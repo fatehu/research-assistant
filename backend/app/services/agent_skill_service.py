@@ -20,6 +20,7 @@ class AgentSkill:
     prompt_text: str
     config_path: str = ""
     interface_path: str = ""
+    session_system_prompt: str = ""
     aliases: Tuple[str, ...] = ()
     trigger_keywords: Tuple[str, ...] = ()
     allowed_channels: Tuple[str, ...] = ()
@@ -49,6 +50,7 @@ class AgentSkillMatch:
     path: str
     config_path: str = ""
     interface_path: str = ""
+    session_system_prompt: str = ""
     score: int = 0
     activation_reason: str = ""
     display_name: str = ""
@@ -78,6 +80,8 @@ class AgentSkillResolution:
     active_skills: Tuple[AgentSkillMatch, ...] = ()
     active_prompt: str = ""
     active_prompt_tokens: int = 0
+    active_system_prompt: str = ""
+    active_system_prompt_tokens: int = 0
     enforced_tool_names: Tuple[str, ...] = ()
     blocked_tool_names: Tuple[str, ...] = ()
 
@@ -128,6 +132,7 @@ class AgentSkillService:
         skills = [skill for skill in self._load_skills() if self._skill_allows_channel(skill, normalized_channel)]
         available_matches: List[AgentSkillMatch] = []
         active_prompt_parts: List[str] = []
+        active_system_prompt_parts: List[str] = []
         active_matches: List[AgentSkillMatch] = []
         active_enforced_tool_sets: List[set[str]] = []
         active_blocked_tool_names: set[str] = set()
@@ -140,6 +145,7 @@ class AgentSkillService:
                 path=skill.path,
                 config_path=skill.config_path,
                 interface_path=skill.interface_path,
+                session_system_prompt=skill.session_system_prompt,
                 score=score,
                 activation_reason=activation_reason,
                 display_name=skill.display_name,
@@ -174,6 +180,8 @@ class AgentSkillService:
                 )
                 active_matches.append(match)
                 active_prompt_parts.append(self._render_skill_prompt(skill))
+                if skill.session_system_prompt.strip():
+                    active_system_prompt_parts.append(skill.session_system_prompt.strip())
                 if skill.enforced_tool_names:
                     active_enforced_tool_sets.append(
                         {str(item).strip() for item in skill.enforced_tool_names if str(item).strip()}
@@ -185,6 +193,7 @@ class AgentSkillService:
         available_matches.sort(key=lambda item: (-item.score, item.name))
         active_matches.sort(key=lambda item: (-item.score, item.name))
         active_prompt = "\n\n".join(part for part in active_prompt_parts if part.strip()).strip()
+        active_system_prompt = "\n\n".join(part for part in active_system_prompt_parts if part.strip()).strip()
         enforced_tool_names: Tuple[str, ...] = ()
         if active_enforced_tool_sets:
             active_intersection = set.intersection(*active_enforced_tool_sets)
@@ -199,6 +208,8 @@ class AgentSkillService:
             active_skills=tuple(active_matches),
             active_prompt=active_prompt,
             active_prompt_tokens=estimate_tokens(active_prompt) if active_prompt else 0,
+            active_system_prompt=active_system_prompt,
+            active_system_prompt_tokens=estimate_tokens(active_system_prompt) if active_system_prompt else 0,
             enforced_tool_names=enforced_tool_names,
             blocked_tool_names=blocked_tool_names,
         )
@@ -235,6 +246,12 @@ class AgentSkillService:
         if not name:
             return None
         description = str(metadata.get("description") or "").strip()
+        session_system_prompt = str(
+            metadata.get("session_system_prompt")
+            or metadata.get("active_system_prompt")
+            or metadata.get("system_prompt")
+            or ""
+        ).strip()
         aliases = self._normalize_list(metadata.get("aliases"))
         trigger_keywords = self._normalize_list(metadata.get("trigger_keywords"))
         allowed_channels = self._normalize_list(
@@ -278,6 +295,7 @@ class AgentSkillService:
             prompt_text=body.strip(),
             config_path=self._relative_skill_path(config_file) if config_file is not None else "",
             interface_path=self._relative_skill_path(interface_file) if interface_file is not None else "",
+            session_system_prompt=session_system_prompt,
             aliases=tuple(aliases),
             trigger_keywords=tuple(trigger_keywords),
             allowed_channels=tuple(allowed_channels),
@@ -494,6 +512,10 @@ class AgentSkillService:
             normalized_alias = self._normalize_text(alias)
             if normalized_alias and normalized_alias in normalized_text:
                 return 90, f"命中 skill 别名: {alias}"
+        for keyword in skill.trigger_keywords:
+            normalized_keyword = self._normalize_text(keyword)
+            if normalized_keyword and normalized_keyword in normalized_text:
+                return 90, f"命中 skill 触发词: {keyword}"
         return 0, ""
 
     @staticmethod

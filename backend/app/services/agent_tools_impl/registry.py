@@ -3,6 +3,7 @@ Agent 工具定义和执行 - 支持共享知识库搜索
 """
 import asyncio
 import base64
+import contextvars
 import fnmatch
 import httpx
 import json
@@ -11,15 +12,16 @@ import os
 import re
 import shutil
 import time
+import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set, Callable, Type, Protocol, Mapping, Sequence, Literal
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, text, or_, and_, tuple_
+from sqlalchemy import select, text, or_, and_, tuple_, cast, String as SQLString
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.config import settings
@@ -45,14 +47,39 @@ from app.services.contextual_compression_service import (
     get_contextual_compression_service,
 )
 from app.services.aider_cli_service import AiderCliService
+from app.services.claude_code_collaboration_graph_service import ClaudeCodeCollaborationGraphService
 from app.services.agent_tool_error_contract import (
     build_tool_error_contract,
     merge_error_contract,
 )
 from app.services.html_page_semantics import analyze_html_page_semantics, resolve_html_probe_plan_with_llm
 from app.services.google_drive_utils import is_google_drive_url, probe_google_drive_confirm_download
+from app.services.llm_service import LLMService
 from app.services.smart_chunking.token_utils import estimate_tokens, tokens_to_chars
 from app.services.zoekt_cli_service import ZoektCliService
+
+
+_TOOL_LIVE_EVENT_EMITTER: contextvars.ContextVar[Optional[Callable[[Dict[str, Any]], Any]]] = contextvars.ContextVar(
+    "tool_live_event_emitter",
+    default=None,
+)
+
+
+def set_tool_live_event_emitter(callback: Optional[Callable[[Dict[str, Any]], Any]]):
+    return _TOOL_LIVE_EVENT_EMITTER.set(callback)
+
+
+def reset_tool_live_event_emitter(token) -> None:
+    _TOOL_LIVE_EVENT_EMITTER.reset(token)
+
+
+async def emit_tool_live_event(payload: Dict[str, Any]) -> None:
+    callback = _TOOL_LIVE_EVENT_EMITTER.get()
+    if callback is None:
+        return
+    maybe_awaitable = callback(dict(payload or {}))
+    if asyncio.iscoroutine(maybe_awaitable):
+        await maybe_awaitable
 
 # 尝试导入共享模块（可选）
 try:
@@ -102,6 +129,38 @@ def _normalize_relative_path(value: Any) -> str:
     if not parts or any(part == ".." for part in parts):
         return ""
     return "/".join(parts)
+
+
+def _normalize_repo_relative_path(value: Any) -> str:
+    normalized = _normalize_relative_path(value)
+    if normalized == "repo/source":
+        return ""
+    if normalized.startswith("repo/source/"):
+        return normalized.removeprefix("repo/source/")
+    if normalized.startswith("paper_repo/"):
+        return normalized.removeprefix("paper_repo/")
+    return normalized
+
+
+def _extract_first_json_object(text: Any) -> Optional[Dict[str, Any]]:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    candidates: List[str] = [raw]
+    fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL | re.IGNORECASE)
+    candidates.extend(item for item in fenced if item)
+    first = raw.find("{")
+    last = raw.rfind("}")
+    if first >= 0 and last > first:
+        candidates.append(raw[first : last + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 def _collect_schema_constraints(schema: Mapping[str, Any]) -> Dict[str, Any]:
@@ -167,11 +226,14 @@ class ToolBase(Tool, ABC):
     async def _execute(self, **kwargs) -> ToolResult:
         raise NotImplementedError
 
-    def _resolve_timeout_seconds(self) -> float:
+    def _resolve_timeout_seconds(self) -> Optional[float]:
         timeout = self.timeout_seconds
         if timeout is None:
             timeout = float(getattr(settings, "tool_default_timeout_seconds", 20))
-        return max(float(timeout), 1.0)
+        timeout_value = float(timeout)
+        if timeout_value <= 0:
+            return None
+        return max(timeout_value, 1.0)
 
     def _resolve_retry_count(self) -> int:
         retries = self.retry_count
@@ -284,7 +346,10 @@ class ToolBase(Tool, ABC):
         for attempt in range(1, max_attempts + 1):
             try:
                 maybe_awaitable = self._execute(**validated_kwargs)
-                result = await asyncio.wait_for(maybe_awaitable, timeout=timeout_seconds)
+                if timeout_seconds is None:
+                    result = await maybe_awaitable
+                else:
+                    result = await asyncio.wait_for(maybe_awaitable, timeout=timeout_seconds)
                 if not isinstance(result, ToolResult):
                     raise TypeError(f"Tool returned unsupported result type: {type(result)}")
                 last_result = result
@@ -295,9 +360,14 @@ class ToolBase(Tool, ABC):
                         retry_attempt=attempt,
                     )
             except asyncio.TimeoutError:
+                timeout_message = (
+                    f"工具执行超时（>{timeout_seconds:.1f}s）"
+                    if timeout_seconds is not None
+                    else "工具执行超时"
+                )
                 contract = build_tool_error_contract(
                     code="timeout",
-                    message=f"工具执行超时（>{timeout_seconds:.1f}s）",
+                    message=timeout_message,
                     tool_name=self.name,
                     stage="execute",
                     retryable=(attempt < max_attempts),
@@ -972,7 +1042,7 @@ class WebSearchInput(BaseModel):
 
 
 class WebSearchTool(ToolBase):
-    """Web 搜索工具 - Serper -> Tavily -> DDGS。"""
+    """Web 搜索工具 - Tavily -> Serper -> DDGS。"""
 
     name = "web_search"
     parallel_safe = True
@@ -1019,17 +1089,17 @@ class WebSearchTool(ToolBase):
         errors: List[str] = []
         logger.info(f"[WebSearch] query={query}, max_results={max_results}")
 
-        if self.serper_api_key:
-            result = await self._safe_provider_call("serper", self._serper_search, query, max_results)
-            if result.success:
-                return result
-            errors.append(f"serper:{result.error or 'failed'}")
-
         if self.tavily_api_key:
             result = await self._safe_provider_call("tavily", self._tavily_search, query, max_results)
             if result.success:
                 return result
             errors.append(f"tavily:{result.error or 'failed'}")
+
+        if self.serper_api_key:
+            result = await self._safe_provider_call("serper", self._serper_search, query, max_results)
+            if result.success:
+                return result
+            errors.append(f"serper:{result.error or 'failed'}")
 
         result = await self._ddgs_search(query, max_results)
         if result.success:
@@ -1038,7 +1108,7 @@ class WebSearchTool(ToolBase):
 
         return ToolResult(
             success=False,
-            output=f"网络搜索失败，已尝试 Serper/Tavily/DDGS。错误: {'; '.join(errors)}",
+            output=f"网络搜索失败，已尝试 Tavily/Serper/DDGS。错误: {'; '.join(errors)}",
             error="web_search_all_failed",
         )
 
@@ -1341,126 +1411,7 @@ class PaperResearchStatusInput(BaseModel):
     paper_title: Optional[str] = Field(default=None, max_length=500)
     project_id: Optional[int] = Field(default=None, ge=1)
 
-
-class PaperResearchCloneRepoInput(BaseModel):
-    project_id: int = Field(ge=1)
-    repo_url: Optional[str] = Field(default=None, max_length=1000)
-    refresh: bool = False
-
-
-class PaperResearchCreateRunDraftInput(BaseModel):
-    model_config = ConfigDict(protected_namespaces=())
-
-    paper_id: Optional[int] = Field(default=None, ge=1)
-    paper_title: Optional[str] = Field(default=None, max_length=500)
-    project_id: Optional[int] = Field(default=None, ge=1)
-    run_label: str = Field(min_length=1, max_length=200)
-    run_kind: Literal["baseline", "variant"] = "variant"
-    model_name: Optional[str] = Field(default=None, max_length=255)
-    hypothesis: Optional[str] = Field(default=None, max_length=2000)
-    params: Dict[str, Any] = Field(default_factory=dict)
-    variant_spec: Dict[str, Any] = Field(default_factory=dict)
-
-
-class PaperResearchArtifactManifestInput(BaseModel):
-    project_id: int = Field(ge=1)
-
-
-class PaperResearchReadArtifactInput(BaseModel):
-    project_id: int = Field(ge=1)
-    relative_path: str = Field(min_length=1, max_length=260)
-    mode: Literal["auto", "full", "chunk", "page", "line_range"] = "auto"
-    max_chars: int = Field(default=20000, ge=200, le=200000)
-    chunk_index: Optional[int] = Field(default=None, ge=1, le=1000000)
-    chunk_chars: Optional[int] = Field(default=None, ge=200, le=200000)
-    page: Optional[int] = Field(default=None, ge=1, le=1000000)
-    page_size_lines: Optional[int] = Field(default=None, ge=1, le=5000)
-    line_start: Optional[int] = Field(default=None, ge=1, le=2000000)
-    line_end: Optional[int] = Field(default=None, ge=1, le=2000000)
-
-
-class PaperResearchSearchOutputsInput(BaseModel):
-    project_id: int = Field(ge=1)
-    query: str = Field(min_length=1, max_length=400)
-    scope: Literal["all", "planning", "repo_analysis", "grounding", "implementation", "run_drafts", "executions", "results"] = "all"
-    max_results: int = Field(default=20, ge=1, le=100)
-    case_sensitive: bool = False
-    is_regex: bool = False
-    context_lines: int = Field(default=0, ge=0, le=20)
-
-
-class PaperResearchReadRepoFileInput(BaseModel):
-    project_id: int = Field(ge=1)
-    repo_relative_path: str = Field(
-        min_length=1,
-        max_length=400,
-        description=(
-            "repo/source 下的 repo-relative 路径。"
-            "如果不确定文件具体在哪个子目录，先用 `paper_research_search_repo`"
-            " 按文件名或关键字定位真实路径，不要臆测 `scripts/` 等前缀。"
-        ),
-        validation_alias=AliasChoices("repo_relative_path", "relative_path", "path", "file_path", "file"),
-    )
-    mode: str = Field(default="auto")
-    max_chars: int = Field(default=20000, ge=1, le=200000)
-    chunk_index: Optional[int] = Field(default=None, ge=1, le=1000000)
-    chunk_chars: Optional[int] = Field(default=None, ge=1, le=200000)
-    page: Optional[int] = Field(default=None, ge=1, le=1000000)
-    page_size_lines: Optional[int] = Field(default=None, ge=1, le=5000)
-    line_start: Optional[int] = Field(default=None, ge=1, le=2000000)
-    line_end: Optional[int] = Field(default=None, ge=1, le=2000000)
-
-    @field_validator("repo_relative_path")
-    @classmethod
-    def _normalize_repo_relative_path(cls, value: str) -> str:
-        normalized = _normalize_relative_path(value)
-        if normalized == "repo/source":
-            return ""
-        if normalized.startswith("repo/source/"):
-            return normalized.removeprefix("repo/source/")
-        if normalized.startswith("paper_repo/"):
-            return normalized.removeprefix("paper_repo/")
-        return normalized
-
-    @field_validator("mode")
-    @classmethod
-    def _normalize_mode(cls, value: str) -> str:
-        normalized = str(value or "auto").strip().lower().replace("-", "_")
-        alias_map = {
-            "auto": "auto",
-            "full": "full",
-            "all": "full",
-            "entire": "full",
-            "chunk": "chunk",
-            "chunks": "chunk",
-            "page": "page",
-            "pages": "page",
-            "line": "line_range",
-            "lines": "line_range",
-            "line_range": "line_range",
-        }
-        resolved = alias_map.get(normalized)
-        if not resolved:
-            raise ValueError("mode must be one of auto/full/chunk/page/line_range")
-        return resolved
-
-
-class PaperResearchSearchRepoInput(BaseModel):
-    project_id: int = Field(ge=1)
-    query: str = Field(min_length=1, max_length=400)
-    max_results: int = Field(default=20, ge=1, le=100)
-    case_sensitive: bool = False
-    is_regex: bool = False
-    glob: Optional[str] = Field(default=None, max_length=200)
-    context_lines: int = Field(default=0, ge=0, le=20)
-
-
-class PaperResearchBuildZoektIndexInput(BaseModel):
-    project_id: int = Field(ge=1)
-    force_reindex: bool = False
-
-
-class PaperResearchSearchRepoZoektInput(BaseModel):
+class PaperResearchSearchProjectZoektInput(BaseModel):
     project_id: int = Field(ge=1)
     query: str = Field(min_length=1, max_length=800)
     max_results: int = Field(default=20, ge=1, le=100)
@@ -1468,96 +1419,112 @@ class PaperResearchSearchRepoZoektInput(BaseModel):
     auto_index: bool = True
     force_reindex: bool = False
 
+class PaperSearchInput(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+    max_results: int = Field(default=5, ge=1, le=10)
 
-class PaperResearchRunAiderInput(BaseModel):
+
+class ProjectTreeInput(BaseModel):
     project_id: int = Field(ge=1)
-    instruction: str = Field(min_length=1, max_length=12000)
-    target_root: Literal["repo", "workspace"] = "repo"
-    mode: Literal["code", "architect", "ask"] = "code"
-    editable_files: List[str] = Field(default_factory=list)
-    read_only_files: List[str] = Field(default_factory=list)
-    context_artifacts: List[str] = Field(default_factory=list)
-    llm_provider: Optional[str] = Field(default=None, max_length=64)
-    model_name: Optional[str] = Field(default=None, max_length=255)
-    editor_model: Optional[str] = Field(default=None, max_length=255)
-    weak_model: Optional[str] = Field(default=None, max_length=255)
-    edit_format: Optional[str] = Field(default=None, max_length=64)
-    editor_edit_format: Optional[str] = Field(default=None, max_length=64)
-    reasoning_effort: Optional[str] = Field(default=None, max_length=32)
-    dry_run: bool = False
-    map_tokens: Optional[int] = Field(default=None, ge=0, le=64000)
-    api_timeout_seconds: Optional[int] = Field(default=None, ge=30, le=3600)
-    auto_test: bool = False
-    test_cmd: Optional[str] = Field(default=None, max_length=2000)
-    auto_lint: bool = False
-    lint_cmds: List[str] = Field(default_factory=list)
-    allow_dirty_repo: bool = False
 
 
-class PaperResearchReadAiderRunInput(BaseModel):
+class ProjectReadFileInput(BaseModel):
     project_id: int = Field(ge=1)
-    run_id: str = Field(min_length=1, max_length=128)
-    include_stdout: bool = True
-    include_prompt: bool = False
-    include_diff: bool = False
-    max_chars: int = Field(default=20000, ge=200, le=200000)
+    relative_path: str = Field(min_length=1, max_length=400)
 
 
-class PaperResearchTailAiderLogInput(BaseModel):
+class ProjectWriteFileInput(BaseModel):
     project_id: int = Field(ge=1)
-    run_id: str = Field(min_length=1, max_length=128)
-    max_chars: int = Field(default=12000, ge=200, le=200000)
+    relative_path: str = Field(min_length=1, max_length=400)
+    content: str
 
 
-class PaperResearchWriteImplementationSpecInput(BaseModel):
+class ProjectBashInput(BaseModel):
     project_id: int = Field(ge=1)
-    implementation_spec: Dict[str, Any] = Field(default_factory=dict)
+    command: str = Field(min_length=1, max_length=20000)
 
 
-class PaperResearchReadImplementationSpecInput(BaseModel):
+class ProjectClaudeInput(BaseModel):
     project_id: int = Field(ge=1)
-    mode: Literal["auto", "full", "chunk", "page", "line_range"] = "auto"
-    max_chars: int = Field(default=20000, ge=200, le=200000)
-    chunk_index: Optional[int] = Field(default=None, ge=1, le=1000000)
-    chunk_chars: Optional[int] = Field(default=None, ge=200, le=200000)
-    page: Optional[int] = Field(default=None, ge=1, le=1000000)
-    page_size_lines: Optional[int] = Field(default=None, ge=1, le=5000)
-    line_start: Optional[int] = Field(default=None, ge=1, le=2000000)
-    line_end: Optional[int] = Field(default=None, ge=1, le=2000000)
+    prompt: str = Field(min_length=1, max_length=20000)
+    continue_session: bool = False
 
 
-class PaperResearchWriteGroundingReportInput(BaseModel):
-    project_id: int = Field(ge=1)
-    grounding_report: Dict[str, Any] = Field(default_factory=dict)
+class DocxGenerateWithClaudeInput(BaseModel):
+    docx_id: Optional[str] = None
+    template_id: Optional[str] = None
+    markdown: Optional[str] = None
+    source_path: Optional[str] = None
+    requirements: str = Field(min_length=1)
+    output_basename: Optional[str] = None
+    continue_session: bool = False
 
 
-class PaperResearchReadGroundingReportInput(BaseModel):
-    project_id: int = Field(ge=1)
-    mode: Literal["auto", "full", "chunk", "page", "line_range"] = "auto"
-    max_chars: int = Field(default=20000, ge=200, le=200000)
-    chunk_index: Optional[int] = Field(default=None, ge=1, le=1000000)
-    chunk_chars: Optional[int] = Field(default=None, ge=200, le=200000)
-    page: Optional[int] = Field(default=None, ge=1, le=1000000)
-    page_size_lines: Optional[int] = Field(default=None, ge=1, le=5000)
-    line_start: Optional[int] = Field(default=None, ge=1, le=2000000)
-    line_end: Optional[int] = Field(default=None, ge=1, le=2000000)
+class LiteratureReviewStartInput(BaseModel):
+    literature_review_id: Optional[str] = None
+    topic: str = Field(min_length=1, max_length=1000)
+    target_paper_count: int = Field(default=12, ge=1, le=100)
+    notes: Optional[str] = None
 
 
-class PaperResearchWriteRunDraftsInput(BaseModel):
-    project_id: int = Field(ge=1)
-    run_drafts: Dict[str, Any] = Field(default_factory=dict)
+class LiteratureReviewDownloadPdfInput(BaseModel):
+    literature_review_id: str = Field(min_length=1, max_length=160)
+    pdf_url: Optional[str] = Field(default=None, max_length=3000)
+    arxiv_id: Optional[str] = Field(default=None, max_length=120)
+    title: Optional[str] = Field(default=None, max_length=1000)
+    abstract: Optional[str] = Field(default=None, max_length=50000)
+    source: Optional[str] = Field(default=None, max_length=120)
+    external_id: Optional[str] = Field(default=None, max_length=300)
+    doi: Optional[str] = Field(default=None, max_length=300)
+    url: Optional[str] = Field(default=None, max_length=3000)
+    venue: Optional[str] = Field(default=None, max_length=500)
+    year: Optional[int] = None
+    authors: Optional[List[Dict[str, Any]]] = None
+    citation_count: Optional[int] = None
+    reference_count: Optional[int] = None
+    fields_of_study: Optional[List[str]] = None
+    paper_key: Optional[str] = Field(default=None, max_length=180)
+    overwrite: bool = False
 
 
-class PaperResearchReadRunDraftsInput(BaseModel):
-    project_id: int = Field(ge=1)
-    mode: Literal["auto", "full", "chunk", "page", "line_range"] = "auto"
-    max_chars: int = Field(default=20000, ge=200, le=200000)
-    chunk_index: Optional[int] = Field(default=None, ge=1, le=1000000)
-    chunk_chars: Optional[int] = Field(default=None, ge=200, le=200000)
-    page: Optional[int] = Field(default=None, ge=1, le=1000000)
-    page_size_lines: Optional[int] = Field(default=None, ge=1, le=5000)
-    line_start: Optional[int] = Field(default=None, ge=1, le=2000000)
-    line_end: Optional[int] = Field(default=None, ge=1, le=2000000)
+class LiteratureReviewJsonReadInput(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    literature_review_id: str = Field(min_length=1, max_length=160)
+    mode: Literal["list", "read"] = "list"
+    relative_path: Optional[str] = Field(
+        default=None,
+        max_length=1200,
+        validation_alias=AliasChoices("relative_path", "path"),
+    )
+
+
+class LiteratureReviewSearchZoektInput(BaseModel):
+    literature_review_id: str = Field(min_length=1, max_length=160)
+    query: str = Field(min_length=1, max_length=800)
+    scope: Literal["all", "paper", "review"] = "all"
+    max_results: int = Field(default=20, ge=1, le=100)
+    context_lines: int = Field(default=2, ge=0, le=20)
+    auto_index: bool = True
+    force_reindex: bool = False
+
+
+class ReadFullPdfInput(BaseModel):
+    literature_review_id: str = Field(min_length=1, max_length=160)
+    paper_key: Optional[str] = Field(default=None, max_length=180)
+    pdf_path: Optional[str] = Field(default=None, max_length=2000)
+    mode: Literal["fast", "hybrid"] = "fast"
+    return_content: bool = False
+
+
+class ReviewWriterInput(BaseModel):
+    literature_review_id: str = Field(min_length=1, max_length=160)
+    topic: str = Field(min_length=1, max_length=1000)
+    mode: Literal["paper", "final"] = "paper"
+    paper_key: Optional[str] = Field(default=None, max_length=180)
+    md_path: Optional[str] = Field(default=None, max_length=2000)
+    requirements: Optional[str] = None
+    target_paper_count: int = Field(default=12, ge=1, le=100)
 
 
 class PaperResearchInspectRuntimeInput(BaseModel):
@@ -1579,21 +1546,6 @@ class PaperResearchProbeUrlInput(BaseModel):
 
 class PaperResearchAssessRepoMainpathInput(BaseModel):
     project_id: int = Field(ge=1)
-
-
-class PaperResearchListOutputsInput(BaseModel):
-    project_id: int = Field(ge=1)
-    scope: Literal["all", "planning", "repo_analysis", "grounding", "implementation", "run_drafts", "executions", "results"] = "all"
-
-
-class PaperResearchDeleteOutputInput(BaseModel):
-    project_id: int = Field(ge=1)
-    relative_path: str = Field(min_length=1, max_length=400)
-
-
-class PaperResearchCleanupScopeInput(BaseModel):
-    project_id: int = Field(ge=1)
-    scope: Literal["all", "planning", "repo_analysis", "grounding", "implementation", "run_drafts", "executions", "results"] = "all"
 
 
 class PaperResearchGitStatusInput(BaseModel):
@@ -1621,7 +1573,7 @@ class PaperResearchGitDiffInput(BaseModel):
         raw_items = list(value) if isinstance(value, (list, tuple, set)) else [value]
         normalized_items: List[str] = []
         for item in raw_items:
-            normalized = PaperResearchReadRepoFileInput._normalize_repo_relative_path(str(item or ""))
+            normalized = _normalize_repo_relative_path(str(item or ""))
             if normalized:
                 normalized_items.append(normalized)
         deduped: List[str] = []
@@ -1664,13 +1616,27 @@ class PaperResearchGitShowInput(BaseModel):
     def _normalize_repo_relative_path(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
-        normalized = PaperResearchReadRepoFileInput._normalize_repo_relative_path(value)
+        normalized = _normalize_repo_relative_path(value)
         return normalized or None
 
 
 class PaperResearchWriteExecutionSpecInput(BaseModel):
     project_id: int = Field(ge=1)
     execution_spec: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PaperResearchLaunchClaudeCodeInput(BaseModel):
+    project_id: int = Field(ge=1)
+    task: str = Field(min_length=1, max_length=20000)
+    execution_id: Optional[str] = Field(default=None, max_length=120)
+    model: Optional[str] = Field(default=None, max_length=200)
+    max_turns: Optional[int] = Field(default=None, ge=1, le=200)
+    add_dirs: List[str] = Field(default_factory=list, max_length=20)
+    allowed_tools: List[str] = Field(default_factory=list, max_length=50)
+    disallowed_tools: List[str] = Field(default_factory=list, max_length=50)
+    append_system_prompt: Optional[str] = Field(default=None, max_length=12000)
+    permission_mode: Optional[str] = Field(default=None, max_length=100)
+    dangerously_skip_permissions: bool = True
 
 
 class PaperResearchWriteExecutionScriptInput(BaseModel):
@@ -1720,117 +1686,6 @@ class _PaperResearchToolBase(ToolBase):
     timeout_seconds = 720.0
     output_max_tokens = 2600
     _PROJECT_ROOT_ALIAS = "project_workspace"
-    _RUN_DRAFT_KINDS = {
-        "env_setup",
-        "data_prep",
-        "smoke_test",
-        "baseline_repro",
-        "evaluation",
-        "first_tuning",
-        "custom",
-    }
-    _RUN_DRAFT_ENTRYPOINT_TYPES = {
-        "repo_script",
-        "notebook",
-        "config",
-        "readme_command",
-        "dataset_step",
-        "manual_step",
-        "unknown",
-    }
-    _GROUNDING_STATUSES = {"grounded", "absent", "blocked", "unknown"}
-    _CANONICAL_FILE_SPECS: Dict[str, Dict[str, str]] = {
-        "planning/paper_intake_result.json": {
-            "kind": "planning",
-            "name": "paper_intake_result",
-            "content_type": "json",
-            "actual_rel_path": "paper_intake_result.json",
-        },
-        "planning/paper_summary.json": {
-            "kind": "planning",
-            "name": "paper_summary",
-            "content_type": "json",
-            "actual_rel_path": "paper_summary.json",
-        },
-        "planning/experiment_spec.json": {
-            "kind": "planning",
-            "name": "experiment_spec",
-            "content_type": "json",
-            "actual_rel_path": "experiment_spec.json",
-        },
-        "planning/paper_intake_markdown.md": {
-            "kind": "planning",
-            "name": "paper_intake_markdown",
-            "content_type": "text",
-            "actual_rel_path": "paper_intake_markdown.md",
-        },
-        "planning/paper_intake_payload.json": {
-            "kind": "planning",
-            "name": "paper_intake_payload",
-            "content_type": "json",
-            "actual_rel_path": "paper_intake_payload.json",
-        },
-        "repo/repo_reference.json": {
-            "kind": "repo",
-            "name": "repo_reference",
-            "content_type": "json",
-            "actual_rel_path": "repo_reference.json",
-        },
-        "repo/repo_file_index.json": {
-            "kind": "repo",
-            "name": "repo_file_index",
-            "content_type": "json",
-            "actual_rel_path": "repo_file_index.json",
-        },
-        "repo/repo_history_url_candidates.json": {
-            "kind": "repo",
-            "name": "repo_history_url_candidates",
-            "content_type": "json",
-            "actual_rel_path": "repo_history_url_candidates.json",
-        },
-        "repo/repo_readme_excerpt.md": {
-            "kind": "repo",
-            "name": "repo_readme_excerpt",
-            "content_type": "text",
-            "actual_rel_path": "repo_readme_excerpt.md",
-        },
-        "repo/repo_readme_reproduction_intake.json": {
-            "kind": "repo",
-            "name": "repo_readme_reproduction_intake",
-            "content_type": "json",
-            "actual_rel_path": "repo_readme_reproduction_intake.json",
-        },
-        "meta/workspace_adapter_manifest.json": {
-            "kind": "meta",
-            "name": "workspace_adapter_manifest",
-            "content_type": "json",
-            "actual_rel_path": "workspace_adapter_manifest.json",
-        },
-        "meta/workspace_readme.md": {
-            "kind": "meta",
-            "name": "workspace_readme",
-            "content_type": "text",
-            "actual_rel_path": "WORKSPACE_README.md",
-        },
-        "specs/grounding_report.json": {
-            "kind": "spec",
-            "name": "grounding_report",
-            "content_type": "json",
-            "actual_rel_path": "specs/grounding_report.json",
-        },
-        "specs/implementation_spec.json": {
-            "kind": "spec",
-            "name": "implementation_spec",
-            "content_type": "json",
-            "actual_rel_path": "specs/implementation_spec.json",
-        },
-        "drafts/run_drafts.json": {
-            "kind": "draft",
-            "name": "run_drafts",
-            "content_type": "json",
-            "actual_rel_path": "drafts/run_drafts.json",
-        },
-    }
 
     @staticmethod
     def _normalize_line_preview(value: str, *, limit: int = 240) -> str:
@@ -1865,6 +1720,145 @@ class _PaperResearchToolBase(ToolBase):
         async with self.db_session_factory() as session:
             return await handler(session)
 
+    async def _load_project_tree_focus_context(
+        self,
+        db: AsyncSession,
+        *,
+        project_payload: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        project_goal = str((project_payload or {}).get("goal") or "").strip()
+        context: Dict[str, Any] = {
+            "project_goal": project_goal,
+            "user_goal": "",
+            "active_topic": "",
+            "current_stage": "",
+            "workflow_binding": {},
+            "latest_user_message": "",
+            "recent_tool_calls": [],
+        }
+        if self.conversation_id is None:
+            return context
+
+        from app.models.conversation import Message, MessageRole
+        from app.services.agent_runtime_service import get_agent_runtime_service
+
+        latest_user_result = await db.execute(
+            select(Message.content)
+            .where(
+                Message.conversation_id == int(self.conversation_id),
+                Message.role == MessageRole.USER,
+            )
+            .order_by(Message.id.desc())
+            .limit(1)
+        )
+        latest_user_message = latest_user_result.scalar_one_or_none()
+        if latest_user_message is not None:
+            context["latest_user_message"] = str(latest_user_message or "").strip()
+
+        runtime_service = get_agent_runtime_service()
+        state = dict(await runtime_service.get_conversation_context_state(int(self.conversation_id)) or {})
+        workflow_binding = (
+            dict(state.get("workflow_binding") or {})
+            if isinstance(state.get("workflow_binding"), dict)
+            else {}
+        )
+        context["user_goal"] = str(state.get("user_goal") or "").strip()
+        context["active_topic"] = str(state.get("active_topic") or "").strip()
+        context["current_stage"] = str(workflow_binding.get("current_stage") or "").strip()
+        context["workflow_binding"] = workflow_binding
+
+        tool_ledger_payload = dict(await runtime_service.get_conversation_tool_ledger(int(self.conversation_id)) or {})
+        raw_entries = [
+            dict(item)
+            for item in list(tool_ledger_payload.get("entries") or [])
+            if isinstance(item, dict)
+        ]
+        recent_calls: List[Dict[str, Any]] = []
+        for item in reversed(raw_entries):
+            if str(item.get("kind") or "").strip() != "tool_call":
+                continue
+            tool_name = str(item.get("tool_name") or "").strip()
+            if not tool_name:
+                continue
+            recent_calls.append(
+                {
+                    "tool_name": tool_name,
+                    "arguments": dict(item.get("arguments") or {}) if isinstance(item.get("arguments"), dict) else {},
+                    "status": str(item.get("status") or "").strip() or None,
+                    "iteration": int(item.get("iteration") or 0),
+                }
+            )
+            if len(recent_calls) >= 8:
+                break
+        context["recent_tool_calls"] = list(reversed(recent_calls))
+        return context
+
+    @classmethod
+    async def _summarize_project_tree_for_agent(
+        cls,
+        *,
+        tree: str,
+        focus_context: Dict[str, Any],
+    ) -> tuple[str, List[str]]:
+        normalized_tree = str(tree or "").strip()
+        if not normalized_tree:
+            return "", []
+
+        provider = str(getattr(settings, "agent_budget_compression_provider", "aliyun") or "aliyun").strip()
+        llm = LLMService(provider)
+        llm.config = dict(llm.config)
+        llm.config["model"] = "qwen-turbo"
+        timeout_seconds = max(
+            float(getattr(settings, "agent_budget_compression_timeout_seconds", 8.0) or 8.0),
+            0.1,
+        )
+        try:
+            response = await asyncio.wait_for(
+                llm.chat(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {
+                                    "agent_focus": focus_context,
+                                    "project_tree": normalized_tree,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
+                    ],
+                    system_prompt=(
+                        "你是项目目录树整理器。"
+                        "给定当前 agent 的目标、最近工具调用和完整 project tree，"
+                        "请挑出当前最值得继续探索的目录层级和文件。"
+                        "不要编造任何不存在的路径；只能使用输入 tree 中已有的路径。"
+                        "focused_tree 必须保留层级结构，使用纯文本目录树，根节点用 `.`。"
+                        "important_paths 必须是 project 根相对路径列表。"
+                        "返回严格 JSON："
+                        "{\"focused_tree\":\"...\",\"important_paths\":[\"...\"]}"
+                    ),
+                    temperature=0.1,
+                    max_tokens=1200,
+                    source="project_tree.focused_tree",
+                ),
+                timeout=timeout_seconds,
+            )
+        except Exception as exc:
+            logger.warning(f"[ProjectTree] focused tree summarization failed: {exc}")
+            return "", []
+
+        payload = _extract_first_json_object(response.get("content", ""))
+        if not isinstance(payload, dict):
+            return "", []
+
+        focused_tree = str(payload.get("focused_tree") or "").strip()
+        important_paths = [
+            _normalize_relative_path(item)
+            for item in list(payload.get("important_paths") or [])
+            if _normalize_relative_path(item)
+        ]
+        return focused_tree, list(dict.fromkeys(important_paths))
+
     async def _resolve_paper(
         self,
         db: AsyncSession,
@@ -1894,6 +1888,72 @@ class _PaperResearchToolBase(ToolBase):
             return rows[0]
         title_lower = title.lower()
         return next((row for row in rows if str(row.title or "").strip().lower() == title_lower), None)
+
+    @staticmethod
+    def _paper_author_names(paper: Any) -> List[str]:
+        if hasattr(paper, "author_names"):
+            try:
+                return [str(item).strip() for item in list(getattr(paper, "author_names") or []) if str(item).strip()]
+            except Exception:
+                pass
+        authors = list(getattr(paper, "authors", []) or [])
+        names: List[str] = []
+        for item in authors:
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+            else:
+                name = str(item or "").strip()
+            if name:
+                names.append(name)
+        return names
+
+    @staticmethod
+    def _normalize_search_text(value: Any) -> str:
+        return " ".join(str(value or "").strip().lower().split())
+
+    @classmethod
+    def _score_saved_paper_candidate(cls, *, paper: Any, query: str) -> int:
+        query_norm = cls._normalize_search_text(query)
+        if not query_norm:
+            return 0
+
+        title = cls._normalize_search_text(getattr(paper, "title", ""))
+        abstract = cls._normalize_search_text(getattr(paper, "abstract", ""))
+        venue = cls._normalize_search_text(getattr(paper, "venue", "") or getattr(paper, "journal", ""))
+        arxiv_id = cls._normalize_search_text(getattr(paper, "arxiv_id", ""))
+        authors_text = cls._normalize_search_text(" ".join(cls._paper_author_names(paper)))
+        query_terms = [item for item in query_norm.split() if item]
+
+        score = 0
+        if query_norm == arxiv_id and arxiv_id:
+            score += 220
+        if query_norm == title and title:
+            score += 200
+        if query_norm in title and title:
+            score += 120
+        if query_norm in authors_text and authors_text:
+            score += 80
+        if query_norm in venue and venue:
+            score += 40
+        if query_norm in abstract and abstract:
+            score += 25
+
+        if query_terms and all(term in title for term in query_terms if title):
+            score += 40
+        if query_terms and all(term in authors_text for term in query_terms if authors_text):
+            score += 25
+
+        for term in query_terms:
+            if term in title and title:
+                score += 18
+            if term in authors_text and authors_text:
+                score += 12
+            if term in venue and venue:
+                score += 8
+            if term in abstract and abstract:
+                score += 4
+
+        return score
 
     @staticmethod
     def _paper_not_found(paper_id: Optional[int], paper_title: Optional[str]) -> ToolResult:
@@ -1931,28 +1991,6 @@ class _PaperResearchToolBase(ToolBase):
             paper_ids=[int(paper.id)],
         )
         return await project_service.get_project_payload(project_id=int(created.id), user_id=self.user_id)
-
-    async def _link_project_workspace(
-        self,
-        project_service: Any,
-        *,
-        project_payload: Optional[Dict[str, Any]],
-        paper: Any,
-        workspace: Any,
-    ) -> Optional[Dict[str, Any]]:
-        if not isinstance(project_payload, dict) or not project_payload.get("id") or workspace is None:
-            return project_payload
-        project = await project_service.link_workspace(
-            project_id=int(project_payload["id"]),
-            user_id=self.user_id,
-            workspace_id=int(workspace.id),
-            paper_id=int(paper.id),
-            role="primary_reproduction",
-        )
-        if project is None:
-            return project_payload
-        refreshed = await project_service.get_project_payload(project_id=int(project.id), user_id=self.user_id)
-        return refreshed or project_payload
 
     @staticmethod
     def _bool_like(value: Any) -> bool:
@@ -2016,19 +2054,6 @@ class _PaperResearchToolBase(ToolBase):
     def _workspace_needs_intake_refresh(cls, workspace: Any) -> bool:
         return bool(cls._intake_summary_from_workspace(workspace).get("needs_refresh"))
 
-    @classmethod
-    def _workspace_missing_required_archives(cls, workspace_dir: Path, *, include_grounding: bool = False) -> bool:
-        required_paths = [
-            "paper_intake_result.json",
-            "paper_summary.json",
-            "experiment_spec.json",
-            "workspace_adapter_manifest.json",
-        ]
-        if include_grounding:
-            required_paths.append("specs/grounding_report.json")
-        root = Path(workspace_dir)
-        return any(not (root / rel_path).is_file() for rel_path in required_paths)
-
     @staticmethod
     def _project_not_found(project_id: int) -> ToolResult:
         return ToolResult(
@@ -2043,24 +2068,27 @@ class _PaperResearchToolBase(ToolBase):
         return _normalize_relative_path(value)
 
     @classmethod
-    def _artifact_spec_for_path(cls, relative_path: str) -> Optional[Dict[str, str]]:
-        normalized = cls._normalize_relative_path(relative_path)
-        if not normalized:
-            return None
-        spec = cls._CANONICAL_FILE_SPECS.get(normalized)
-        if spec is None:
-            return None
-        return {"relative_path": normalized, **dict(spec)}
-
-    @classmethod
-    def _root_descriptor(cls, *, project_payload: Dict[str, Any], workspace: Any) -> Dict[str, Any]:
-        return {
+    def _root_descriptor(cls, *, project_payload: Dict[str, Any], workspace: Any = None) -> Dict[str, Any]:
+        descriptor = {
             "project_id": int(project_payload.get("id") or 0),
-            "workspace_id": int(workspace.id),
-            "notebook_id": str(workspace.notebook_id or ""),
-            "root_alias": cls._PROJECT_ROOT_ALIAS,
+            "root_alias": cls._PROJECT_ROOT_ALIAS if workspace is not None else "project_root",
             "root_relative_prefix": ".",
         }
+        if workspace is not None:
+            descriptor["workspace_id"] = int(getattr(workspace, "id", 0) or 0)
+            descriptor["notebook_id"] = str(getattr(workspace, "notebook_id", "") or "")
+        return descriptor
+
+    async def _resolve_project_payload_only(
+        self,
+        db: AsyncSession,
+        *,
+        project_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        from app.services.project_service import ProjectService
+
+        project_payload = await ProjectService(db).get_project_payload(project_id=int(project_id), user_id=self.user_id)
+        return dict(project_payload) if isinstance(project_payload, dict) else None
 
     async def _resolve_project_workspace(
         self,
@@ -2119,12 +2147,65 @@ class _PaperResearchToolBase(ToolBase):
 
         return Path(ensure_notebook_workspace(str(workspace.notebook_id), self.user_id))
 
+    @staticmethod
+    def _project_dir_for(project_id: int) -> Path:
+        from app.services.project_paths import get_project_root_dir
+
+        return get_project_root_dir(int(project_id))
+
     @classmethod
-    def _artifact_actual_path(cls, workspace_dir: Path, relative_path: str) -> Optional[Path]:
-        spec = cls._artifact_spec_for_path(relative_path)
-        if spec is None:
+    def _resolve_project_path(
+        cls,
+        project_dir: Path,
+        relative_path: Any,
+        *,
+        require_exists: bool = True,
+    ) -> Optional[Path]:
+        normalized = cls._normalize_relative_path(relative_path)
+        if not normalized:
             return None
-        return workspace_dir / str(spec["actual_rel_path"])
+        candidate = Path(project_dir) / normalized
+        try:
+            resolved = candidate.resolve()
+            root = Path(project_dir).resolve()
+        except OSError:
+            return None
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            return None
+        if require_exists and not resolved.exists():
+            return None
+        return resolved
+
+    @classmethod
+    def _render_project_tree(cls, project_dir: Path) -> str:
+        root = Path(project_dir)
+        if not root.exists():
+            return "."
+
+        lines = ["."]
+
+        def _walk(current_dir: Path, prefix: str) -> None:
+            try:
+                entries = sorted(
+                    list(current_dir.iterdir()),
+                    key=lambda item: (not item.is_dir(), str(item.name).lower(), str(item.name)),
+                )
+            except OSError:
+                lines.append(f"{prefix}`-- [unreadable]")
+                return
+
+            for index, entry in enumerate(entries):
+                is_last = index == len(entries) - 1
+                branch = "`-- " if is_last else "|-- "
+                label = f"{entry.name}/" if entry.is_dir() and not entry.is_symlink() else entry.name
+                lines.append(f"{prefix}{branch}{label}")
+                if entry.is_dir() and not entry.is_symlink():
+                    _walk(entry, prefix + ("    " if is_last else "|   "))
+
+        _walk(root, "")
+        return "\n".join(lines)
 
     @staticmethod
     def _read_json_file(path: Path) -> Dict[str, Any]:
@@ -2162,7 +2243,7 @@ class _PaperResearchToolBase(ToolBase):
         if not repo_dir.is_dir():
             return project_payload, workspace, None, ToolResult(
                 success=False,
-                output="当前 Project 还没有可用的 repo/source。请先调用 paper_research_prepare 或 paper_research_clone_repo。",
+                output="当前 Project 还没有可用的 repo/source。请先调用 paper_research_prepare。",
                 error="repo_not_available",
                 data={
                     **self._root_descriptor(project_payload=project_payload, workspace=workspace),
@@ -2316,6 +2397,8 @@ class _PaperResearchToolBase(ToolBase):
     def _repo_local_signals(cls, workspace_dir: Path) -> Dict[str, Any]:
         repo_dir = workspace_dir / "paper_repo"
         if not repo_dir.is_dir():
+            repo_dir = workspace_dir / "repo" / "source"
+        if not repo_dir.is_dir():
             return {
                 "materialized": False,
                 "readme_present": False,
@@ -2328,49 +2411,6 @@ class _PaperResearchToolBase(ToolBase):
             "materialized": True,
             "readme_present": bool(readme_present),
             "license_present": bool(license_present),
-        }
-
-    @classmethod
-    def _build_artifact_manifest(cls, *, project_payload: Dict[str, Any], workspace: Any, workspace_dir: Path) -> Dict[str, Any]:
-        artifacts: List[Dict[str, Any]] = []
-        for relative_path, spec in cls._CANONICAL_FILE_SPECS.items():
-            actual_path = workspace_dir / str(spec["actual_rel_path"])
-            entry: Dict[str, Any] = {
-                "kind": str(spec["kind"]),
-                "name": str(spec["name"]),
-                "relative_path": relative_path,
-                "content_type": str(spec["content_type"]),
-                "exists": actual_path.is_file(),
-            }
-            if actual_path.is_file():
-                try:
-                    entry["size_bytes"] = int(actual_path.stat().st_size)
-                except OSError:
-                    entry["size_bytes"] = None
-            artifacts.append(entry)
-
-        repo_reference_path = workspace_dir / "repo_reference.json"
-        repo_source_dir = workspace_dir / "paper_repo"
-        repo_status = "missing"
-        repo_url = ""
-        if repo_reference_path.is_file():
-            try:
-                repo_reference = json.loads(repo_reference_path.read_text(encoding="utf-8"))
-            except Exception:
-                repo_reference = {}
-            repo_status = str(repo_reference.get("status") or "missing")
-            repo_url = str(repo_reference.get("repo_url") or "").strip()
-
-        return {
-            **cls._root_descriptor(project_payload=project_payload, workspace=workspace),
-            "project": cls._project_payload(project_payload),
-            "artifacts": artifacts,
-            "repo": {
-                "available": bool(repo_source_dir.exists() and repo_source_dir.is_dir()),
-                "status": repo_status,
-                "repo_url": repo_url or None,
-                "root_relative_path": "repo/source",
-            },
         }
 
     @classmethod
@@ -2540,18 +2580,21 @@ class _PaperResearchToolBase(ToolBase):
         }
 
     @classmethod
-    def _build_repo_match_context(
+    def _build_match_context(
         cls,
         *,
-        repo_dir: Path,
-        repo_relative_path: str,
+        root_dir: Path,
+        relative_path: str,
         line_number: int,
         context_lines: int,
         max_chars: int = 800,
     ) -> Dict[str, Any]:
         if context_lines <= 0:
             return {}
-        file_path = repo_dir / repo_relative_path
+        normalized_relative_path = _normalize_relative_path(relative_path)
+        if not normalized_relative_path:
+            return {}
+        file_path = Path(root_dir) / normalized_relative_path
         if not file_path.is_file():
             return {}
         preview = cls._read_text_payload(
@@ -2571,6 +2614,24 @@ class _PaperResearchToolBase(ToolBase):
             "context_text": preview.get("content"),
             "context_truncated": preview.get("truncated"),
         }
+
+    @classmethod
+    def _build_repo_match_context(
+        cls,
+        *,
+        repo_dir: Path,
+        repo_relative_path: str,
+        line_number: int,
+        context_lines: int,
+        max_chars: int = 800,
+    ) -> Dict[str, Any]:
+        return cls._build_match_context(
+            root_dir=repo_dir,
+            relative_path=repo_relative_path,
+            line_number=line_number,
+            context_lines=context_lines,
+            max_chars=max_chars,
+        )
 
     @classmethod
     def _repo_file_set(cls, workspace_dir: Path) -> Set[str]:
@@ -2598,1525 +2659,18 @@ class _PaperResearchToolBase(ToolBase):
                         files.add(relative_path)
                     except ValueError:
                         continue
+        project_repo_dir = workspace_dir / "repo" / "source"
+        if project_repo_dir.is_dir() and project_repo_dir != repo_dir:
+            for path in project_repo_dir.rglob("*"):
+                if path.is_file():
+                    try:
+                        relative_path = str(path.relative_to(project_repo_dir)).replace("\\", "/")
+                        if any(part in _REPO_SKIPPED_DIRS for part in relative_path.split("/")):
+                            continue
+                        files.add(relative_path)
+                    except ValueError:
+                        continue
         return files
-
-    @classmethod
-    def _grounding_section_defaults(cls) -> Dict[str, Dict[str, Any]]:
-        return {
-            "repo": {
-                "status": "unknown",
-                "url": None,
-                "resolved_ref": None,
-                "default_branch": None,
-                "commit_sha": None,
-                "blockers": [],
-                "blocker_details": [],
-            },
-            "entrypoint": {
-                "status": "unknown",
-                "candidates": [],
-                "selected_candidate": None,
-                "evidence_files": [],
-                "blockers": [],
-                "blocker_details": [],
-            },
-            "dataset": {
-                "status": "unknown",
-                "sources": [],
-                "access_mode": None,
-                "local_presence": {},
-                "blockers": [],
-                "blocker_details": [],
-                "alternative_source_candidates": [],
-            },
-            "runtime": {
-                "status": "unknown",
-                "inspection_summary": None,
-                "candidate_runtimes": [],
-                "tool_availability": {},
-                "blockers": [],
-                "blocker_details": [],
-            },
-            "external_dependencies": {
-                "status": "unknown",
-                "urls": [],
-                "probe_results": [],
-                "blockers": [],
-                "blocker_details": [],
-                "alternative_source_candidates": [],
-            },
-        }
-
-    @classmethod
-    def _grounding_completion_summary(cls, report: Dict[str, Any]) -> Dict[str, Any]:
-        summary = dict(report.get("summary") or {})
-        repo = dict(report.get("repo") or {})
-        entrypoint = dict(report.get("entrypoint") or {})
-        dataset = dict(report.get("dataset") or {})
-        runtime = dict(report.get("runtime") or {})
-        external_dependencies = dict(report.get("external_dependencies") or {})
-        repo_grounded = bool(summary.get("repo_grounded")) or str(repo.get("status") or "") == "grounded"
-        entrypoint_grounded = bool(summary.get("entrypoint_grounded")) or str(entrypoint.get("status") or "") == "grounded"
-        dataset_grounded = bool(summary.get("dataset_grounded")) or str(dataset.get("status") or "") == "grounded"
-        runtime_grounded = bool(summary.get("runtime_grounded")) or str(runtime.get("status") or "") == "grounded"
-        external_dependencies_grounded = bool(summary.get("external_dependencies_grounded")) or str(external_dependencies.get("status") or "") == "grounded"
-        section_blockers: List[str] = []
-        for section in (repo, entrypoint, dataset, runtime, external_dependencies):
-            for blocker in list(section.get("blockers") or []):
-                text = str(blocker or "").strip()
-                if text:
-                    section_blockers.append(text)
-            for detail in list(section.get("blocker_details") or []):
-                if not isinstance(detail, dict):
-                    continue
-                text = (
-                    str(detail.get("reason") or "").strip()
-                    or str(detail.get("message") or "").strip()
-                    or str(detail.get("summary") or "").strip()
-                )
-                if text:
-                    section_blockers.append(text)
-        for blocker in list(summary.get("blockers") or []):
-            text = str(blocker or "").strip()
-            if text:
-                section_blockers.append(text)
-        explicit_next_actions = [str(item).strip() for item in list(summary.get("next_actions") or []) if str(item).strip()]
-        explicit_status = str(summary.get("overall_status") or "").strip().lower()
-        if explicit_status not in cls._GROUNDING_STATUSES:
-            explicit_status = ""
-        explicit_run_decision = str(summary.get("run_decision") or "").strip().lower()
-        if explicit_run_decision not in {"ready", "runnable_with_patch", "blocked"}:
-            explicit_run_decision = ""
-        any_blocked = any(
-            str(section.get("status") or "").strip().lower() == "blocked"
-            for section in (repo, entrypoint, dataset, runtime, external_dependencies)
-        ) or bool(section_blockers)
-        all_grounded = all(
-            (
-                repo_grounded,
-                entrypoint_grounded,
-                dataset_grounded,
-                runtime_grounded,
-                external_dependencies_grounded,
-            )
-        )
-        if explicit_status:
-            overall_status = explicit_status
-        elif all_grounded:
-            overall_status = "grounded"
-        elif any_blocked:
-            overall_status = "blocked"
-        elif any(
-            str(section.get("status") or "").strip().lower() == "absent"
-            for section in (repo, entrypoint, dataset, runtime, external_dependencies)
-        ):
-            overall_status = "absent"
-        else:
-            overall_status = "unknown"
-        if explicit_run_decision:
-            run_decision = explicit_run_decision
-        elif repo_grounded and entrypoint_grounded and runtime_grounded and not any_blocked:
-            run_decision = "ready"
-        elif overall_status == "blocked":
-            run_decision = "blocked"
-        else:
-            run_decision = "unknown"
-        return {
-            "repo_grounded": repo_grounded,
-            "entrypoint_grounded": entrypoint_grounded,
-            "dataset_grounded": dataset_grounded,
-            "runtime_grounded": runtime_grounded,
-            "external_dependencies_grounded": external_dependencies_grounded,
-            "overall_status": overall_status,
-            "run_decision": run_decision,
-            "blockers": list(dict.fromkeys(section_blockers)),
-            "next_actions": explicit_next_actions,
-            "complete": run_decision in {"ready", "runnable_with_patch", "blocked"},
-            "ready_for_next_stage": run_decision in {"ready", "runnable_with_patch"},
-        }
-
-    @classmethod
-    def _normalize_grounding_report_payload(cls, payload: Dict[str, Any], *, workspace_dir: Path) -> Dict[str, Any]:
-        normalized = dict(payload or {})
-        repo_files = cls._repo_file_set(workspace_dir)
-        defaults = cls._grounding_section_defaults()
-        for section_name, section_defaults in defaults.items():
-            merged_section = dict(section_defaults)
-            merged_section.update(dict(normalized.get(section_name) or {}))
-            status = str(merged_section.get("status") or "unknown").strip().lower() or "unknown"
-            if status not in cls._GROUNDING_STATUSES:
-                status = "unknown"
-            merged_section["status"] = status
-            for list_field in (
-                "blockers",
-                "blocker_details",
-                "alternative_source_candidates",
-                "candidates",
-                "evidence_files",
-                "sources",
-                "candidate_runtimes",
-                "urls",
-                "probe_results",
-            ):
-                if list_field in merged_section and not isinstance(merged_section.get(list_field), list):
-                    merged_section[list_field] = []
-            normalized[section_name] = merged_section
-
-        summary = dict(normalized.get("summary") or {})
-        if not isinstance(summary.get("blockers") or [], list):
-            summary["blockers"] = []
-        if not isinstance(summary.get("next_actions") or [], list):
-            summary["next_actions"] = []
-        normalized["summary"] = summary
-
-        entrypoint = dict(normalized.get("entrypoint") or {})
-        selected_candidate = entrypoint.get("selected_candidate")
-        if selected_candidate is None and list(entrypoint.get("candidates") or []):
-            first_candidate = next(
-                (
-                    item
-                    for item in list(entrypoint.get("candidates") or [])
-                    if isinstance(item, dict) and cls._normalize_relative_path(item.get("path") or item.get("repo_relative_path") or item.get("path_or_hint") or "")
-                ),
-                None,
-            )
-            if first_candidate is not None:
-                entrypoint["selected_candidate"] = first_candidate
-        entrypoint_evidence: List[str] = []
-        for item in list(entrypoint.get("evidence_files") or []):
-            normalized_path = cls._normalize_relative_path(item)
-            if normalized_path:
-                entrypoint_evidence.append(normalized_path)
-        for candidate in list(entrypoint.get("candidates") or []):
-            if not isinstance(candidate, dict):
-                continue
-            candidate_path = cls._normalize_relative_path(
-                candidate.get("path")
-                or candidate.get("repo_relative_path")
-                or candidate.get("path_or_hint")
-                or ""
-            )
-            if candidate_path and not candidate_path.startswith("repo/source/") and candidate_path in repo_files:
-                candidate_path = f"repo/source/{candidate_path}"
-            if candidate_path:
-                entrypoint_evidence.append(candidate_path)
-        entrypoint["evidence_files"] = list(dict.fromkeys(entrypoint_evidence))
-        normalized["entrypoint"] = entrypoint
-
-        dataset = dict(normalized.get("dataset") or {})
-        if not list(dataset.get("sources") or []):
-            for alias in ("datasets", "items"):
-                if isinstance(dataset.get(alias), list):
-                    dataset["sources"] = list(dataset.get(alias) or [])
-                    break
-        normalized_sources: List[Any] = []
-        dataset_probe_results: List[Dict[str, Any]] = []
-        for item in list(dataset.get("sources") or []):
-            if not isinstance(item, dict):
-                normalized_sources.append(item)
-                continue
-            source = dict(item)
-            source_url = str(
-                source.get("url")
-                or source.get("source_url")
-                or source.get("download_url")
-                or source.get("href")
-                or source.get("link")
-                or ""
-            ).strip()
-            probe_result = source.get("probe_result")
-            if isinstance(probe_result, dict):
-                probe_payload = dict(probe_result)
-                if source_url:
-                    probe_payload.setdefault("url", source_url)
-                inferred_ok = cls._infer_probe_result_ok(probe_payload)
-                if inferred_ok is not None and "ok" not in probe_payload:
-                    probe_payload["ok"] = inferred_ok
-                source["probe_result"] = probe_payload
-                dataset_probe_results.append(probe_payload)
-                if (
-                    inferred_ok is True
-                    and str(source.get("status") or "").strip().lower() in {"", "unknown", "partial", "blocked"}
-                    and not list(source.get("blockers") or [])
-                ):
-                    source["status"] = "grounded"
-            normalized_sources.append(source)
-        dataset["sources"] = normalized_sources
-        local_presence = dataset.get("local_presence")
-        if isinstance(local_presence, bool):
-            dataset["local_presence"] = {"available": bool(local_presence)}
-        elif not isinstance(local_presence, dict):
-            dataset["local_presence"] = {}
-        dataset["blocker_details"] = cls._normalize_grounding_detail_items(dataset.get("blocker_details"))
-        dataset["alternative_source_candidates"] = cls._normalize_grounding_candidate_items(
-            dataset.get("alternative_source_candidates")
-        )
-        normalized["dataset"] = dataset
-
-        runtime = dict(normalized.get("runtime") or {})
-        tool_availability = runtime.get("tool_availability")
-        if not isinstance(tool_availability, dict):
-            runtime["tool_availability"] = {}
-        runtime["blocker_details"] = cls._normalize_grounding_detail_items(runtime.get("blocker_details"))
-        normalized["runtime"] = runtime
-
-        external_dependencies = dict(normalized.get("external_dependencies") or {})
-        raw_urls = list(external_dependencies.get("urls") or [])
-        existing_probe_results = [*list(external_dependencies.get("probe_results") or []), *dataset_probe_results]
-        normalized_urls: List[str] = []
-        flattened_probe_results: List[Dict[str, Any]] = []
-        for item in list(dataset.get("sources") or []):
-            if not isinstance(item, dict):
-                continue
-            dataset_url = str(
-                item.get("url")
-                or item.get("source_url")
-                or item.get("download_url")
-                or item.get("href")
-                or item.get("link")
-                or ""
-            ).strip()
-            if dataset_url:
-                normalized_urls.append(dataset_url)
-        for item in raw_urls:
-            if isinstance(item, str):
-                url = str(item or "").strip()
-                if url:
-                    normalized_urls.append(url)
-                continue
-            if not isinstance(item, dict):
-                continue
-            url = str(
-                item.get("url")
-                or item.get("source_url")
-                or item.get("download_url")
-                or item.get("href")
-                or item.get("link")
-                or ""
-            ).strip()
-            if url:
-                normalized_urls.append(url)
-            nested_probe_results = list(item.get("probe_results") or [])
-            singular_probe_result = item.get("probe_result")
-            if isinstance(singular_probe_result, dict):
-                nested_probe_results.append(singular_probe_result)
-            for probe in nested_probe_results:
-                if not isinstance(probe, dict):
-                    continue
-                probe_payload = dict(probe)
-                probe_payload.setdefault("url", url)
-                flattened_probe_results.append(probe_payload)
-        merged_probe_results: List[Dict[str, Any]] = []
-        for item in [*existing_probe_results, *flattened_probe_results]:
-            if isinstance(item, dict):
-                probe_payload = dict(item)
-                inferred_ok = cls._infer_probe_result_ok(probe_payload)
-                if inferred_ok is not None and "ok" not in probe_payload:
-                    probe_payload["ok"] = inferred_ok
-                merged_probe_results.append(probe_payload)
-        external_dependencies["urls"] = list(dict.fromkeys(url for url in normalized_urls if url))
-        external_dependencies["probe_results"] = merged_probe_results
-        external_dependencies["blocker_details"] = cls._normalize_grounding_detail_items(
-            external_dependencies.get("blocker_details")
-        )
-        external_dependencies["alternative_source_candidates"] = cls._normalize_grounding_candidate_items(
-            external_dependencies.get("alternative_source_candidates")
-        )
-        normalized["external_dependencies"] = external_dependencies
-
-        repo = dict(normalized.get("repo") or {})
-        repo["blocker_details"] = cls._normalize_grounding_detail_items(repo.get("blocker_details"))
-        repo_verification = str(repo.get("verification_status") or "").strip().lower()
-        if (
-            str(repo.get("status") or "").strip().lower() == "unknown"
-            and not list(repo.get("blockers") or [])
-            and not list(repo.get("blocker_details") or [])
-        ):
-            if repo_verification in {"verified", "cloneable", "ready"} or (
-                str(repo.get("url") or "").strip()
-                and (
-                    str(repo.get("resolved_ref") or "").strip()
-                    or str(repo.get("default_branch") or "").strip()
-                    or str(repo.get("commit_sha") or "").strip()
-                )
-            ):
-                repo["status"] = "grounded"
-        normalized["repo"] = repo
-
-        entrypoint = dict(normalized.get("entrypoint") or {})
-        entrypoint_verification = str(entrypoint.get("verification_status") or "").strip().lower()
-        if (
-            str(entrypoint.get("status") or "").strip().lower() == "unknown"
-            and not list(entrypoint.get("blockers") or [])
-            and not list(entrypoint.get("blocker_details") or [])
-        ):
-            has_selected_candidate = isinstance(entrypoint.get("selected_candidate"), dict)
-            has_evidence = bool(list(entrypoint.get("evidence_files") or []))
-            if entrypoint_verification == "verified" or (has_selected_candidate and has_evidence):
-                entrypoint["status"] = "grounded"
-        normalized["entrypoint"] = entrypoint
-
-        summary = dict(normalized.get("summary") or {})
-        dataset_source_urls = cls._extract_grounding_urls(dataset.get("sources"))
-        external_urls = cls._extract_grounding_urls(external_dependencies.get("urls"))
-        successful_probe_urls, failed_probe_urls = cls._probe_result_url_sets(external_dependencies.get("probe_results"))
-        failed_probe_map = cls._failed_probe_result_map(external_dependencies.get("probe_results"))
-
-        dataset_status = str(dataset.get("status") or "").strip().lower()
-        if dataset_status != "blocked":
-            if any(url in failed_probe_urls for url in dataset_source_urls):
-                dataset["status"] = "blocked"
-            elif bool(dict(dataset.get("local_presence") or {}).get("available")):
-                dataset["status"] = "grounded"
-            elif dataset_source_urls and all(url in successful_probe_urls for url in dataset_source_urls):
-                dataset["status"] = "grounded"
-        external_status = str(external_dependencies.get("status") or "").strip().lower()
-        if external_status != "blocked":
-            if any(url in failed_probe_urls for url in external_urls):
-                external_dependencies["status"] = "blocked"
-            elif external_urls and all(url in successful_probe_urls for url in external_urls):
-                external_dependencies["status"] = "grounded"
-
-        cls._merge_probe_failures_into_grounding_section(
-            dataset,
-            urls=dataset_source_urls,
-            failed_probe_map=failed_probe_map,
-            label_resolver=cls._dataset_source_label_map(dataset.get("sources")),
-            code="official_dataset_source_blocked",
-            blocker_prefix="Official dataset source blocked",
-        )
-        cls._merge_probe_failures_into_grounding_section(
-            external_dependencies,
-            urls=external_urls,
-            failed_probe_map=failed_probe_map,
-            label_resolver={},
-            code="official_external_dependency_blocked",
-            blocker_prefix="Official external dependency blocked",
-        )
-        normalized["dataset"] = dataset
-        normalized["external_dependencies"] = external_dependencies
-
-        completion = cls._grounding_completion_summary(normalized)
-        section_blockers = list(completion.get("blockers") or [])
-        if not list(summary.get("blockers") or []):
-            summary["blockers"] = section_blockers
-        else:
-            summary["blockers"] = list(
-                dict.fromkeys(str(item).strip() for item in list(summary.get("blockers") or []) if str(item).strip())
-            )
-        for field in (
-            "repo_grounded",
-            "entrypoint_grounded",
-            "dataset_grounded",
-            "runtime_grounded",
-            "external_dependencies_grounded",
-            "overall_status",
-        ):
-            summary[field] = completion[field]
-        summary["run_decision"] = completion["run_decision"]
-        existing_next_actions = [
-            str(item).strip()
-            for item in list(summary.get("next_actions") or [])
-            if str(item).strip()
-        ]
-        if existing_next_actions:
-            summary["next_actions"] = existing_next_actions
-        else:
-            next_actions: List[str] = []
-            blocked_source_search_needed = (
-                (
-                    str(dataset.get("status") or "").strip().lower() == "blocked"
-                    and not list(dataset.get("alternative_source_candidates") or [])
-                )
-                or (
-                    str(external_dependencies.get("status") or "").strip().lower() == "blocked"
-                    and not list(external_dependencies.get("alternative_source_candidates") or [])
-                )
-            )
-            if blocked_source_search_needed:
-                next_actions.append(
-                    "对 blocked 官方链接做一次 focused web_search/web_scrape，记录 `alternative_source_candidates`；不要覆盖 official blocker。"
-                )
-            if str(runtime.get("status") or "").strip().lower() == "unknown":
-                next_actions.append("调用 `paper_research_inspect_runtime`，把 runtime 收敛成 grounded/absent/blocked。")
-            if str(repo.get("status") or "").strip().lower() == "unknown":
-                next_actions.append("继续 probe/clone repo，补齐 repo commit/ref 与 blocker 归因。")
-            if str(entrypoint.get("status") or "").strip().lower() == "unknown":
-                next_actions.append("继续 read/search repo，确认 entrypoint candidate、selected_candidate 与 evidence_files。")
-            if completion["run_decision"] == "unknown":
-                next_actions.append("先判断 repo 主路径能否运行；必要时调用 `paper_research_assess_repo_mainpath`，再把结论写入 `summary.run_decision`。")
-            summary["next_actions"] = list(dict.fromkeys(next_actions))
-        normalized["summary"] = summary
-        return normalized
-
-    @staticmethod
-    def _extract_grounding_urls(items: Any) -> List[str]:
-        urls: List[str] = []
-        for item in list(items or []):
-            candidate = ""
-            if isinstance(item, str):
-                candidate = item
-            elif isinstance(item, dict):
-                for key in ("url", "source_url", "download_url", "href", "link"):
-                    raw_value = str(item.get(key) or "").strip()
-                    if raw_value:
-                        candidate = raw_value
-                        break
-            normalized = str(candidate or "").strip()
-            if normalized.startswith(("http://", "https://")):
-                urls.append(normalized)
-        return list(dict.fromkeys(urls))
-
-    @classmethod
-    def _probe_result_url_sets(cls, probe_results: Any) -> tuple[set[str], set[str]]:
-        successful: set[str] = set()
-        failed: set[str] = set()
-        for item in list(probe_results or []):
-            if not isinstance(item, dict):
-                continue
-            url = str(item.get("url") or item.get("final_url") or "").strip()
-            if not url.startswith(("http://", "https://")):
-                continue
-            inferred_ok = cls._infer_probe_result_ok(item)
-            if inferred_ok is True:
-                successful.add(url)
-            elif inferred_ok is False:
-                failed.add(url)
-        return successful, failed
-
-    @staticmethod
-    def _infer_probe_result_ok(item: Dict[str, Any]) -> Optional[bool]:
-        if "ok" in item:
-            raw_ok = item.get("ok")
-            if isinstance(raw_ok, bool):
-                return raw_ok
-            return None
-        raw_valid = item.get("valid")
-        if isinstance(raw_valid, bool):
-            return raw_valid
-        diagnosis = str(item.get("diagnosis") or "").strip().lower()
-        if diagnosis.startswith("valid_") or diagnosis in {"ready", "ok", "downloadable", "reference_page_ok", "followed_link_ok"}:
-            return True
-        if diagnosis in {
-            "auth_required",
-            "forbidden",
-            "not_found",
-            "accepted_but_empty",
-            "redirect_broken",
-            "checksum_mismatch",
-            "gdrive_confirm_required",
-            "html_page",
-            "html_landing_page_for_file",
-            "license_gate",
-            "manual_download_required",
-            "follow_link_failed",
-            "follow_link_cycle",
-            "follow_depth_exceeded",
-            "repo_unreachable",
-            "repo_page_reachable_but_not_cloneable",
-        }:
-            return False
-        detected_kind = str(item.get("detected_kind") or item.get("kind") or "").strip().lower()
-        if detected_kind == "html":
-            return False
-        content_type = str(item.get("content_type") or "").strip().lower()
-        if "text/html" in content_type:
-            return False
-        raw_status = item.get("status_code", item.get("status"))
-        try:
-            status_code = int(raw_status)
-        except (TypeError, ValueError):
-            status_code = None
-        if status_code is not None:
-            if status_code in {200, 206}:
-                return True
-            if status_code >= 400:
-                return False
-        downloadable = item.get("downloadable")
-        if isinstance(downloadable, bool):
-            return downloadable
-        return None
-
-    @staticmethod
-    def _normalize_grounding_detail_items(items: Any) -> List[Dict[str, Any]]:
-        normalized: List[Dict[str, Any]] = []
-        for item in list(items or []):
-            if isinstance(item, str):
-                text = str(item or "").strip()
-                if text:
-                    normalized.append({"reason": text})
-                continue
-            if not isinstance(item, dict):
-                continue
-            payload = {str(key): value for key, value in dict(item).items() if str(key).strip()}
-            if payload:
-                normalized.append(payload)
-        return normalized
-
-    @staticmethod
-    def _normalize_grounding_candidate_items(items: Any) -> List[Dict[str, Any]]:
-        normalized: List[Dict[str, Any]] = []
-        for item in list(items or []):
-            if isinstance(item, str):
-                text = str(item or "").strip()
-                if text:
-                    normalized.append({"label": text})
-                continue
-            if not isinstance(item, dict):
-                continue
-            payload = {str(key): value for key, value in dict(item).items() if str(key).strip()}
-            if payload:
-                normalized.append(payload)
-        return normalized
-
-    @classmethod
-    def _failed_probe_result_map(cls, probe_results: Any) -> Dict[str, Dict[str, Any]]:
-        failed: Dict[str, Dict[str, Any]] = {}
-        for item in list(probe_results or []):
-            if not isinstance(item, dict):
-                continue
-            url = str(item.get("url") or item.get("final_url") or "").strip()
-            if not url.startswith(("http://", "https://")):
-                continue
-            if cls._infer_probe_result_ok(item) is False and url not in failed:
-                failed[url] = dict(item)
-        return failed
-
-    @staticmethod
-    def _dataset_source_label_map(items: Any) -> Dict[str, str]:
-        labels: Dict[str, str] = {}
-        for item in list(items or []):
-            if not isinstance(item, dict):
-                continue
-            url = str(
-                item.get("url")
-                or item.get("source_url")
-                or item.get("download_url")
-                or item.get("href")
-                or item.get("link")
-                or ""
-            ).strip()
-            label = str(item.get("name") or item.get("label") or item.get("title") or "").strip()
-            if url and label:
-                labels[url] = label
-        return labels
-
-    @classmethod
-    def _merge_probe_failures_into_grounding_section(
-        cls,
-        section: Dict[str, Any],
-        *,
-        urls: Sequence[str],
-        failed_probe_map: Dict[str, Dict[str, Any]],
-        label_resolver: Dict[str, str],
-        code: str,
-        blocker_prefix: str,
-    ) -> None:
-        if str(section.get("status") or "").strip().lower() != "blocked":
-            return
-        blockers = [str(item).strip() for item in list(section.get("blockers") or []) if str(item).strip()]
-        blocker_details = cls._normalize_grounding_detail_items(section.get("blocker_details"))
-        existing_targets = {
-            str(detail.get("target_url") or detail.get("url") or detail.get("target") or "").strip()
-            for detail in blocker_details
-            if isinstance(detail, dict)
-        }
-        for url in list(urls or []):
-            failure = failed_probe_map.get(url)
-            if not failure or url in existing_targets:
-                continue
-            diagnosis = str(failure.get("diagnosis") or "").strip().lower()
-            raw_status = failure.get("status_code", failure.get("status"))
-            try:
-                status_code = int(raw_status)
-            except (TypeError, ValueError):
-                status_code = None
-            label = str(label_resolver.get(url) or "").strip()
-            target_text = label or url
-            suffix_parts: List[str] = []
-            if status_code is not None:
-                suffix_parts.append(f"HTTP {status_code}")
-            if diagnosis:
-                suffix_parts.append(diagnosis)
-            suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
-            reason = f"{blocker_prefix}: {target_text}{suffix}"
-            blockers.append(reason)
-            blocker_details.append(
-                {
-                    "code": code,
-                    "target": label or None,
-                    "target_url": url,
-                    "reason": reason,
-                    "diagnosis": diagnosis or None,
-                    "status_code": status_code,
-                }
-            )
-        section["blockers"] = list(dict.fromkeys(item for item in blockers if item))
-        section["blocker_details"] = blocker_details
-
-    @classmethod
-    def _validate_grounding_report_payload(cls, payload: Dict[str, Any], *, workspace_dir: Path) -> List[str]:
-        from app.services.project_runtime_service import ProjectRuntimeService
-
-        errors: List[str] = []
-        required_sections = ("repo", "entrypoint", "dataset", "runtime", "external_dependencies", "summary")
-        for section in required_sections:
-            if not isinstance(payload.get(section), dict):
-                errors.append(f"`{section}` must be an object.")
-
-        repo = dict(payload.get("repo") or {})
-        entrypoint = dict(payload.get("entrypoint") or {})
-        dataset = dict(payload.get("dataset") or {})
-        runtime = dict(payload.get("runtime") or {})
-        external_dependencies = dict(payload.get("external_dependencies") or {})
-        summary = dict(payload.get("summary") or {})
-
-        for section_name, section in (
-            ("repo", repo),
-            ("entrypoint", entrypoint),
-            ("dataset", dataset),
-            ("runtime", runtime),
-            ("external_dependencies", external_dependencies),
-        ):
-            status = str(section.get("status") or "").strip().lower()
-            if status not in cls._GROUNDING_STATUSES:
-                errors.append(
-                    f"`{section_name}.status` must be one of {sorted(cls._GROUNDING_STATUSES)}, got `{status}`."
-                )
-            blockers = section.get("blockers")
-            if blockers is not None and not isinstance(blockers, list):
-                errors.append(f"`{section_name}.blockers` must be a list when provided.")
-            blocker_details = section.get("blocker_details")
-            if blocker_details is not None and not isinstance(blocker_details, list):
-                errors.append(f"`{section_name}.blocker_details` must be a list when provided.")
-            elif isinstance(blocker_details, list):
-                for index, item in enumerate(blocker_details):
-                    if not isinstance(item, dict):
-                        errors.append(f"`{section_name}.blocker_details[{index}]` must be an object.")
-
-        repo_url = str(repo.get("url") or "").strip()
-        if repo_url and not repo_url.startswith(("http://", "https://", "git@")):
-            errors.append("`repo.url` must be http(s) or git@ when provided.")
-        entrypoint_evidence = entrypoint.get("evidence_files")
-        if entrypoint_evidence is not None and not isinstance(entrypoint_evidence, list):
-            errors.append("`entrypoint.evidence_files` must be a list when provided.")
-        else:
-            for item in list(entrypoint_evidence or []):
-                relative_path = cls._normalize_relative_path(item)
-                if not relative_path:
-                    errors.append(f"`entrypoint.evidence_files` contains invalid path `{item}`.")
-                    continue
-                resolved = ProjectRuntimeService.resolve_workspace_path(workspace_dir, relative_path, require_exists=False)
-                if resolved is None:
-                    errors.append(f"`entrypoint.evidence_files` contains out-of-scope path `{relative_path}`.")
-
-        if dataset.get("sources") is not None and not isinstance(dataset.get("sources"), list):
-            errors.append("`dataset.sources` must be a list when provided.")
-        if not isinstance(dataset.get("local_presence") or {}, dict):
-            errors.append("`dataset.local_presence` must be an object.")
-        if dataset.get("alternative_source_candidates") is not None and not isinstance(dataset.get("alternative_source_candidates"), list):
-            errors.append("`dataset.alternative_source_candidates` must be a list when provided.")
-        elif isinstance(dataset.get("alternative_source_candidates"), list):
-            for index, item in enumerate(list(dataset.get("alternative_source_candidates") or [])):
-                if not isinstance(item, dict):
-                    errors.append(f"`dataset.alternative_source_candidates[{index}]` must be an object.")
-        if runtime.get("candidate_runtimes") is not None and not isinstance(runtime.get("candidate_runtimes"), list):
-            errors.append("`runtime.candidate_runtimes` must be a list when provided.")
-        if runtime.get("tool_availability") is not None and not isinstance(runtime.get("tool_availability"), dict):
-            errors.append("`runtime.tool_availability` must be an object when provided.")
-        if external_dependencies.get("urls") is not None and not isinstance(external_dependencies.get("urls"), list):
-            errors.append("`external_dependencies.urls` must be a list when provided.")
-        if external_dependencies.get("probe_results") is not None and not isinstance(external_dependencies.get("probe_results"), list):
-            errors.append("`external_dependencies.probe_results` must be a list when provided.")
-        else:
-            for index, item in enumerate(list(external_dependencies.get("probe_results") or [])):
-                if not isinstance(item, dict):
-                    errors.append(f"`external_dependencies.probe_results[{index}]` must be an object.")
-                    continue
-                url = str(item.get("url") or item.get("final_url") or "").strip()
-                if not url.startswith(("http://", "https://")):
-                    errors.append(
-                        f"`external_dependencies.probe_results[{index}]` must include a valid `url` or `final_url`."
-                    )
-                inferred_ok = cls._infer_probe_result_ok(item)
-                if "ok" in item and not isinstance(item.get("ok"), bool):
-                    errors.append(f"`external_dependencies.probe_results[{index}].ok` must be a boolean.")
-                elif inferred_ok is None:
-                    errors.append(
-                        f"`external_dependencies.probe_results[{index}]` must include a boolean `ok`, "
-                        "or enough status/diagnosis fields to infer success."
-                    )
-        if external_dependencies.get("alternative_source_candidates") is not None and not isinstance(external_dependencies.get("alternative_source_candidates"), list):
-            errors.append("`external_dependencies.alternative_source_candidates` must be a list when provided.")
-        elif isinstance(external_dependencies.get("alternative_source_candidates"), list):
-            for index, item in enumerate(list(external_dependencies.get("alternative_source_candidates") or [])):
-                if not isinstance(item, dict):
-                    errors.append(f"`external_dependencies.alternative_source_candidates[{index}]` must be an object.")
-
-        dataset_status = str(dataset.get("status") or "").strip().lower()
-        external_status = str(external_dependencies.get("status") or "").strip().lower()
-        local_presence = dict(dataset.get("local_presence") or {})
-        dataset_source_urls = cls._extract_grounding_urls(dataset.get("sources"))
-        external_urls = cls._extract_grounding_urls(external_dependencies.get("urls"))
-        successful_probe_urls, failed_probe_urls = cls._probe_result_url_sets(external_dependencies.get("probe_results"))
-
-        if external_status == "grounded":
-            if not external_urls:
-                errors.append(
-                    "`external_dependencies.status` is `grounded` but `external_dependencies.urls` is empty."
-                )
-            missing_external_probes = [url for url in external_urls if url not in successful_probe_urls]
-            if missing_external_probes:
-                preview = ", ".join(missing_external_probes[:4])
-                errors.append(
-                    "`external_dependencies.status` is `grounded` but these urls do not have successful "
-                    f"`probe_results`: {preview}."
-                )
-            failed_external_urls = [url for url in external_urls if url in failed_probe_urls]
-            if failed_external_urls:
-                preview = ", ".join(failed_external_urls[:4])
-                errors.append(
-                    "`external_dependencies.status` is `grounded` but these urls have failed probe results: "
-                    f"{preview}."
-                )
-
-        if dataset_status == "grounded" and dataset_source_urls and not bool(local_presence.get("available")):
-            missing_dataset_probes = [url for url in dataset_source_urls if url not in successful_probe_urls]
-            if missing_dataset_probes:
-                preview = ", ".join(missing_dataset_probes[:4])
-                errors.append(
-                    "`dataset.status` is `grounded`, but these remote dataset sources do not have successful "
-                    f"probe results and `dataset.local_presence.available` is not true: {preview}."
-                )
-
-        for field in (
-            "repo_grounded",
-            "entrypoint_grounded",
-            "dataset_grounded",
-            "runtime_grounded",
-            "external_dependencies_grounded",
-        ):
-            if field in summary and not isinstance(summary.get(field), bool):
-                errors.append(f"`summary.{field}` must be a boolean.")
-        overall_status = str(summary.get("overall_status") or "").strip().lower()
-        if overall_status and overall_status not in cls._GROUNDING_STATUSES:
-            errors.append(
-                f"`summary.overall_status` must be one of {sorted(cls._GROUNDING_STATUSES)}, got `{overall_status}`."
-            )
-        run_decision = str(summary.get("run_decision") or "").strip().lower()
-        if run_decision and run_decision not in {"ready", "runnable_with_patch", "blocked"}:
-            errors.append("`summary.run_decision` must be one of ready/runnable_with_patch/blocked when provided.")
-        if run_decision in {"ready", "runnable_with_patch"}:
-            missing_prereqs: List[str] = []
-            if str(repo.get("status") or "").strip().lower() != "grounded":
-                missing_prereqs.append("repo")
-            if str(entrypoint.get("status") or "").strip().lower() != "grounded":
-                missing_prereqs.append("entrypoint")
-            if str(runtime.get("status") or "").strip().lower() != "grounded":
-                missing_prereqs.append("runtime")
-            if missing_prereqs:
-                errors.append(
-                    "`summary.run_decision` marks the main path as runnable, but these sections are not grounded: "
-                    + ", ".join(missing_prereqs)
-                    + "."
-                )
-        if summary.get("next_actions") is not None and not isinstance(summary.get("next_actions"), list):
-            errors.append("`summary.next_actions` must be a list when provided.")
-        if summary.get("blockers") is not None and not isinstance(summary.get("blockers"), list):
-            errors.append("`summary.blockers` must be a list when provided.")
-        return errors
-
-    @staticmethod
-    def _structured_validation_issue(
-        *,
-        path: str,
-        code: str,
-        message: str,
-        evidence_needed: Optional[str] = None,
-        suggested_tool_calls: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "path": path,
-            "code": code,
-            "message": message,
-        }
-        if evidence_needed:
-            payload["evidence_needed"] = evidence_needed
-        if suggested_tool_calls:
-            payload["suggested_tool_calls"] = suggested_tool_calls
-        return payload
-
-    @classmethod
-    def _structured_grounding_validation_errors(
-        cls,
-        *,
-        project_id: int,
-        payload: Dict[str, Any],
-        validation_errors: Sequence[str],
-    ) -> List[Dict[str, Any]]:
-        issues: List[Dict[str, Any]] = []
-        dataset = dict(payload.get("dataset") or {})
-        external_dependencies = dict(payload.get("external_dependencies") or {})
-        dataset_source_urls = cls._extract_grounding_urls(dataset.get("sources"))
-        external_urls = cls._extract_grounding_urls(external_dependencies.get("urls"))
-
-        for raw_error in validation_errors:
-            message = str(raw_error or "").strip()
-            if not message:
-                continue
-            if message.startswith("`dataset.status` is `grounded`, but these remote dataset sources do not have successful "):
-                issues.append(
-                    cls._structured_validation_issue(
-                        path="dataset.sources",
-                        code="missing_probe_or_local_evidence",
-                        message=message,
-                        evidence_needed="successful probe result for each required dataset URL, or dataset.local_presence.available=true",
-                        suggested_tool_calls=[
-                            {
-                                "tool": "paper_research_probe_url",
-                                "args": {
-                                    "project_id": project_id,
-                                    "url": url,
-                                    "expected_kind": "file",
-                                    "resolve_download_gate": True,
-                                },
-                            }
-                            for url in dataset_source_urls[:4]
-                        ]
-                        or None,
-                    )
-                )
-                continue
-            if message.startswith("`external_dependencies.status` is `grounded` but these urls do not have successful "):
-                issues.append(
-                    cls._structured_validation_issue(
-                        path="external_dependencies.urls",
-                        code="missing_successful_probe",
-                        message=message,
-                        evidence_needed="successful probe result for each required external URL",
-                        suggested_tool_calls=[
-                            {
-                                "tool": "paper_research_probe_url",
-                                "args": {
-                                    "project_id": project_id,
-                                    "url": url,
-                                    "resolve_download_gate": True,
-                                },
-                            }
-                            for url in external_urls[:4]
-                        ]
-                        or None,
-                    )
-                )
-                continue
-            if message.startswith("`external_dependencies.status` is `grounded` but these urls have failed probe results:"):
-                issues.append(
-                    cls._structured_validation_issue(
-                        path="external_dependencies.probe_results",
-                        code="failed_probe_present",
-                        message=message,
-                        evidence_needed="replace failed probe results with successful ones, or mark the section blocked/partial instead of grounded",
-                    )
-                )
-                continue
-            if message.startswith("`summary.run_decision` marks the main path as runnable, but these sections are not grounded:"):
-                issues.append(
-                    cls._structured_validation_issue(
-                        path="summary.run_decision",
-                        code="run_decision_conflicts_with_sections",
-                        message=message,
-                        evidence_needed="align run_decision with grounded repo/entrypoint/runtime evidence",
-                    )
-                )
-                continue
-            field_match = re.match(r"^`([^`]+)` (must .+)$", message)
-            if field_match:
-                issues.append(
-                    cls._structured_validation_issue(
-                        path=field_match.group(1),
-                        code="schema_constraint_failed",
-                        message=message,
-                    )
-                )
-                continue
-            issues.append(
-                cls._structured_validation_issue(
-                    path="unknown",
-                    code="validation_error",
-                    message=message,
-                )
-            )
-        return issues
-
-    @classmethod
-    def _implementation_grounding_conflicts(
-        cls,
-        *,
-        payload: Dict[str, Any],
-        grounding_report: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        if not isinstance(grounding_report, dict) or not grounding_report:
-            return []
-        conflicts: List[Dict[str, Any]] = []
-        summary = dict(grounding_report.get("summary") or {})
-        entrypoint = dict(grounding_report.get("entrypoint") or {})
-        readiness = dict(payload.get("readiness") or {})
-        baseline = dict(payload.get("baseline") or {})
-
-        run_decision = str(summary.get("run_decision") or "").strip().lower()
-        if bool(readiness.get("can_execute")) and run_decision not in {"ready", "runnable_with_patch"}:
-            conflicts.append(
-                {
-                    "path": "readiness.can_execute",
-                    "code": "conflicts_with_grounding_run_decision",
-                    "message": (
-                        f"`readiness.can_execute=true` but `grounding_report.summary.run_decision={run_decision or 'unknown'}`."
-                    ),
-                }
-            )
-        external_grounded = summary.get("external_dependencies_grounded")
-        if isinstance(readiness.get("external_dependencies_grounded"), bool) and isinstance(external_grounded, bool):
-            if readiness.get("external_dependencies_grounded") != external_grounded:
-                conflicts.append(
-                    {
-                        "path": "readiness.external_dependencies_grounded",
-                        "code": "conflicts_with_grounding_summary",
-                        "message": (
-                            "`readiness.external_dependencies_grounded` does not match "
-                            "`grounding_report.summary.external_dependencies_grounded`."
-                        ),
-                    }
-                )
-        selected_candidate = dict(entrypoint.get("selected_candidate") or {})
-        grounded_path = str(selected_candidate.get("path") or "").strip()
-        entrypoint_path = cls._normalize_repo_relative_path(baseline.get("entrypoint_path_or_hint"))
-        if grounded_path and entrypoint_path and grounded_path != entrypoint_path:
-            conflicts.append(
-                {
-                    "path": "baseline.entrypoint_path_or_hint",
-                    "code": "conflicts_with_grounding_entrypoint",
-                    "message": (
-                        f"`baseline.entrypoint_path_or_hint={entrypoint_path}` does not match "
-                        f"`grounding_report.entrypoint.selected_candidate.path={grounded_path}`."
-                    ),
-                }
-            )
-        return conflicts
-
-    @classmethod
-    def _group_run_draft_validation_errors(
-        cls,
-        *,
-        payload: Dict[str, Any],
-        validation_errors: Sequence[str],
-    ) -> Dict[str, Any]:
-        drafts = [dict(item) for item in list(payload.get("drafts") or []) if isinstance(item, dict)]
-        grouped: Dict[int, Dict[str, Any]] = {}
-        global_errors: List[Dict[str, Any]] = []
-
-        for raw_error in validation_errors:
-            message = str(raw_error or "").strip()
-            if not message:
-                continue
-            match = re.match(r"^drafts\[(\d+)\]\.([^\s]+)\s+(.*)$", message)
-            if match:
-                draft_index = int(match.group(1))
-                field_path = match.group(2)
-                suffix = match.group(3).strip()
-                draft = drafts[draft_index] if 0 <= draft_index < len(drafts) else {}
-                bucket = grouped.setdefault(
-                    draft_index,
-                    {
-                        "draft_index": draft_index,
-                        "draft_id": str(draft.get("id") or "").strip() or None,
-                        "title": str(draft.get("title") or "").strip() or None,
-                        "errors": [],
-                    },
-                )
-                bucket["errors"].append(
-                    {
-                        "path": field_path,
-                        "code": "draft_field_invalid",
-                        "message": f"drafts[{draft_index}].{field_path} {suffix}",
-                    }
-                )
-                continue
-            if message.startswith("`drafts` must be a non-empty list."):
-                global_errors.append(
-                    {
-                        "path": "drafts",
-                        "code": "missing_drafts",
-                        "message": message,
-                    }
-                )
-                continue
-            global_errors.append(
-                {
-                    "path": "unknown",
-                    "code": "validation_error",
-                    "message": message,
-                }
-            )
-        return {
-            "draft_errors": [grouped[index] for index in sorted(grouped)],
-            "global_errors": global_errors,
-        }
-
-    @classmethod
-    def _read_grounding_report_payload(cls, workspace_dir: Path) -> Dict[str, Any]:
-        return cls._read_json_file(workspace_dir / "specs" / "grounding_report.json")
-
-    @classmethod
-    def _grounding_gate_state(cls, workspace_dir: Path) -> Dict[str, Any]:
-        report = cls._read_grounding_report_payload(workspace_dir)
-        if not report:
-            return {
-                "ready": False,
-                "status": "missing",
-                "relative_path": "specs/grounding_report.json",
-                "blockers": [],
-                "next_actions": ["先完成 grounding，并写入 `specs/grounding_report.json`。"],
-                "report": {},
-            }
-        completion = cls._grounding_completion_summary(report)
-        return {
-            "ready": bool(completion.get("ready_for_next_stage")),
-            "complete": bool(completion.get("complete")),
-            "status": str(completion.get("overall_status") or "unknown"),
-            "run_decision": str(completion.get("run_decision") or "unknown"),
-            "relative_path": "specs/grounding_report.json",
-            "blockers": list(completion.get("blockers") or []),
-            "next_actions": list(completion.get("next_actions") or []),
-            "report": report,
-        }
-
-    @classmethod
-    def _grounding_gate_result(
-        cls,
-        *,
-        project_payload: Dict[str, Any],
-        workspace: Any,
-        stage_name: str,
-        action_label: str,
-        gate_state: Dict[str, Any],
-    ) -> ToolResult:
-        blockers = [str(item).strip() for item in list(gate_state.get("blockers") or []) if str(item).strip()]
-        next_actions = [str(item).strip() for item in list(gate_state.get("next_actions") or []) if str(item).strip()]
-        status = str(gate_state.get("status") or "missing")
-        lines = [
-            f"{action_label} 前，必须先完成 grounding 阶段。",
-            f"- Project: /projects/{int(project_payload.get('id') or 0)}",
-            f"- Grounding report: {gate_state.get('relative_path')}",
-            f"- Grounding status: {status}",
-            f"- Run decision: {gate_state.get('run_decision') or 'unknown'}",
-        ]
-        if blockers:
-            lines.append("- Grounding blockers:")
-            lines.extend(f"  - {item}" for item in blockers[:8])
-        if next_actions:
-            lines.append("- Recommended next actions:")
-            lines.extend(f"  - {item}" for item in next_actions[:6])
-        else:
-            if status == "blocked":
-                lines.append("- Recommended next action: 对 blocked 官方链接做一次 focused web_search/web_scrape，记录 alternative_source_candidates；若仍无可信候选，再报告 blocker。")
-            else:
-                lines.append("- Recommended next action: 先 probe repo/url、inspect runtime，并写入 grounding_report。")
-        return ToolResult(
-            success=False,
-            output="\n".join(lines),
-            error="grounding_blocked" if status == "blocked" else "grounding_incomplete",
-            data={
-                **cls._root_descriptor(project_payload=project_payload, workspace=workspace),
-                "project_id": int(project_payload.get("id") or 0),
-                "current_stage": "grounding",
-                "blocked_stage": stage_name,
-                "grounding_report_relative_path": gate_state.get("relative_path"),
-                "grounding_status": status,
-                "grounding_complete": bool(gate_state.get("complete")),
-                "grounding_ready": bool(gate_state.get("ready")),
-                "run_decision": gate_state.get("run_decision"),
-                "grounding_blockers": blockers,
-                "next_actions": next_actions,
-            },
-        )
-
-    @classmethod
-    def _normalize_implementation_spec_payload(
-        cls,
-        payload: Dict[str, Any],
-        *,
-        workspace_dir: Path,
-        runtime_inspection: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        normalized = dict(payload or {})
-        repo_files = cls._repo_file_set(workspace_dir)
-        runtime_payload = dict(runtime_inspection or {})
-        detected_repo_root = str(dict(runtime_payload.get("repo") or {}).get("detected_root_relative_path") or "").strip() or "repo/source"
-        normalized["repo_root_relative_path"] = detected_repo_root
-
-        repo_evidence = dict(normalized.get("repo_evidence") or {})
-        dataset_structure = dict(repo_evidence.get("dataset_structure") or {})
-        expected_dataset_files = [
-            cls._normalize_relative_path(item)
-            for item in list(dataset_structure.get("expected_files") or [])
-            if cls._normalize_relative_path(item)
-        ]
-        existing_dataset_files = [item for item in expected_dataset_files if item in repo_files]
-        missing_dataset_files = [item for item in expected_dataset_files if item not in repo_files]
-        dataset_ready = bool(expected_dataset_files) and not missing_dataset_files
-        if expected_dataset_files:
-            dataset_structure["existing_files"] = existing_dataset_files
-            dataset_structure["missing_files"] = missing_dataset_files
-            dataset_structure["current_status"] = "present_in_repo" if dataset_ready else ("partial" if existing_dataset_files else str(dataset_structure.get("current_status") or "missing"))
-            repo_evidence["dataset_structure"] = dataset_structure
-            normalized["repo_evidence"] = repo_evidence
-
-        runtime_requirements = dict(normalized.get("runtime_requirements") or {})
-        worker_environment = dict(dict(runtime_payload.get("runtime_worker") or {}).get("environment") or {})
-        worker_packages = dict(worker_environment.get("packages") or {})
-        worker_commands = dict(worker_environment.get("commands") or {})
-        package_aliases = {
-            "sklearn": "scikit-learn",
-            "scikit_learn": "scikit-learn",
-            "jupyter_repo2docker": "jupyter-repo2docker",
-        }
-        missing_runtime_packages: List[str] = []
-        for item in list(runtime_requirements.get("dependencies") or []):
-            package_name = str(item or "").strip()
-            if not package_name:
-                continue
-            normalized_name = package_aliases.get(package_name.replace("-", "_").lower(), package_name)
-            package_payload = dict(worker_packages.get(normalized_name) or worker_packages.get(package_name) or {})
-            if not bool(package_payload.get("installed")):
-                missing_runtime_packages.append(package_name)
-        if missing_runtime_packages:
-            runtime_requirements["missing_packages"] = missing_runtime_packages
-        elif "missing_packages" in runtime_requirements:
-            runtime_requirements["missing_packages"] = []
-        if runtime_requirements:
-            normalized["runtime_requirements"] = runtime_requirements
-
-        runtime_candidates = [item for item in list(runtime_payload.get("runtime_candidates") or []) if isinstance(item, dict)]
-        preferred_runtime_type = (
-            str(
-                next(
-                    (
-                        item.get("runtime_type")
-                        for item in runtime_candidates
-                        if str(item.get("status") or "").strip().lower() in {"ready", "available", "supported"}
-                    ),
-                    "",
-                )
-            ).strip()
-            or str(runtime_candidates[0].get("runtime_type") or "").strip()
-            if runtime_candidates
-            else ""
-        )
-        installed_key_packages = [
-            name
-            for name, package_payload in worker_packages.items()
-            if isinstance(package_payload, dict) and bool(package_payload.get("installed"))
-        ][:12]
-        available_commands = [
-            name
-            for name, command_payload in worker_commands.items()
-            if isinstance(command_payload, dict) and bool(command_payload.get("available"))
-        ][:12]
-        normalized["runtime_snapshot"] = {
-            "captured_from": "paper_research_inspect_runtime",
-            "repo_root_relative_path": detected_repo_root,
-            "runtime_worker_available": bool(dict(runtime_payload.get("runtime_worker") or {}).get("available")),
-            "preferred_runtime_type": preferred_runtime_type,
-            "candidate_summaries": [
-                {
-                    "runtime_type": str(item.get("runtime_type") or "").strip(),
-                    "status": str(item.get("status") or "").strip(),
-                    "reason": str(item.get("reason") or "").strip(),
-                    "blockers": [str(blocker).strip() for blocker in list(item.get("blockers") or []) if str(blocker).strip()],
-                    "evidence_files": [str(path).strip() for path in list(item.get("evidence_files") or [])[:6] if str(path).strip()],
-                }
-                for item in runtime_candidates[:6]
-            ],
-            "environment": {
-                "python_version": str(dict(worker_environment.get("python") or {}).get("version") or "").strip(),
-                "available_commands": available_commands,
-                "installed_key_packages": installed_key_packages,
-                "missing_required_packages": missing_runtime_packages,
-            },
-        }
-        blockers = normalized.get("blockers")
-        if isinstance(blockers, list):
-            normalized_blockers: List[Any] = []
-            for blocker in blockers:
-                if not isinstance(blocker, dict):
-                    normalized_blockers.append(blocker)
-                    continue
-                blocker_type = str(blocker.get("type") or "").strip().lower()
-                if blocker_type == "dataset_missing" and dataset_ready:
-                    continue
-                if blocker_type == "runtime_unknown" and runtime_candidates:
-                    continue
-                normalized_blockers.append(blocker)
-            has_runtime_packages_blocker = any(
-                isinstance(item, dict) and str(item.get("type") or "").strip().lower() == "runtime_packages_missing"
-                for item in normalized_blockers
-            )
-            if missing_runtime_packages and not has_runtime_packages_blocker:
-                normalized_blockers.append(
-                    {
-                        "type": "runtime_packages_missing",
-                        "description": "Runtime worker is available, but required project packages are still missing.",
-                        "severity": "medium",
-                        "action_required": "Install missing packages before baseline execution.",
-                        "packages": missing_runtime_packages,
-                    }
-                )
-            normalized["blockers"] = normalized_blockers
-
-        next_actions = normalized.get("next_actions")
-        if isinstance(next_actions, list):
-            normalized_actions: List[Any] = []
-            for action in next_actions:
-                action_text = str(action or "").strip()
-                lowered = action_text.lower()
-                if dataset_ready and "download dataset" in lowered:
-                    continue
-                if runtime_candidates and "check python environment" in lowered:
-                    continue
-                normalized_actions.append(action)
-            if missing_runtime_packages:
-                missing_text = ", ".join(missing_runtime_packages)
-                install_action = f"Install missing project packages before baseline: {missing_text}"
-                if install_action not in [str(item) for item in normalized_actions]:
-                    normalized_actions.insert(0, install_action)
-            normalized["next_actions"] = normalized_actions
-
-        return normalized
-
-    @classmethod
-    def _validate_implementation_spec_payload(cls, payload: Dict[str, Any], *, workspace_dir: Path) -> List[str]:
-        from app.services.project_runtime_service import ProjectRuntimeService
-
-        errors: List[str] = []
-        required_object_fields = (
-            "source_summary",
-            "baseline",
-            "repo_plan",
-            "runtime_snapshot",
-            "data_plan",
-            "tuning_plan",
-            "readiness",
-        )
-        for field in required_object_fields:
-            if not isinstance(payload.get(field), dict):
-                errors.append(f"`{field}` must be an object.")
-
-        repo_root_relative_path = cls._normalize_relative_path(payload.get("repo_root_relative_path") or "")
-        if not repo_root_relative_path:
-            errors.append("`repo_root_relative_path` must be a workspace-relative path.")
-        elif ProjectRuntimeService.resolve_workspace_path(workspace_dir, repo_root_relative_path, require_exists=False) is None:
-            errors.append(f"`repo_root_relative_path` is outside workspace or invalid: {repo_root_relative_path}")
-
-        for field in ("blockers", "next_actions", "evidence_log", "notes"):
-            value = payload.get(field)
-            if value is not None and not isinstance(value, list):
-                errors.append(f"`{field}` must be a list when provided.")
-
-        baseline = dict(payload.get("baseline") or {})
-        readiness = dict(payload.get("readiness") or {})
-        runtime_snapshot = dict(payload.get("runtime_snapshot") or {})
-        repo_plan = dict(payload.get("repo_plan") or {})
-
-        entrypoint_type = str(baseline.get("entrypoint_type") or "").strip().lower()
-        entrypoint_aliases = {
-            "repo": "repo_script",
-            "repo_script": "repo_script",
-            "python_script": "repo_script",
-            "notebook": "notebook",
-            "unknown": "unknown",
-        }
-        normalized_entrypoint_type = entrypoint_aliases.get(entrypoint_type, entrypoint_type)
-        if normalized_entrypoint_type and normalized_entrypoint_type not in {"repo_script", "notebook", "unknown"}:
-            errors.append("`baseline.entrypoint_type` must be one of repo_script/notebook/unknown.")
-
-        readiness_bools = ("can_create_run_draft", "can_execute", "external_dependencies_grounded")
-        for field in readiness_bools:
-            if field in readiness and not isinstance(readiness.get(field), bool):
-                errors.append(f"`readiness.{field}` must be a boolean.")
-
-        entrypoint_path_or_hint = str(baseline.get("entrypoint_path_or_hint") or "").strip()
-        if bool(readiness.get("can_create_run_draft")) or bool(readiness.get("can_execute")):
-            if not normalized_entrypoint_type or normalized_entrypoint_type == "unknown":
-                errors.append(
-                    "`baseline.entrypoint_type` must be grounded before readiness.can_create_run_draft/can_execute is true."
-                )
-            if not entrypoint_path_or_hint:
-                errors.append(
-                    "`baseline.entrypoint_path_or_hint` is required before readiness.can_create_run_draft/can_execute is true."
-                )
-
-        if normalized_entrypoint_type in {"repo_script", "notebook"} and entrypoint_path_or_hint:
-            repo_relative_path = cls._normalize_relative_path(entrypoint_path_or_hint)
-            if repo_relative_path.startswith("repo/source/"):
-                repo_relative_path = repo_relative_path.removeprefix("repo/source/")
-            if not repo_relative_path:
-                errors.append("`baseline.entrypoint_path_or_hint` must be a repo-relative path.")
-            elif ProjectRuntimeService.resolve_workspace_path(workspace_dir, f"repo/source/{repo_relative_path}") is None:
-                errors.append(
-                    f"`baseline.entrypoint_path_or_hint` references missing repo file `{repo_relative_path}`."
-                )
-
-        repo_status = str(repo_plan.get("repo_status") or "").strip()
-        if str(payload.get("mode") or "").strip() == "repo_driven" and not repo_status:
-            errors.append("`repo_plan.repo_status` is required for repo_driven implementation specs.")
-        for field in ("dependency_files", "entrypoint_candidates", "files_read"):
-            if field in repo_plan and not isinstance(repo_plan.get(field), list):
-                errors.append(f"`repo_plan.{field}` must be a list when provided.")
-
-        captured_from = str(runtime_snapshot.get("captured_from") or "").strip()
-        if captured_from and captured_from != "paper_research_inspect_runtime":
-            errors.append("`runtime_snapshot.captured_from` must be `paper_research_inspect_runtime`.")
-        if not isinstance(runtime_snapshot.get("candidate_summaries") or [], list):
-            errors.append("`runtime_snapshot.candidate_summaries` must be a list.")
-        if not isinstance(runtime_snapshot.get("environment") or {}, dict):
-            errors.append("`runtime_snapshot.environment` must be an object.")
-
-        return errors
-
-    @classmethod
-    def _validate_run_drafts_payload(cls, payload: Dict[str, Any], *, workspace_dir: Path) -> List[str]:
-        errors: List[str] = []
-        drafts = payload.get("drafts")
-        if not isinstance(drafts, list) or not drafts:
-            return ["`drafts` must be a non-empty list."]
-
-        repo_files = cls._repo_file_set(workspace_dir)
-        canonical_paths = set(cls._CANONICAL_FILE_SPECS.keys())
-        for index, draft in enumerate(drafts):
-            prefix = f"drafts[{index}]"
-            if not isinstance(draft, dict):
-                errors.append(f"{prefix} must be an object.")
-                continue
-
-            kind = str(draft.get("kind") or "").strip()
-            if kind not in cls._RUN_DRAFT_KINDS:
-                errors.append(
-                    f"{prefix}.kind must be one of {sorted(cls._RUN_DRAFT_KINDS)}, got `{kind}`."
-                )
-
-            entrypoint = draft.get("entrypoint")
-            if not isinstance(entrypoint, dict):
-                errors.append(f"{prefix}.entrypoint must be an object, not a string or array.")
-                continue
-
-            entrypoint_type = str(entrypoint.get("type") or "").strip()
-            if entrypoint_type not in cls._RUN_DRAFT_ENTRYPOINT_TYPES:
-                errors.append(
-                    f"{prefix}.entrypoint.type must be one of {sorted(cls._RUN_DRAFT_ENTRYPOINT_TYPES)}, got `{entrypoint_type}`."
-                )
-            path_or_hint = str(entrypoint.get("path_or_hint") or "").strip()
-            if entrypoint_type in {"repo_script", "notebook", "config"}:
-                repo_relative_path = cls._normalize_relative_path(path_or_hint)
-                if not repo_relative_path:
-                    errors.append(f"{prefix}.entrypoint.path_or_hint must be a repo-relative path.")
-                elif repo_relative_path not in repo_files:
-                    errors.append(
-                        f"{prefix}.entrypoint.path_or_hint references missing repo file `{repo_relative_path}`. "
-                        "Use readme_command/dataset_step/manual_step for README-only actions."
-                    )
-                else:
-                    entrypoint["path_or_hint"] = repo_relative_path
-                    entrypoint["verified"] = True
-            elif entrypoint_type in {"readme_command", "dataset_step", "manual_step"}:
-                if not path_or_hint:
-                    errors.append(f"{prefix}.entrypoint.path_or_hint is required for `{entrypoint_type}`.")
-                entrypoint["verified"] = False
-
-            evidence_files = draft.get("evidence_files")
-            if not isinstance(evidence_files, list) or not evidence_files:
-                errors.append(f"{prefix}.evidence_files must list at least one archived evidence path.")
-                continue
-            for evidence in evidence_files:
-                evidence_path = cls._normalize_relative_path(evidence)
-                if not evidence_path:
-                    errors.append(f"{prefix}.evidence_files contains an invalid path `{evidence}`.")
-                    continue
-                if evidence_path.startswith("repo/source/"):
-                    repo_path = evidence_path.removeprefix("repo/source/")
-                    if repo_path not in repo_files:
-                        errors.append(f"{prefix}.evidence_files references missing repo file `{evidence_path}`.")
-                elif evidence_path not in canonical_paths:
-                    errors.append(
-                        f"{prefix}.evidence_files references non-canonical artifact `{evidence_path}`."
-                    )
-
-        return errors
-
-    @classmethod
-    def _normalize_run_drafts_payload(cls, payload: Dict[str, Any], *, workspace_dir: Path) -> Dict[str, Any]:
-        normalized = dict(payload or {})
-        drafts = normalized.get("drafts")
-        if not isinstance(drafts, list):
-            return normalized
-
-        repo_files = cls._repo_file_set(workspace_dir)
-        canonical_paths = set(cls._CANONICAL_FILE_SPECS.keys())
-        normalized_drafts: List[Dict[str, Any]] = []
-
-        for item in drafts:
-            if not isinstance(item, dict):
-                normalized_drafts.append(item)
-                continue
-
-            draft = dict(item)
-            if not str(draft.get("id") or "").strip() and str(draft.get("draft_id") or "").strip():
-                draft["id"] = str(draft.get("draft_id") or "").strip()
-            if not str(draft.get("title") or "").strip() and str(draft.get("label") or "").strip():
-                draft["title"] = str(draft.get("label") or "").strip()
-            if not str(draft.get("objective") or "").strip():
-                fallback_objective = str(draft.get("description") or draft.get("goal") or "").strip()
-                if fallback_objective:
-                    draft["objective"] = fallback_objective
-            if (not isinstance(draft.get("params"), dict) or not draft.get("params")) and isinstance(draft.get("changes"), dict):
-                draft["params"] = dict(draft.get("changes") or {})
-            if not isinstance(draft.get("grounding_notes"), list):
-                notes = draft.get("notes")
-                if isinstance(notes, list):
-                    draft["grounding_notes"] = [str(note).strip() for note in notes if str(note or "").strip()]
-                elif str(notes or "").strip():
-                    draft["grounding_notes"] = [str(notes).strip()]
-
-            entrypoint = draft.get("entrypoint")
-            if isinstance(entrypoint, dict):
-                normalized_entrypoint = dict(entrypoint)
-                entrypoint_type = str(normalized_entrypoint.get("type") or "").strip()
-                if entrypoint_type == "python_script":
-                    normalized_entrypoint["type"] = "repo_script"
-                if not str(normalized_entrypoint.get("path_or_hint") or "").strip() and str(normalized_entrypoint.get("path") or "").strip():
-                    normalized_entrypoint["path_or_hint"] = str(normalized_entrypoint.get("path") or "").strip()
-                draft["entrypoint"] = normalized_entrypoint
-
-            evidence_files = draft.get("evidence_files")
-            if isinstance(evidence_files, list):
-                normalized_evidence_files: List[str] = []
-                for evidence in evidence_files:
-                    evidence_path = cls._normalize_relative_path(evidence)
-                    if not evidence_path:
-                        normalized_evidence_files.append(str(evidence))
-                        continue
-                    if evidence_path in canonical_paths or evidence_path.startswith("repo/source/"):
-                        normalized_evidence_files.append(evidence_path)
-                        continue
-                    if evidence_path in repo_files:
-                        normalized_evidence_files.append(f"repo/source/{evidence_path}")
-                        continue
-                    normalized_evidence_files.append(evidence_path)
-                draft["evidence_files"] = normalized_evidence_files
-
-            normalized_drafts.append(draft)
-
-        normalized["drafts"] = normalized_drafts
-        return normalized
 
     @staticmethod
     def _workspace_payload(workspace: Any) -> Optional[Dict[str, Any]]:
@@ -4183,93 +2737,6 @@ class _PaperResearchToolBase(ToolBase):
             "project_url": f"/projects/{int(project['id'])}",
             "paper_count": int(project.get("paper_count") or 0),
             "workspace_count": int(project.get("workspace_count") or 0),
-        }
-
-    @staticmethod
-    def _selected_runtime_workspace(
-        runtime_overview: Optional[Dict[str, Any]],
-        *,
-        workspace_id: Optional[int],
-    ) -> Dict[str, Any]:
-        if not isinstance(runtime_overview, dict):
-            return {}
-        workspaces = [item for item in list(runtime_overview.get("workspaces") or []) if isinstance(item, dict)]
-        if workspace_id is not None:
-            selected = next((item for item in workspaces if int(item.get("workspace_id") or 0) == int(workspace_id)), None)
-            if selected is not None:
-                return selected
-        primary_workspace_id = runtime_overview.get("primary_workspace_id")
-        if primary_workspace_id is not None:
-            selected = next((item for item in workspaces if int(item.get("workspace_id") or 0) == int(primary_workspace_id)), None)
-            if selected is not None:
-                return selected
-        return workspaces[0] if workspaces else {}
-
-    @classmethod
-    def _status_summary_from_runtime(
-        cls,
-        runtime_overview: Optional[Dict[str, Any]],
-        *,
-        workspace_id: Optional[int],
-        project_id: Optional[int],
-    ) -> Dict[str, Any]:
-        runtime_payload = runtime_overview if isinstance(runtime_overview, dict) else {}
-        selected_workspace = cls._selected_runtime_workspace(runtime_overview, workspace_id=workspace_id)
-        results = dict(selected_workspace.get("results") or {})
-        baseline_status = str(results.get("baseline_status") or "missing").strip().lower() or "missing"
-        baseline_execution_id = str(results.get("baseline_execution_id") or "").strip() or None
-        tuning_status = str(results.get("tuning_status") or "missing").strip().lower() or "missing"
-        compare_status = str(results.get("compare_status") or "missing").strip().lower() or "missing"
-        current_stage = str(selected_workspace.get("current_stage") or runtime_payload.get("current_stage") or "planning").strip().lower() or "planning"
-        current_status = str(selected_workspace.get("current_status") or runtime_payload.get("current_status") or "draft").strip().lower() or "draft"
-
-        recommended_next_action = "先调用 paper_research_prepare，生成或刷新 structured intake / workspace。"
-        running_execution = next(
-            (
-                item
-                for item in list(selected_workspace.get("recent_executions") or [])
-                if isinstance(item, dict) and str(item.get("status") or "").strip().lower() in {"pending", "running"}
-            ),
-            None,
-        )
-        if isinstance(running_execution, dict):
-            execution_id = str(running_execution.get("execution_id") or "").strip() or "<execution_id>"
-            recommended_next_action = (
-                f"先调用 paper_research_read_execution(project_id={int(project_id or 0)}, execution_id=\"{execution_id}\") "
-                "继续观察正在运行的 execution，不要重复启动新的 baseline 或 tuning。"
-            )
-        elif baseline_status == "completed" and baseline_execution_id:
-            if tuning_status == "completed":
-                recommended_next_action = (
-                    f"先调用 paper_research_read_execution(project_id={int(project_id or 0)}, execution_id=\"{baseline_execution_id}\") "
-                    "确认 baseline 指标；若要继续分析调优结果，再读取最近的 tuning execution 或 compare 产物。"
-                )
-            else:
-                recommended_next_action = (
-                    f"先调用 paper_research_read_execution(project_id={int(project_id or 0)}, execution_id=\"{baseline_execution_id}\") "
-                    "读取 baseline 指标与命令；围绕该 baseline 做 first_tuning，不要回退到 env_setup 或重新跑 baseline。"
-                )
-        elif current_stage == "planning":
-            recommended_next_action = "先调用 paper_research_prepare，准备/刷新论文 intake 与 workspace。"
-        elif current_stage == "grounding":
-            recommended_next_action = (
-                "优先 probe repo/url、读取 repo/runtime 证据，并写入 grounding_report；"
-                "在 grounding 完成前不要进入 implementation 或 execution。"
-            )
-        elif current_stage in {"implementation_prep", "run_drafts"}:
-            recommended_next_action = "优先读取 implementation_spec / run_drafts，确认 repo、数据和 baseline 草案后再启动 execution。"
-        elif current_stage == "execution":
-            recommended_next_action = "优先读取最新 execution 状态；只有在没有运行中任务时才继续启动 baseline。"
-
-        return {
-            "current_stage": current_stage,
-            "current_status": current_status,
-            "baseline_status": baseline_status,
-            "baseline_execution_id": baseline_execution_id,
-            "tuning_status": tuning_status,
-            "tuning_execution_id": str(results.get("tuning_execution_id") or "").strip() or None,
-            "compare_status": compare_status,
-            "recommended_next_action": recommended_next_action,
         }
 
     def _result(
@@ -4393,23 +2860,26 @@ class PaperResearchPrepareTool(_PaperResearchToolBase):
     name = "paper_research_prepare"
     input_model = PaperResearchPrepareInput
     description = (
-        "论文复现/调优研究流程的准备步骤。根据已保存 paper_id 创建或复用轻量 Project，"
-        "按需解析 PDF 生成实验 workspace/notebook 草案，并返回 baseline、指标、可调参数和 first runs。不会执行训练。"
+        "论文复现的 prepare 步骤。根据已保存的论文创建或复用 Project，"
+        "并在 `/app/uploads/projects/{project_id}/reference/` 下生成 reference bundle。"
+        "如果用户给的是内部 `paper_id`，优先直接传给这个工具；不要把 `paper_id` 直接当成 `project_id` 传给 `project_tree`、`project_read_file`、`project_bash`。"
+        "主要用途是首次准备项目，或在论文、README、reference 明显过期时显式刷新。"
+        "它会生成完整论文 markdown、论文解读和 README intake，不会执行训练，也不会启动旧 workspace/notebook 流程。"
     )
     parameters = {
         "type": "object",
         "properties": {
-            "paper_id": {"type": "integer", "description": "已保存论文的内部 paper_id，优先提供。"},
-            "paper_title": {"type": "string", "description": "没有 paper_id 时用于精确匹配已保存论文标题。"},
-            "project_id": {"type": "integer", "description": "已有研究项目 ID；缺省时按论文复用或创建。"},
-            "project_title": {"type": "string", "description": "需要新建 Project 时的标题。"},
-            "user_goal": {"type": "string", "description": "用户的复现、调优或创新验证目标。"},
-            "create_project": {"type": "boolean", "default": True, "description": "没有 Project 时是否创建轻量 Project。"},
-            "create_workspace": {"type": "boolean", "default": True, "description": "是否创建/复用实验 workspace 和 notebook 草案。"},
+            "paper_id": {"type": "integer", "description": "已保存论文的内部 paper_id。已知 paper_id 时优先直接传它。"},
+            "paper_title": {"type": "string", "description": "没有 paper_id 时，用已保存论文标题做精确匹配。"},
+            "project_id": {"type": "integer", "description": "已有 Project ID。传了它就优先在这个 Project 下准备 reference。"},
+            "project_title": {"type": "string", "description": "需要新建 Project 时使用的标题；通常可以省略。"},
+            "user_goal": {"type": "string", "description": "当前复现目标、调优目标或验证目标。会写入 Project 元信息。"},
+            "create_project": {"type": "boolean", "default": True, "description": "没有匹配 Project 时是否自动创建。通常保持 true。"},
+            "create_workspace": {"type": "boolean", "default": True, "description": "历史兼容字段，当前 project-only 流程会忽略它；不要依赖它。"},
             "refresh_intake": {
                 "type": "boolean",
                 "default": False,
-                "description": "是否强制重新生成 PDF/Markdown -> structured intake JSON；即使为 false，已有 workspace 缺失或失败的 intake 也会自动刷新。",
+                "description": "是否强制重建 `project/reference/` 下的 reference bundle。只有在 reference 明显过期或想覆盖旧结果时再设 true。",
             },
         },
         "required": [],
@@ -4417,8 +2887,8 @@ class PaperResearchPrepareTool(_PaperResearchToolBase):
 
     async def _execute(self, **kwargs) -> ToolResult:
         async def _handler(db: AsyncSession) -> ToolResult:
-            from app.services.paper_experiment_service import PaperExperimentService
             from app.services.project_service import ProjectService
+            from app.services.project_reference_builder_service import ProjectReferenceBuilderService
 
             paper = await self._resolve_paper(
                 db,
@@ -4429,7 +2899,6 @@ class PaperResearchPrepareTool(_PaperResearchToolBase):
                 return self._paper_not_found(kwargs.get("paper_id"), kwargs.get("paper_title"))
 
             project_service = ProjectService(db)
-            experiment_service = PaperExperimentService(db)
             project_payload = await self._resolve_project_payload(
                 project_service,
                 paper=paper,
@@ -4438,65 +2907,54 @@ class PaperResearchPrepareTool(_PaperResearchToolBase):
                 user_goal=kwargs.get("user_goal"),
                 create_project=bool(kwargs.get("create_project", True)),
             )
-
-            workspace = await experiment_service.get_workspace(paper_id=int(paper.id), user_id=self.user_id)
-            intake_before = self._intake_summary_from_workspace(workspace)
-            refresh_requested = bool(kwargs.get("refresh_intake", False))
-            missing_workspace_archives = (
-                workspace is not None
-                and bool(kwargs.get("create_workspace", True))
-                and self._workspace_missing_required_archives(self._workspace_dir_for(workspace))
-            )
-            auto_refresh_needed = (
-                workspace is not None
-                and bool(kwargs.get("create_workspace", True))
-                and self._workspace_needs_intake_refresh(workspace)
-            )
-            intake_refreshed = False
-            intake_refresh_reason = None
-            if workspace is not None and (refresh_requested or auto_refresh_needed):
-                intake_refresh_reason = "explicit refresh_intake=true" if refresh_requested else "existing structured intake missing or failed"
-                workspace = await experiment_service.refresh_workspace_intake(paper=paper, workspace=workspace)
-                intake_refreshed = True
-            elif workspace is not None and missing_workspace_archives:
-                from app.services.paper_experiment_adapter_service import PaperExperimentAdapterService
-
-                intake_refresh_reason = "workspace archive files missing"
-                summary_json = dict(getattr(workspace, "summary_json", {}) or {})
-                experiment_spec_json = dict(getattr(workspace, "experiment_spec_json", {}) or {})
-                adapter_manifest = PaperExperimentAdapterService().ensure_workspace_archive_from_existing_state(
-                    paper=paper,
-                    workspace_dir=self._workspace_dir_for(workspace),
-                    summary=summary_json,
-                    experiment_spec=experiment_spec_json,
+            if project_payload is None:
+                return ToolResult(
+                    success=False,
+                    output="没有可用 Project。请提供已有 project_id，或允许 create_project=true。",
+                    error="project_not_found",
+                    data={"paper_id": int(paper.id)},
                 )
-                summary_json["workspace_adapter"] = adapter_manifest
-                experiment_spec_json["workspace_adapter"] = adapter_manifest
-                workspace.summary_json = summary_json
-                workspace.experiment_spec_json = experiment_spec_json
-                workspace.updated_at = datetime.utcnow()
-                await db.commit()
-            elif workspace is None and bool(kwargs.get("create_workspace", True)):
-                workspace = await experiment_service.bootstrap_workspace(paper=paper, user_id=self.user_id)
-                intake_refresh_reason = "created new workspace and intake"
 
-            project_payload = await self._link_project_workspace(
-                project_service,
-                project_payload=project_payload,
+            builder = ProjectReferenceBuilderService(db)
+            builder_summary = await builder.build(
                 paper=paper,
-                workspace=workspace,
+                project_id=int(project_payload["id"]),
+                user_id=self.user_id,
+                refresh=bool(kwargs.get("refresh_intake", False)),
             )
-            return self._result(
-                action="prepare",
-                paper=paper,
-                project=project_payload,
-                workspace=workspace,
-                extra={
-                    "intake_before": intake_before,
-                    "intake_summary": self._intake_summary_from_workspace(workspace),
-                    "intake_refreshed": intake_refreshed,
-                    "intake_refresh_reason": intake_refresh_reason,
+            payload = {
+                "workflow": "paper-reproduction",
+                "action": "prepare",
+                "paper": {
+                    "id": int(paper.id),
+                    "title": str(paper.title or ""),
+                    "year": paper.year,
+                    "venue": paper.venue,
+                    "arxiv_id": paper.arxiv_id,
                 },
+                "project": self._project_payload(project_payload),
+                "reference_builder": builder_summary,
+            }
+            lines = [
+                "Project reference builder 完成。",
+                f"- 论文: {payload['paper']['title']} (paper_id={payload['paper']['id']})",
+                f"- Project: /projects/{int(project_payload['id'])}",
+                f"- Project root: {builder_summary.get('project_root')}",
+                f"- Reference root: {builder_summary.get('reference_root')}",
+                f"- Reference ready: {bool(builder_summary.get('reference_ready'))}",
+                "- Files:",
+                *[
+                    f"  - {relative_path}"
+                    for relative_path in list(builder_summary.get("reference_files") or [])
+                ],
+            ]
+            repo_materialization = dict(dict(builder_summary.get("repo_reference") or {}).get("repo_materialization") or {})
+            if repo_materialization.get("status"):
+                lines.append(f"- Repo status: {repo_materialization.get('status')}")
+            return ToolResult(
+                success=bool(builder_summary.get("reference_ready")),
+                output="\n".join(lines),
+                data=payload,
             )
 
         return await self._with_db(_handler)
@@ -4505,21 +2963,27 @@ class PaperResearchPrepareTool(_PaperResearchToolBase):
 class PaperResearchStatusTool(_PaperResearchToolBase):
     name = "paper_research_status"
     input_model = PaperResearchStatusInput
-    description = "查看论文研究 Project/workspace 状态。只读取状态，不创建 Project，不解析 PDF，不执行训练。"
+    description = (
+        "读取当前论文复现 Project 的 reference 状态。"
+        "它会根据 `project_id` 或 `paper_id` 定位 Project，然后只读检查 `project/reference/` 是否齐全、有哪些归档文件。"
+        "当用户只给了 `paper_id`，优先先用这个工具，把 `paper_id` 解析成 Project，再继续调用 `project_tree`、`project_read_file`、`project_bash`。"
+        "这个工具不创建 Project，不刷新 reference，也不执行训练。"
+    )
     parameters = {
         "type": "object",
         "properties": {
-            "paper_id": {"type": "integer", "description": "已保存论文的内部 paper_id。"},
-            "paper_title": {"type": "string", "description": "没有 paper_id 时用于精确匹配已保存论文标题。"},
-            "project_id": {"type": "integer", "description": "已有研究项目 ID。"},
+            "paper_id": {"type": "integer", "description": "已保存论文的内部 paper_id。已知 paper_id 时可直接用它定位对应 Project。"},
+            "paper_title": {"type": "string", "description": "没有 paper_id 时，用已保存论文标题做精确匹配。"},
+            "project_id": {"type": "integer", "description": "已有 Project ID。已知 project_id 时优先传它。"},
         },
         "required": [],
     }
 
     async def _execute(self, **kwargs) -> ToolResult:
         async def _handler(db: AsyncSession) -> ToolResult:
-            from app.services.paper_experiment_service import PaperExperimentService
             from app.services.project_service import ProjectService
+            from app.services.project_paths import get_project_root_dir
+            from app.services.project_reference_builder_service import ProjectReferenceBuilderService
 
             project_service = ProjectService(db)
             project_payload: Optional[Dict[str, Any]] = None
@@ -4547,289 +3011,281 @@ class PaperResearchStatusTool(_PaperResearchToolBase):
                     project_id=None,
                     create_project=False,
                 )
-            workspace = await PaperExperimentService(db).get_workspace(paper_id=int(paper.id), user_id=self.user_id)
-            runtime_overview = None
-            project_id = int(project_payload["id"]) if isinstance(project_payload, dict) and project_payload.get("id") is not None else None
-            if project_id is not None:
-                runtime_overview = await project_service.get_project_runtime_overview(
-                    project_id=project_id,
-                    user_id=self.user_id,
-                )
-            workspace_id = int(workspace.id) if workspace is not None and getattr(workspace, "id", None) is not None else None
-            status_summary = self._status_summary_from_runtime(
-                runtime_overview,
-                workspace_id=workspace_id,
-                project_id=project_id,
-            )
-            return self._result(
-                action="status",
-                paper=paper,
-                project=project_payload,
-                workspace=workspace,
-                extra={
-                    "runtime_overview": runtime_overview,
-                    "status_summary": status_summary,
-                },
-            )
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchCloneRepoTool(_PaperResearchToolBase):
-    name = "paper_research_clone_repo"
-    input_model = PaperResearchCloneRepoInput
-    description = (
-        "在当前 Project workspace 中物化或刷新论文关联 repo，并重建 repo_reference/repo_file_index。"
-        "这是 repo 获取的原子能力，不会重新跑 PDF intake。"
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "repo_url": {"type": "string", "description": "可选，显式指定要克隆/替换的 GitHub repo URL。"},
-            "refresh": {"type": "boolean", "default": False, "description": "是否强制重拉并替换现有 repo。"},
-        },
-        "required": ["project_id"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            from app.services.paper_experiment_adapter_service import PaperExperimentAdapterService
-
-            project_id = int(kwargs["project_id"])
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
             if project_payload is None:
-                return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
-
-            workspace_dir = self._workspace_dir_for(workspace)
-            experiment_spec = dict(getattr(workspace, "experiment_spec_json", {}) or {})
-            result = await PaperExperimentAdapterService().materialize_repo(
-                workspace_dir=workspace_dir,
-                repo_url=str(kwargs.get("repo_url") or "").strip() or None,
-                experiment_spec=experiment_spec,
-                refresh=bool(kwargs.get("refresh", False)),
-            )
-
-            summary_json = dict(getattr(workspace, "summary_json", {}) or {})
-            adapter_manifest = dict(summary_json.get("workspace_adapter") or {})
-            adapter_manifest["repo"] = dict(result.get("repo") or {})
-            adapter_manifest["repo_index"] = {
-                "repo_file_index_file": "repo_file_index.json",
-                "readme_excerpt_file": dict(result.get("repo_index") or {}).get("readme_excerpt_file"),
-                "indexed_file_count": int(dict(result.get("repo_index") or {}).get("indexed_file_count") or 0),
-            }
-            summary_json["workspace_adapter"] = adapter_manifest
-            workspace.summary_json = summary_json
-            workspace.updated_at = datetime.utcnow()
-            await db.commit()
-
-            repo = dict(result.get("repo") or {})
-            repo_index = dict(result.get("repo_index") or {})
-            lines = [
-                "已处理 repo materialize。",
-                f"- Project: /projects/{project_id}",
-                f"- Status: {repo.get('status') or result.get('status')}",
-                f"- Repo URL: {repo.get('repo_url') or kwargs.get('repo_url') or 'none'}",
-                f"- Indexed files: {repo_index.get('indexed_file_count') or 0}",
-                f"- Readme excerpt: {repo_index.get('readme_excerpt_file') or 'none'}",
-                f"- Repo history candidates: {repo_index.get('repo_history_candidates_file') or 'none'} ({repo_index.get('history_candidate_count') or 0})",
-            ]
-            if repo.get("message"):
-                lines.append(f"- Message: {repo.get('message')}")
-            failed_statuses = {
-                "missing",
-                "unsupported_host",
-                "clone_failed",
-                "archive_failed",
-                "archive_extract_failed",
-                "blocked_existing_repo_url_mismatch",
-            }
-            return ToolResult(
-                success=str(result.get("status") or "") not in failed_statuses,
-                output="\n".join(lines),
-                data={
-                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                    **result,
-                },
-                error=None if str(result.get("status") or "") not in failed_statuses else "repo_materialize_failed",
-            )
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchCreateRunDraftTool(_PaperResearchToolBase):
-    name = "paper_research_create_run_draft"
-    input_model = PaperResearchCreateRunDraftInput
-    description = (
-        "在已有论文实验 workspace 中创建 baseline 或 variant run 草案，并写入对应 Notebook cell。"
-        "只创建草案，不执行训练。"
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "paper_id": {"type": "integer", "description": "已保存论文的内部 paper_id。"},
-            "paper_title": {"type": "string", "description": "没有 paper_id 时用于精确匹配已保存论文标题。"},
-            "project_id": {"type": "integer", "description": "可选研究项目 ID，用于返回项目入口。"},
-            "run_label": {"type": "string", "description": "运行草案名称，例如 baseline-epochs-5。"},
-            "run_kind": {"type": "string", "enum": ["baseline", "variant"], "default": "variant"},
-            "model_name": {"type": "string", "description": "模型或替换模型名称。"},
-            "hypothesis": {"type": "string", "description": "本次 run 要验证的假设。"},
-            "params": {"type": "object", "description": "参数覆盖，例如 {\"epochs\": 5, \"learning_rate\": 0.001}。"},
-            "variant_spec": {"type": "object", "description": "结构化变体说明。"},
-        },
-        "required": ["run_label"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            from app.services.paper_experiment_service import PaperExperimentService
-            from app.services.project_service import ProjectService
-
-            paper = await self._resolve_paper(
-                db,
-                paper_id=kwargs.get("paper_id"),
-                paper_title=kwargs.get("paper_title"),
-            )
-            if paper is None:
-                return self._paper_not_found(kwargs.get("paper_id"), kwargs.get("paper_title"))
-
-            experiment_service = PaperExperimentService(db)
-            workspace = await experiment_service.get_workspace(paper_id=int(paper.id), user_id=self.user_id)
-            if workspace is None:
                 return ToolResult(
                     success=False,
-                    output="尚未创建实验 workspace。请先调用 paper_research_prepare。",
-                    error="workspace_not_found",
+                    output="没有可用 Project。",
+                    error="project_not_found",
+                    data={"paper_id": int(paper.id)},
                 )
 
-            resolved_kind = "baseline" if str(kwargs.get("run_kind") or "") == "baseline" else "variant"
-            baseline = next(
-                (item for item in list(workspace.runs or []) if str(item.run_kind or "") == "baseline"),
-                None,
-            )
-            run = await experiment_service.create_run(
-                workspace=workspace,
-                label=str(kwargs["run_label"]),
-                run_kind=resolved_kind,
-                model_name=kwargs.get("model_name"),
-                hypothesis=kwargs.get("hypothesis"),
-                params=dict(kwargs.get("params") or {}),
-                variant_spec=dict(kwargs.get("variant_spec") or {}),
-                base_run_id=(int(baseline.id) if baseline is not None and resolved_kind == "variant" else None),
-            )
-            refreshed = await experiment_service.get_workspace(paper_id=int(paper.id), user_id=self.user_id)
-            project_payload = await self._resolve_project_payload(
-                ProjectService(db),
-                paper=paper,
-                project_id=kwargs.get("project_id"),
-                create_project=False,
-            )
-            created_run = {
-                "id": int(run.id),
-                "label": str(run.label or ""),
-                "run_kind": str(run.run_kind or ""),
-                "status": str(run.status or ""),
-                "params": dict(run.params_json or {}),
-                "variant_spec": dict(run.variant_spec_json or {}),
-                "notebook_cell_id": run.notebook_cell_id,
+            project_id = int(project_payload["id"])
+            project_root = get_project_root_dir(project_id, ensure_exists=False)
+            builder = ProjectReferenceBuilderService(db)
+            reference_ready = builder.reference_bundle_ready(project_root)
+            reference_root = project_root / "reference"
+            reference_files = [
+                relative_path
+                for relative_path in ProjectReferenceBuilderService.required_reference_relative_paths()
+                if (project_root / relative_path).is_file()
+            ]
+            payload = {
+                "workflow": "paper-reproduction",
+                "action": "status",
+                "paper": {
+                    "id": int(paper.id),
+                    "title": str(paper.title or ""),
+                    "year": paper.year,
+                    "venue": paper.venue,
+                    "arxiv_id": paper.arxiv_id,
+                },
+                "project": self._project_payload(project_payload),
+                "project_root": str(project_root),
+                "reference_root": str(reference_root),
+                "reference_ready": bool(reference_ready),
+                "reference_files": reference_files,
             }
-            return self._result(
-                action="create_run_draft",
-                paper=paper,
-                project=project_payload,
-                workspace=refreshed or workspace,
-                extra={"created_run": created_run},
-            )
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchArtifactManifestTool(_PaperResearchToolBase):
-    name = "paper_research_get_artifact_manifest"
-    input_model = PaperResearchArtifactManifestInput
-    parallel_safe = True
-    description = (
-        "返回当前 Project 工作区的固定逻辑根和可用 artifact 清单。"
-        "所有后续读取都应基于 manifest 提供的 relative_path。"
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-        },
-        "required": ["project_id"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            project_id = int(kwargs["project_id"])
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
-            if project_payload is None:
-                return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
-
-            workspace_dir = self._workspace_dir_for(workspace)
-            manifest = self._build_artifact_manifest(
-                project_payload=project_payload,
-                workspace=workspace,
-                workspace_dir=workspace_dir,
-            )
-            artifact_lines = [
-                f"- {item.get('relative_path')} [{('exists' if item.get('exists') else 'missing')}]"
-                for item in list(manifest.get("artifacts") or [])
-            ]
             lines = [
-                "已生成 Project 工作区 artifact manifest。",
+                "已读取 Project reference 状态。",
+                f"- 论文: {payload['paper']['title']} (paper_id={payload['paper']['id']})",
                 f"- Project: /projects/{project_id}",
-                f"- Root alias: {manifest.get('root_alias')}",
-                f"- Workspace ID: {manifest.get('workspace_id')}",
-                f"- Notebook: /code/{manifest.get('notebook_id')}",
-                f"- Repo root: {manifest.get('repo', {}).get('root_relative_path')} (available={manifest.get('repo', {}).get('available')})",
-                "- Artifacts:",
-                *artifact_lines,
+                f"- Project root: {project_root}",
+                f"- Reference root: {reference_root}",
+                f"- Reference ready: {bool(reference_ready)}",
+                "- Files:",
+                *[f"  - {relative_path}" for relative_path in reference_files],
             ]
-            return ToolResult(success=True, output="\n".join(lines), data=manifest)
+            return ToolResult(
+                success=True,
+                output="\n".join(lines),
+                data=payload,
+            )
 
         return await self._with_db(_handler)
 
 
-class PaperResearchReadArtifactTool(_PaperResearchToolBase):
-    name = "paper_research_read_artifact"
-    input_model = PaperResearchReadArtifactInput
+class PaperSearchTool(_PaperResearchToolBase):
+    name = "paper_search"
+    input_model = PaperSearchInput
     parallel_safe = True
     output_max_tokens = 9000
     description = (
-        "按固定 relative_path 读取 Project 工作区中的 planning/repo/meta/spec artifact。"
-        "不接受任意绝对路径。"
+        "搜索当前用户已保存的论文候选，用来确定 `paper_id`。"
+        "适合输入论文标题、简称、作者名、研究主题或自然语言描述。"
+        "它不是按内部 ID 精确查找的工具；如果你已经知道 `paper_id`，应直接传给 `paper_research_prepare` 或 `paper_research_status`，不要把 `113` 这种内部 ID 当搜索词。"
+        "结果只返回识别论文所需的最小字段：paper_id、title、abstract、authors、year、venue。"
     )
     parameters = {
         "type": "object",
         "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "relative_path": {
-                "type": "string",
-                "description": "manifest 中返回的 artifact 相对路径，例如 `planning/paper_summary.json` 或 `specs/grounding_report.json`。不要传绝对路径。",
-            },
-            "mode": {
-                "type": "string",
-                "enum": ["auto", "full", "chunk", "page", "line_range"],
-                "default": "auto",
-                "description": "读取模式。full 返回全文；chunk/page/line_range 返回原文分段，不做摘要。",
-            },
-            "max_chars": {
-                "type": "integer",
-                "default": 20000,
-                "description": "兼容旧调用的字符窗口参数；chunk 模式下会作为默认 chunk_chars。",
-            },
-            "chunk_index": {"type": "integer", "description": "chunk 模式下的块序号（1-based）。"},
-            "chunk_chars": {"type": "integer", "description": "chunk 模式下每块字符数。"},
-            "page": {"type": "integer", "description": "page 模式下的页号（1-based，按行分页）。"},
-            "page_size_lines": {"type": "integer", "description": "page 模式下每页多少行。"},
-            "line_start": {"type": "integer", "description": "line_range 模式起始行号（1-based）。"},
-            "line_end": {"type": "integer", "description": "line_range 模式结束行号（1-based）。"},
+            "query": {"type": "string", "description": "论文标题、简称、作者名、关键词或自然语言描述；不要传内部 paper_id 数字当搜索词。"},
+            "max_results": {"type": "integer", "default": 5, "description": "最多返回多少个候选，范围 1-10。候选用于确认 paper_id，不是最终执行步骤。"},
+        },
+        "required": ["query"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            from app.models.literature import Paper
+
+            query = str(kwargs.get("query") or "").strip()
+            max_results = int(kwargs.get("max_results") or 5)
+            pattern = f"%{query[:180]}%"
+            search_limit = max(20, min(120, max_results * 12))
+
+            stmt = (
+                select(Paper)
+                .where(Paper.user_id == self.user_id)
+                .where(
+                    or_(
+                        Paper.title.ilike(pattern),
+                        Paper.abstract.ilike(pattern),
+                        Paper.venue.ilike(pattern),
+                        Paper.arxiv_id.ilike(pattern),
+                        cast(Paper.authors, SQLString).ilike(pattern),
+                    )
+                )
+                .order_by(Paper.updated_at.desc(), Paper.id.desc())
+                .limit(search_limit)
+            )
+            result = await db.execute(stmt)
+            matched_rows = list(result.scalars().all())
+
+            if len(matched_rows) < max_results:
+                fallback_stmt = (
+                    select(Paper)
+                    .where(Paper.user_id == self.user_id)
+                    .order_by(Paper.updated_at.desc(), Paper.id.desc())
+                    .limit(max(50, min(300, max_results * 30)))
+                )
+                fallback_result = await db.execute(fallback_stmt)
+                for paper in list(fallback_result.scalars().all()):
+                    if any(int(getattr(existing, "id", 0) or 0) == int(getattr(paper, "id", 0) or 0) for existing in matched_rows):
+                        continue
+                    matched_rows.append(paper)
+
+            ranked: List[Dict[str, Any]] = []
+            for paper in matched_rows:
+                score = self._score_saved_paper_candidate(paper=paper, query=query)
+                if score <= 0:
+                    continue
+                ranked.append(
+                    {
+                        "score": score,
+                        "paper_id": int(getattr(paper, "id", 0) or 0),
+                        "title": str(getattr(paper, "title", "") or ""),
+                        "abstract": getattr(paper, "abstract", None),
+                        "authors": self._paper_author_names(paper),
+                        "year": getattr(paper, "year", None),
+                        "venue": getattr(paper, "venue", None) or getattr(paper, "journal", None),
+                    }
+                )
+
+            ranked.sort(
+                key=lambda item: (
+                    -int(item.get("score") or 0),
+                    str(item.get("title") or "").lower(),
+                    int(item.get("paper_id") or 0),
+                )
+            )
+            candidates = [
+                {
+                    "paper_id": int(item["paper_id"]),
+                    "title": str(item["title"] or ""),
+                    "abstract": item.get("abstract"),
+                    "authors": list(item.get("authors") or []),
+                    "year": item.get("year"),
+                    "venue": item.get("venue"),
+                }
+                for item in ranked[:max_results]
+            ]
+
+            if not candidates:
+                return ToolResult(
+                    success=True,
+                    output=f"没有找到与 `{query}` 匹配的已保存论文。",
+                    data={"query": query, "candidates": []},
+                )
+
+            lines = [
+                f"已找到 {len(candidates)} 个论文候选。",
+                f"- Query: {query}",
+                "- Candidates:",
+            ]
+            for item in candidates:
+                author_text = ", ".join(list(item.get("authors") or [])[:4]) or "unknown"
+                year_text = item.get("year") if item.get("year") is not None else "unknown"
+                venue_text = str(item.get("venue") or "").strip() or "unknown"
+                lines.append(
+                    f"- paper_id={item['paper_id']} | {item['title']} | {author_text} | {year_text} | {venue_text}"
+                )
+            return ToolResult(
+                success=True,
+                output="\n".join(lines),
+                data={
+                    "query": query,
+                    "candidates": candidates,
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class ProjectTreeTool(_PaperResearchToolBase):
+    name = "project_tree"
+    input_model = ProjectTreeInput
+    parallel_safe = True
+    output_max_tokens = 32000
+    description = (
+        "返回指定 Project 根目录的目录树，用来浏览项目结构、确认文件位置和发现可读文件。"
+        "根目录就是 `/app/uploads/projects/{project_id}`。"
+        "`project_id` 只能传 Project ID，不能传论文 `paper_id`。"
+        "如果现在只知道 `paper_id`，先调用 `paper_research_status(paper_id=...)` 或 `paper_research_prepare(paper_id=...)` 去解析对应 Project。"
+        "输出中的路径都按 Project 根目录的相对路径展示。"
+        "这个工具会保留完整目录树原文；同时会结合当前 agent 目标和最近工具调用，额外给出一份更聚焦的树整理和重要文件路径。"
+        "它只显示结构，不显示文件内容。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "Project ID。用于查看 `/app/uploads/projects/{project_id}` 的目录结构。"},
+        },
+        "required": ["project_id"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            project_id = int(kwargs["project_id"])
+            project_payload = await self._resolve_project_payload_only(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+
+            project_dir = self._project_dir_for(project_id)
+            tree = self._render_project_tree(project_dir)
+            focus_context = await self._load_project_tree_focus_context(
+                db,
+                project_payload=project_payload,
+            )
+            focused_tree, important_paths = await self._summarize_project_tree_for_agent(
+                tree=tree,
+                focus_context=focus_context,
+            )
+            lines = [
+                "已生成 Project 目录树。",
+                f"- Project: /projects/{project_id}",
+            ]
+            if focused_tree:
+                lines.extend(
+                    [
+                        "Focused tree:",
+                        focused_tree,
+                    ]
+                )
+            if important_paths:
+                lines.extend(
+                    [
+                        "Important paths:",
+                        *[f"- {path}" for path in important_paths],
+                    ]
+                )
+            lines.extend(
+                [
+                    "Tree:",
+                    tree,
+                ]
+            )
+            return ToolResult(
+                success=True,
+                output="\n".join(lines),
+                data={
+                    "project_id": project_id,
+                    "tree": tree,
+                    "focused_tree": focused_tree,
+                    "important_paths": important_paths,
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class ProjectReadFileTool(_PaperResearchToolBase):
+    name = "project_read_file"
+    input_model = ProjectReadFileInput
+    parallel_safe = True
+    output_max_tokens = 9000
+    description = (
+        "读取 Project 根目录中的单个文件，并返回完整文件内容。"
+        "`relative_path` 必须是相对于 `/app/uploads/projects/{project_id}` 的相对路径。"
+        "`project_id` 只能传 Project ID，不能传论文 `paper_id`。"
+        "如果只知道 `paper_id`，先用 `paper_research_status` 或 `paper_research_prepare` 解析出 Project。"
+        "这个工具适合在已经知道文件路径时读取完整内容；如果还不知道文件在哪，先用 `project_tree` 或 `paper_research_search_project_zoekt`。"
+        "它只允许读取 Project 根目录内的文件。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "Project ID。"},
+            "relative_path": {"type": "string", "description": "相对于 Project 根目录的文件路径，例如 `reference/paper/paper_interpretation.md`。"},
         },
         "required": ["project_id", "relative_path"],
     }
@@ -4838,895 +3294,1021 @@ class PaperResearchReadArtifactTool(_PaperResearchToolBase):
         async def _handler(db: AsyncSession) -> ToolResult:
             project_id = int(kwargs["project_id"])
             relative_path = self._normalize_relative_path(kwargs.get("relative_path"))
-            mode = str(kwargs.get("mode") or "auto")
-            max_chars = int(kwargs.get("max_chars") or 20000)
-            chunk_index = kwargs.get("chunk_index")
-            chunk_chars = kwargs.get("chunk_chars")
-            page = kwargs.get("page")
-            page_size_lines = kwargs.get("page_size_lines")
-            line_start = kwargs.get("line_start")
-            line_end = kwargs.get("line_end")
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            if not relative_path:
+                return ToolResult(
+                    success=False,
+                    output="relative_path 无效。",
+                    error="invalid_relative_path",
+                    data={"project_id": project_id, "relative_path": str(kwargs.get("relative_path") or "")},
+                )
+
+            project_payload = await self._resolve_project_payload_only(db, project_id=project_id)
             if project_payload is None:
                 return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
 
-            spec = self._artifact_spec_for_path(relative_path)
-            if spec is None:
-                allowed = ", ".join(sorted(self._CANONICAL_FILE_SPECS.keys()))
+            project_dir = self._project_dir_for(project_id)
+            target = self._resolve_project_path(project_dir, relative_path, require_exists=False)
+            if target is None:
                 return ToolResult(
                     success=False,
-                    output=(
-                        f"不支持的 artifact 路径: `{relative_path}`。"
-                        f"请先调用 paper_research_get_artifact_manifest。允许路径: {allowed}"
-                    ),
-                    error="artifact_path_not_allowed",
-                    data={"project_id": project_id, "relative_path": relative_path, "allowed_paths": sorted(self._CANONICAL_FILE_SPECS.keys())},
+                    output=f"不允许读取 Project 根目录之外的路径: `{relative_path}`。",
+                    error="project_path_out_of_scope",
+                    data={"project_id": project_id, "relative_path": relative_path},
                 )
-
-            workspace_dir = self._workspace_dir_for(workspace)
-            actual_path = self._artifact_actual_path(workspace_dir, relative_path)
-            if actual_path is None or not actual_path.is_file():
+            if not target.exists():
                 return ToolResult(
                     success=False,
-                    output=f"artifact 不存在: `{relative_path}`。",
-                    error="artifact_not_found",
-                    data={
-                        "project_id": project_id,
-                        "relative_path": relative_path,
-                        "exists": False,
-                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                    },
+                    output=f"Project 文件不存在: `{relative_path}`。",
+                    error="project_file_not_found",
+                    data={"project_id": project_id, "relative_path": relative_path},
                 )
-
-            text_payload = self._read_text_payload(
-                actual_path,
-                mode=mode,
-                max_chars=max_chars,
-                chunk_index=chunk_index,
-                chunk_chars=chunk_chars,
-                page=page,
-                page_size_lines=page_size_lines,
-                line_start=line_start,
-                line_end=line_end,
-            )
-            parsed_content: Any = None
-            if spec["content_type"] == "json":
-                try:
-                    parsed_content = json.loads(actual_path.read_text(encoding="utf-8"))
-                except Exception:
-                    parsed_content = None
-            lines = [
-                f"已读取 artifact: {relative_path}",
-                f"- Root alias: {self._PROJECT_ROOT_ALIAS}",
-                f"- Content type: {spec['content_type']}",
-                f"- Mode: {text_payload.get('mode')}",
-                f"- Truncated: {text_payload['truncated']}",
-                f"- Returned chars: {text_payload['returned_chars']}/{text_payload['total_chars']}",
-                f"- Has more: {text_payload.get('has_more')}",
-            ]
-            if text_payload.get("chunk_index") is not None:
-                lines.append(
-                    f"- Chunk: {text_payload.get('chunk_index')}/{text_payload.get('total_chunks')} (next={text_payload.get('next_chunk_index')})"
-                )
-            if text_payload.get("page") is not None:
-                lines.append(
-                    f"- Page: {text_payload.get('page')}/{text_payload.get('total_pages')} (next={text_payload.get('next_page')})"
-                )
-            if text_payload.get("line_start") is not None:
-                lines.append(
-                    f"- Lines: {text_payload.get('line_start')}-{text_payload.get('line_end')} / {text_payload.get('total_lines')}"
-                )
-            lines.extend([
-                "Content:",
-                str(text_payload["content"]),
-            ])
-            data = {
-                **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                "relative_path": relative_path,
-                "exists": True,
-                "content_type": spec["content_type"],
-                "content": parsed_content,
-                **text_payload,
-            }
-            return ToolResult(success=True, output="\n".join(lines), data=data)
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchSearchOutputsTool(_PaperResearchToolBase):
-    name = "paper_research_search_outputs"
-    input_model = PaperResearchSearchOutputsInput
-    parallel_safe = True
-    output_max_tokens = 9000
-    description = "在当前 Project/workspace 的归档产物中按关键词或正则搜索内容，适合搜索 `paper_intake_markdown.md`、planning/specs/drafts/executions 等输出。"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "query": {"type": "string", "description": "搜索词或正则表达式。默认按固定字符串搜索；只有在 `is_regex=true` 时才按正则处理。"},
-            "scope": {
-                "type": "string",
-                "enum": ["all", "planning", "repo_analysis", "grounding", "implementation", "run_drafts", "executions", "results"],
-                "default": "all",
-                "description": "只在指定 scope 的 workspace 产物里搜索；all 表示全部可管理输出。",
-            },
-            "max_results": {"type": "integer", "default": 20, "description": "最多返回多少条匹配。范围 1-100。"},
-            "case_sensitive": {"type": "boolean", "default": False, "description": "是否大小写敏感。"},
-            "is_regex": {"type": "boolean", "default": False, "description": "是否将 query 按正则表达式处理。"},
-            "context_lines": {
-                "type": "integer",
-                "default": 0,
-                "minimum": 0,
-                "maximum": 20,
-                "description": "返回每个命中点上下各多少行上下文。范围 0-20，适合先 search 再按行读局部。",
-            },
-        },
-        "required": ["project_id", "query"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            from app.services.project_service import ProjectService
-
-            project_id = int(kwargs["project_id"])
-            query = str(kwargs.get("query") or "").strip()
-            scope = str(kwargs.get("scope") or "all").strip().lower() or "all"
-            max_results = int(kwargs.get("max_results") or 20)
-            case_sensitive = bool(kwargs.get("case_sensitive", False))
-            is_regex = bool(kwargs.get("is_regex", False))
-            context_lines = int(kwargs.get("context_lines") or 0)
-
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
-            if project_payload is None:
-                return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
-
-            service = ProjectService(db)
-            outputs = await service.list_workspace_outputs(
-                project_id=project_id,
-                user_id=self.user_id,
-                workspace_id=int(workspace.id),
-            )
-            if outputs is None:
-                return self._workspace_not_ready(project_payload, project_id)
-
-            workspace_dir = self._workspace_dir_for(workspace)
-            searchable_items: List[Dict[str, Any]] = []
-            skipped_non_file_outputs: List[str] = []
-            for item in list(outputs or []):
-                relative_path = self._normalize_relative_path(item.get("relative_path"))
-                if not relative_path:
-                    continue
-                if scope != "all" and str(item.get("scope") or "").strip() != scope:
-                    continue
-                if str(item.get("storage") or "file").strip() != "file":
-                    skipped_non_file_outputs.append(relative_path)
-                    continue
-                target = workspace_dir / relative_path
-                if not target.is_file():
-                    continue
-                searchable_items.append(
-                    {
-                        "relative_path": relative_path,
-                        "scope": str(item.get("scope") or "").strip(),
-                        "kind": str(item.get("kind") or "").strip(),
-                        "path": target,
-                    }
-                )
-
-            flags = 0 if case_sensitive else re.IGNORECASE
-            try:
-                regex = re.compile(query, flags) if is_regex else None
-            except re.error as exc:
+            if not target.is_file():
                 return ToolResult(
                     success=False,
-                    output=f"搜索正则无效: {exc}",
-                    error="invalid_search_regex",
-                    data={"project_id": project_id, "query": query, "scope": scope},
+                    output=f"目标不是文件，不能读取: `{relative_path}`。",
+                    error="project_path_not_file",
+                    data={"project_id": project_id, "relative_path": relative_path},
                 )
-            fixed_query = query if case_sensitive else query.lower()
-            matches: List[Dict[str, Any]] = []
-            matched_files: Set[str] = set()
-            truncated = False
-            parse_errors = 0
 
-            for item in searchable_items:
-                try:
-                    with Path(item["path"]).open("r", encoding="utf-8", errors="ignore") as handle:
-                        for line_number, line in enumerate(handle, start=1):
-                            haystack = line if case_sensitive else line.lower()
-                            matched = bool(regex.search(line)) if regex is not None else fixed_query in haystack
-                            if not matched:
-                                continue
-                            relative_path = str(item["relative_path"])
-                            matched_files.add(relative_path)
-                            row: Dict[str, Any] = {
-                                "relative_path": relative_path,
-                                "line_number": line_number,
-                                "line_text": self._normalize_line_preview(line),
-                                "scope": item["scope"],
-                                "kind": item["kind"],
-                                "submatches": [],
-                            }
-                            if context_lines > 0:
-                                preview = self._read_text_payload(
-                                    Path(item["path"]),
-                                    mode="line_range",
-                                    max_chars=800,
-                                    chunk_index=None,
-                                    chunk_chars=None,
-                                    page=None,
-                                    page_size_lines=None,
-                                    line_start=max(1, line_number - context_lines),
-                                    line_end=max(1, line_number + context_lines),
-                                )
-                                row.update(
-                                    {
-                                        "context_start_line": preview.get("line_start"),
-                                        "context_end_line": preview.get("line_end"),
-                                        "context_text": preview.get("content"),
-                                        "context_truncated": preview.get("truncated"),
-                                    }
-                                )
-                            matches.append(row)
-                            if len(matches) >= max_results:
-                                truncated = True
-                                break
-                    if truncated:
-                        break
-                except Exception:
-                    parse_errors += 1
-                    continue
-
-            result_lines: List[str] = []
-            for item in matches:
-                result_lines.append(
-                    f"- {item.get('relative_path')}:{item.get('line_number')} | {item.get('line_text')}"
-                )
-                context_text = str(item.get("context_text") or "").strip()
-                if context_text:
-                    result_lines.append(
-                        f"  context {item.get('context_start_line')}-{item.get('context_end_line')}:\n{context_text}"
-                    )
-
-            lines = [
-                "已搜索 Project/workspace 归档产物。",
-                f"- Project: /projects/{project_id}",
-                f"- Scope: {scope}",
-                f"- Query: {query}",
-                f"- Regex: {is_regex}",
-                f"- Case sensitive: {case_sensitive}",
-                f"- Context lines: {context_lines}",
-                f"- Searchable outputs: {len(searchable_items)}",
-                f"- Matched files: {len(matched_files)}",
-                f"- Returned matches: {len(matches)}/{max_results}",
-                f"- Truncated: {truncated}",
-                "- Matches:",
-                *(result_lines or ["- none"]),
-            ]
-            if skipped_non_file_outputs:
-                lines.append("- Skipped non-file outputs:")
-                lines.extend(f"  - {item}" for item in skipped_non_file_outputs[:10])
-
+            content = target.read_text(encoding="utf-8", errors="replace")
             return ToolResult(
                 success=True,
-                output="\n".join(lines),
+                output="\n".join(
+                    [
+                        f"已读取 Project 文件: {relative_path}",
+                        "Content:",
+                        content,
+                    ]
+                ),
                 data={
-                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                    "scope": scope,
-                    "query": query,
-                    "context_lines": context_lines,
-                    "case_sensitive": case_sensitive,
-                    "is_regex": is_regex,
-                    "engine": "python_fallback",
-                    "searchable_output_count": len(searchable_items),
-                    "matched_file_count": len(matched_files),
-                    "returned_matches": len(matches),
-                    "truncated": truncated,
-                    "parse_errors": parse_errors,
-                    "skipped_non_file_outputs": skipped_non_file_outputs,
-                    "matches": matches,
+                    "project_id": project_id,
+                    "relative_path": relative_path,
+                    "content": content,
                 },
             )
 
         return await self._with_db(_handler)
 
 
-class PaperResearchReadRepoFileTool(_PaperResearchToolBase):
-    name = "paper_research_read_repo_file"
-    input_model = PaperResearchReadRepoFileInput
-    parallel_safe = True
+class ProjectWriteFileTool(_PaperResearchToolBase):
+    name = "project_write_file"
+    input_model = ProjectWriteFileInput
     output_max_tokens = 9000
-    description = "按 repo/source 下的相对路径读取单个仓库文件；路径不确定时先用 `paper_research_search_repo` 定位。"
+    description = (
+        "把完整内容写入 Project 根目录中的单个文件。"
+        "`relative_path` 必须是相对于 `/app/uploads/projects/{project_id}` 的相对路径。"
+        "`project_id` 只能传 Project ID，不能传论文 `paper_id`。"
+        "如果只知道 `paper_id`，先用 `paper_research_status` 或 `paper_research_prepare` 解析出 Project。"
+        "`content` 会作为该文件的完整最终内容写入；这是整文件覆盖，不是追加写入。"
+        "如果父目录不存在，会自动创建。它只允许写入 Project 根目录内的文件。"
+    )
     parameters = {
         "type": "object",
         "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "repo_relative_path": {
-                "type": "string",
-                "description": (
-                    "repo/source 下的相对路径，例如 `README.md`、`train.py` 或 `configs/train.yaml`。"
-                    "优先传 repo-relative 路径，不需要带 `repo/source/` 前缀。"
-                    "如果不确定具体位于哪个子目录，先用 `paper_research_search_repo` 按文件名或关键字定位，"
-                    "不要臆测 `scripts/` 等目录前缀。"
-                ),
-            },
-            "mode": {
-                "type": "string",
-                "enum": ["auto", "full", "chunk", "page", "line_range"],
-                "default": "auto",
-                "description": "读取模式。full 返回全文；chunk/page/line_range 返回原文分段，不做摘要。",
-            },
-            "max_chars": {"type": "integer", "default": 20000, "description": "兼容旧调用的字符窗口参数；chunk 模式下会作为默认 chunk_chars。"},
-            "chunk_index": {"type": "integer", "description": "chunk 模式下的块序号（1-based）。"},
-            "chunk_chars": {"type": "integer", "description": "chunk 模式下每块字符数。"},
-            "page": {"type": "integer", "description": "page 模式下的页号（1-based，按行分页）。"},
-            "page_size_lines": {"type": "integer", "description": "page 模式下每页多少行。"},
-            "line_start": {"type": "integer", "description": "line_range 模式起始行号（1-based）。"},
-            "line_end": {"type": "integer", "description": "line_range 模式结束行号（1-based）。"},
+            "project_id": {"type": "integer", "description": "Project ID。"},
+            "relative_path": {"type": "string", "description": "相对于 Project 根目录的文件路径，例如 `notes/summary.md`。"},
+            "content": {"type": "string", "description": "要写入文件的完整最终内容。调用前应假设它会覆盖旧文件。"},
         },
-        "required": ["project_id", "repo_relative_path"],
+        "required": ["project_id", "relative_path", "content"],
     }
 
     async def _execute(self, **kwargs) -> ToolResult:
         async def _handler(db: AsyncSession) -> ToolResult:
             project_id = int(kwargs["project_id"])
-            repo_relative_path = self._normalize_relative_path(kwargs.get("repo_relative_path"))
-            mode = str(kwargs.get("mode") or "auto")
-            max_chars = int(kwargs.get("max_chars") or 20000)
-            chunk_index = kwargs.get("chunk_index")
-            chunk_chars = kwargs.get("chunk_chars")
-            page = kwargs.get("page")
-            page_size_lines = kwargs.get("page_size_lines")
-            line_start = kwargs.get("line_start")
-            line_end = kwargs.get("line_end")
-            if not repo_relative_path:
-                return ToolResult(success=False, output="repo_relative_path 无效。", error="invalid_repo_relative_path")
-            if any(part in _REPO_SKIPPED_DIRS for part in repo_relative_path.split("/")):
+            relative_path = self._normalize_relative_path(kwargs.get("relative_path"))
+            if not relative_path:
                 return ToolResult(
                     success=False,
-                    output=f"不允许读取内部仓库元数据路径: `repo/source/{repo_relative_path}`。",
-                    error="repo_path_blocked",
-                    data={"project_id": project_id, "repo_relative_path": repo_relative_path},
+                    output="relative_path 无效。",
+                    error="invalid_relative_path",
+                    data={"project_id": project_id, "relative_path": str(kwargs.get("relative_path") or "")},
                 )
 
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            project_payload = await self._resolve_project_payload_only(db, project_id=project_id)
             if project_payload is None:
                 return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
 
-            workspace_dir = self._workspace_dir_for(workspace)
-            repo_dir = workspace_dir / "paper_repo"
-            if not repo_dir.is_dir():
+            project_dir = self._project_dir_for(project_id)
+            target = self._resolve_project_path(project_dir, relative_path, require_exists=False)
+            if target is None:
                 return ToolResult(
                     success=False,
-                    output="当前 Project 还没有可用的 repo/source。请先调用 paper_research_prepare 并检查 repo_reference。",
-                    error="repo_not_available",
+                    output=f"不允许写入 Project 根目录之外的路径: `{relative_path}`。",
+                    error="project_path_out_of_scope",
+                    data={"project_id": project_id, "relative_path": relative_path},
+                )
+            if target.exists() and not target.is_file():
+                return ToolResult(
+                    success=False,
+                    output=f"目标不是文件，不能写入: `{relative_path}`。",
+                    error="project_path_not_file",
+                    data={"project_id": project_id, "relative_path": relative_path},
+                )
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(kwargs.get("content") or ""), encoding="utf-8")
+            return ToolResult(
+                success=True,
+                output="\n".join(
+                    [
+                        "已写入 Project 文件。",
+                        f"- Project: /projects/{project_id}",
+                        f"- Relative path: {relative_path}",
+                    ]
+                ),
+                data={
+                    "project_id": project_id,
+                    "relative_path": relative_path,
+                    "written": True,
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class ProjectBashTool(_PaperResearchToolBase):
+    name = "project_bash"
+    input_model = ProjectBashInput
+    output_max_tokens = 9000
+    description = (
+        "在 Project 根目录里执行一条 bash 命令。"
+        "工作目录固定为 `/app/uploads/projects/{project_id}`。"
+        "`project_id` 只能传 Project ID，不能传论文 `paper_id`。"
+        "如果只知道 `paper_id`，先用 `paper_research_status` 或 `paper_research_prepare` 解析出 Project。"
+        "这个工具适合在当前 Project 里运行 shell 命令、检查文件、调用 CLI 或做最小脚本操作。"
+        "它不会切到 Project 根目录之外执行。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "Project ID。命令会在 `/app/uploads/projects/{project_id}` 下执行。"},
+            "command": {"type": "string", "description": "要执行的完整 bash 命令。"},
+        },
+        "required": ["project_id", "command"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            from app.services.project_runtime_service import ProjectRuntimeWorkerClient
+
+            project_id = int(kwargs["project_id"])
+            command = str(kwargs.get("command") or "").strip()
+            if not command:
+                return ToolResult(
+                    success=False,
+                    output="command 不能为空。",
+                    error="invalid_command",
+                    data={"project_id": project_id, "command": ""},
+                )
+
+            project_payload = await self._resolve_project_payload_only(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+
+            if not shutil.which("bash"):
+                return ToolResult(
+                    success=False,
+                    output="当前环境没有可用的 bash。",
+                    error="bash_not_available",
+                    data={"project_id": project_id, "command": command},
+                )
+
+            project_dir = self._project_dir_for(project_id)
+            if ProjectRuntimeWorkerClient.enabled():
+                try:
+                    worker_payload = await ProjectRuntimeWorkerClient().bash(
+                        project_id=project_id,
+                        workspace_dir=project_dir,
+                        command=command,
+                    )
+                except Exception as exc:
+                    return ToolResult(
+                        success=False,
+                        output="\n".join(
+                            [
+                                "Project bash 调用 runtime-worker 失败。",
+                                f"- Project: /projects/{project_id}",
+                                f"- Command: {command}",
+                                f"- Error: {type(exc).__name__}: {exc}",
+                            ]
+                        ),
+                        error="project_bash_worker_failed",
+                        data={
+                            "project_id": project_id,
+                            "command": command,
+                            "cwd": str(project_dir),
+                        },
+                    )
+                return ToolResult(
+                    success=bool(worker_payload.get("success")),
+                    output="\n".join(
+                        [
+                            "已通过 runtime-worker 执行 Project bash 命令。",
+                            f"- Project: /projects/{project_id}",
+                            f"- Command: {command}",
+                            f"- Exit code: {worker_payload.get('exit_code')}",
+                            "Stdout:",
+                            str(worker_payload.get("stdout") or "(empty)"),
+                            "Stderr:",
+                            str(worker_payload.get("stderr") or "(empty)"),
+                        ]
+                    ),
+                    error=str(worker_payload.get("error") or "") or None,
                     data={
-                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
                         "project_id": project_id,
-                        "relative_path": "repo/source",
+                        "command": command,
+                        "cwd": str(project_dir),
+                        "exit_code": worker_payload.get("exit_code"),
+                        "stdout": str(worker_payload.get("stdout") or ""),
+                        "stderr": str(worker_payload.get("stderr") or ""),
+                        "worker": str(worker_payload.get("worker") or "runtime-worker"),
+                    },
+                )
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    "bash",
+                    "-lc",
+                    command,
+                    cwd=str(project_dir),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=120.0)
+            except asyncio.TimeoutError:
+                process.kill()
+                stdout_bytes, stderr_bytes = await process.communicate()
+                stdout = stdout_bytes.decode("utf-8", errors="replace")
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
+                return ToolResult(
+                    success=False,
+                    output="\n".join(
+                        [
+                            "Project bash 执行超时。",
+                            f"- Project: /projects/{project_id}",
+                            f"- Command: {command}",
+                            "Stdout:",
+                            stdout or "(empty)",
+                            "Stderr:",
+                            stderr or "(empty)",
+                        ]
+                    ),
+                    error="project_bash_timeout",
+                    data={
+                        "project_id": project_id,
+                        "command": command,
+                        "cwd": str(project_dir),
+                        "exit_code": None,
+                        "stdout": stdout,
+                        "stderr": stderr,
                     },
                 )
 
-            target_path = (repo_dir / repo_relative_path).resolve()
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            stderr = stderr_bytes.decode("utf-8", errors="replace")
+            exit_code = int(process.returncode or 0)
+            return ToolResult(
+                success=exit_code == 0,
+                output="\n".join(
+                    [
+                        "已执行 Project bash 命令。",
+                        f"- Project: /projects/{project_id}",
+                        f"- Command: {command}",
+                        f"- Exit code: {exit_code}",
+                        "Stdout:",
+                        stdout or "(empty)",
+                        "Stderr:",
+                        stderr or "(empty)",
+                    ]
+                ),
+                error=None if exit_code == 0 else "project_bash_failed",
+                data={
+                    "project_id": project_id,
+                    "command": command,
+                    "cwd": str(project_dir),
+                    "exit_code": exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class ProjectClaudeTool(_PaperResearchToolBase):
+    name = "project_claude"
+    input_model = ProjectClaudeInput
+    timeout_seconds = 0.0
+    output_max_tokens = 9000
+    description = (
+        "在 runtime-worker 里调用 Claude Code，让它在当前 Project 根目录工作。"
+        "它会把 `/app/uploads/projects/{project_id}` 作为 Claude 的当前目录，并返回 Claude 的 session_id 和文本结果。"
+        "如果当前 Project 目录已有 Claude session，就自动复用；没有就自动新建。"
+        "通常只需要传 prompt。"
+        "这个工具只负责和 Claude 交互，不直接执行 bash。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "Project ID。Claude 会在 `/app/uploads/projects/{project_id}` 目录下工作。"},
+            "prompt": {"type": "string", "description": "发给 Claude Code 的完整提示。"},
+            "continue_session": {"type": "boolean", "default": False, "description": "可选强制继续开关。通常不用传；工具会自动在当前 Project 目录已有 session 时复用。"},
+        },
+        "required": ["project_id", "prompt"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            from app.services.project_runtime_service import ProjectRuntimeWorkerClient
+
+            project_id = int(kwargs["project_id"])
+            prompt = str(kwargs.get("prompt") or "").strip()
+            continue_session = bool(kwargs.get("continue_session"))
+            if not prompt:
+                return ToolResult(
+                    success=False,
+                    output="prompt 不能为空。",
+                    error="invalid_prompt",
+                    data={"project_id": project_id, "prompt": "", "continue_session": continue_session},
+                )
+
+            project_payload = await self._resolve_project_payload_only(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+
+            if not ProjectRuntimeWorkerClient.enabled():
+                return ToolResult(
+                    success=False,
+                    output="runtime-worker 未启用，当前不能调用 Claude Code。",
+                    error="runtime_worker_disabled",
+                    data={"project_id": project_id, "prompt": prompt, "continue_session": continue_session},
+                )
+
+            project_dir = self._project_dir_for(project_id)
             try:
-                target_path.relative_to(repo_dir.resolve())
+                live_stream_payload: Optional[Dict[str, Any]] = None
+                if _TOOL_LIVE_EVENT_EMITTER.get() is not None:
+                    async for stream_item in ProjectRuntimeWorkerClient().claude_stream(
+                        project_id=project_id,
+                        workspace_dir=project_dir,
+                        prompt=prompt,
+                        continue_session=continue_session,
+                    ):
+                        if str(stream_item.get("type") or "") == "chunk":
+                            text = str(stream_item.get("text") or "")
+                            if text:
+                                await emit_tool_live_event(
+                                    {
+                                        "type": "tool_output",
+                                        "data": {
+                                            "tool": self.name,
+                                            "input": {
+                                                "project_id": project_id,
+                                                "prompt": prompt,
+                                            },
+                                            "stream": str(stream_item.get("stream") or "stdout"),
+                                            "text": text,
+                                        },
+                                    }
+                                )
+                            continue
+                        if str(stream_item.get("type") or "") == "result" and isinstance(stream_item.get("payload"), dict):
+                            live_stream_payload = dict(stream_item.get("payload") or {})
+                    worker_payload = live_stream_payload or {
+                        "project_id": project_id,
+                        "workspace_dir": str(project_dir),
+                        "prompt": prompt,
+                        "continue_session": continue_session,
+                        "session_id": "",
+                        "assistant_text": "",
+                        "result_text": "",
+                        "is_error": True,
+                        "exit_code": None,
+                        "stdout": "",
+                        "stderr": "",
+                        "error": "project_claude_stream_missing_result",
+                        "worker": "runtime-worker",
+                    }
+                else:
+                    worker_payload = await ProjectRuntimeWorkerClient().claude(
+                        project_id=project_id,
+                        workspace_dir=project_dir,
+                        prompt=prompt,
+                        continue_session=continue_session,
+                    )
+            except Exception as exc:
+                return ToolResult(
+                    success=False,
+                    output="\n".join(
+                        [
+                            "Project Claude 调用 runtime-worker 失败。",
+                            f"- Project: /projects/{project_id}",
+                            f"- Error: {type(exc).__name__}: {exc}",
+                        ]
+                    ),
+                    error="project_claude_worker_failed",
+                    data={
+                        "project_id": project_id,
+                        "prompt": prompt,
+                        "continue_session": continue_session,
+                        "cwd": str(project_dir),
+                    },
+                )
+
+            result_text = str(worker_payload.get("result_text") or "").strip()
+            assistant_text = str(worker_payload.get("assistant_text") or "").strip()
+            rendered_text = result_text or assistant_text or str(worker_payload.get("stdout") or "").strip() or "(empty)"
+            return ToolResult(
+                success=not bool(worker_payload.get("is_error")),
+                output="\n".join(
+                    [
+                        "已通过 runtime-worker 调用 Claude Code。",
+                        f"- Project: /projects/{project_id}",
+                        f"- Continue session: {continue_session}",
+                        f"- Session: {str(worker_payload.get('session_id') or '').strip() or '(missing)'}",
+                        "Claude result:",
+                        rendered_text,
+                    ]
+                ),
+                error=str(worker_payload.get("error") or "") or None,
+                data={
+                    "project_id": project_id,
+                    "prompt": prompt,
+                    "continue_session": continue_session,
+                    "cwd": str(project_dir),
+                    "session_id": str(worker_payload.get("session_id") or ""),
+                    "assistant_text": assistant_text,
+                    "result_text": result_text,
+                    "stdout": str(worker_payload.get("stdout") or ""),
+                    "stderr": str(worker_payload.get("stderr") or ""),
+                    "exit_code": worker_payload.get("exit_code"),
+                    "worker": str(worker_payload.get("worker") or "runtime-worker"),
+                    "is_error": bool(worker_payload.get("is_error")),
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class DocxGenerateWithClaudeTool(ToolBase):
+    name = "docx_generate_with_claude"
+    input_model = DocxGenerateWithClaudeInput
+    timeout_seconds = 0.0
+    retry_count = 0
+    output_max_tokens = 9000
+    description = (
+        "把 Markdown 和文档生成要求写入独立 docx 工作目录，然后调用 runtime-worker 里的 Claude Code "
+        "使用官方 document-skills/docx 生成 DOCX/PDF。"
+        "它不属于 Project，不需要 project_id；工作目录固定为 `/app/uploads/docx/{docx_id}`。"
+        "长 Markdown 优先传 source_path；直接传 markdown 时工具会原样写入 source.md，不截断输入。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "docx_id": {"type": "string", "description": "可选文档任务 ID。未提供时自动生成，用作 `/app/uploads/docx/{docx_id}` 目录名。"},
+            "template_id": {"type": "string", "description": "可选模板 ID。工具会复制 `/app/uploads/docx/templates/{template_id}/files` 到工作区，并把模板 DOCX 约束附加到 requirements.md。"},
+            "artifact_id": {"type": "string", "description": "可选文档 artifact ID，用于把本次 DOCX 生成任务关联回结构化文档草稿。"},
+            "markdown": {"type": "string", "description": "完整 Markdown 原文。工具会原样写入 source.md，不截断。长文也可改传 source_path。"},
+            "source_path": {"type": "string", "description": "可选已有 Markdown 文件路径。支持 `/app/uploads` 下绝对路径或相对上传目录路径，用于避免在工具参数里塞超长文本。"},
+            "requirements": {"type": "string", "description": "文档生成要求、模板说明、章节要求、格式要求。工具会原样写入 requirements.md。"},
+            "output_basename": {"type": "string", "description": "可选输出文件基础名，不含扩展名。默认 generated_document。"},
+            "continue_session": {"type": "boolean", "default": False, "description": "是否强制继续该 docx 工作目录下已有 Claude session。通常不用传；runtime 会自动检测可续 session。"},
+        },
+        "required": ["requirements"],
+    }
+
+    def __init__(
+        self,
+        db: Optional[AsyncSession] = None,
+        user_id: Optional[int] = None,
+        db_session_factory: Optional[Callable[[], AsyncSession]] = None,
+        conversation_id: Optional[int] = None,
+    ):
+        self.db = db
+        self.user_id = int(user_id) if user_id is not None else None
+        self.db_session_factory = db_session_factory
+        self.conversation_id = int(conversation_id) if conversation_id is not None else None
+
+    @staticmethod
+    def _upload_root() -> Path:
+        configured = str(os.getenv("UPLOAD_DIR") or "").strip()
+        if configured:
+            return Path(os.path.abspath(configured))
+        mounted = Path("/app/uploads")
+        if mounted.exists():
+            return mounted.resolve()
+        return Path(os.path.abspath("./uploads"))
+
+    @staticmethod
+    def _safe_slug(value: Any, *, fallback: str) -> str:
+        text = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(value or "").strip()).strip("-._")
+        return (text or fallback)[:120]
+
+    @classmethod
+    def _new_docx_id(cls) -> str:
+        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        return cls._safe_slug(f"docx-{timestamp}-{uuid.uuid4().hex[:8]}", fallback="docx")
+
+    @classmethod
+    def _resolve_source_file(cls, raw_path: Any, *, upload_root: Path) -> Optional[Path]:
+        raw = str(raw_path or "").strip()
+        if not raw:
+            return None
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = upload_root / raw
+        try:
+            resolved = candidate.resolve()
+            root = upload_root.resolve()
+            resolved.relative_to(root)
+        except Exception:
+            return None
+        return resolved if resolved.is_file() else None
+
+    @staticmethod
+    def _relaxed_chmod(path: Path, mode: int) -> None:
+        try:
+            os.chmod(path, mode)
+        except Exception:
+            pass
+
+    @classmethod
+    def _collect_generated_files(cls, workspace_dir: Path, *, output_basename: str) -> Dict[str, Any]:
+        def _pick(extension: str) -> str:
+            preferred = workspace_dir / f"{output_basename}.{extension}"
+            if preferred.is_file():
+                return str(preferred)
+            candidates = sorted(
+                workspace_dir.glob(f"*.{extension}"),
+                key=lambda item: item.stat().st_mtime if item.exists() else 0.0,
+                reverse=True,
+            )
+            return str(candidates[0]) if candidates else ""
+
+        docx_path = _pick("docx")
+        pdf_path = _pick("pdf")
+        return {
+            "docx_path": docx_path,
+            "pdf_path": pdf_path,
+            "files": sorted(
+                str(path)
+                for path in workspace_dir.iterdir()
+                if path.is_file() and path.suffix.lower() in {".md", ".json", ".docx", ".pdf", ".png"}
+            ),
+        }
+
+    @staticmethod
+    def _infer_validation_status(*, worker_payload: Dict[str, Any], docx_path: str) -> str:
+        combined_text = "\n".join(
+            str(worker_payload.get(key) or "")
+            for key in ("result_text", "assistant_text", "stdout", "stderr")
+        )
+        if "All validations PASSED" in combined_text or "All validations passed" in combined_text:
+            return "passed"
+        if bool(worker_payload.get("is_error")):
+            return "failed"
+        return "generated_unverified" if docx_path else "missing"
+
+    @staticmethod
+    def _build_claude_prompt(*, workspace_dir: Path, output_basename: str) -> str:
+        docx_path = workspace_dir / f"{output_basename}.docx"
+        pdf_path = workspace_dir / f"{output_basename}.pdf"
+        return "\n".join(
+            [
+                "你现在只负责 DOCX 文档生成，不处理 Project/论文复现语义。",
+                f"工作目录：{workspace_dir}",
+                "输入文件：",
+                "- source.md：Markdown 原文",
+                "- requirements.md：文档模板、章节和格式要求",
+                "- default_docx_style_prompt.md：平台默认 DOCX 样式与 Word 原生结构要求，已合并进 requirements.md",
+                "- template_files/：可选模板参考文件（如果存在）",
+                "- template_md_constraints.md：可选上游 Markdown 生成约束，仅作追踪和一致性参考",
+                "任务：",
+                "1. 阅读 source.md 和 requirements.md，按要求生成高质量 DOCX。",
+                "2. 如有 template_files/，优先参考里面的模板、样例、图片或规范文件。",
+                "3. 优先使用官方 document-skills/docx 工作流和校验脚本；不要只生成一个能打开的空壳文件。",
+                f"4. DOCX 输出到：{docx_path}",
+                f"5. 如环境支持，同时生成 PDF 预览到：{pdf_path}",
+                "6. 如果无法完成，明确说明阻塞点，不要假装成功。",
+                "最终回复必须给出 docx_path、pdf_path（没有则空）、validation_status、notes。",
+            ]
+        )
+
+    async def _upsert_docx_job(self, template_service: Any, payload: Dict[str, Any]) -> None:
+        if self.db_session_factory is not None:
+            async with self.db_session_factory() as db:
+                await template_service.upsert_generation_job(
+                    db,
+                    user_id=self.user_id,
+                    job=payload,
+                )
+                await db.commit()
+            return
+        if self.db is not None:
+            await template_service.upsert_generation_job(
+                self.db,
+                user_id=self.user_id,
+                job=payload,
+            )
+            if self.db.in_transaction():
+                await self.db.commit()
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        from app.services.docx_runtime_service import DocxRuntimeWorkerClient
+        from app.services.docx_template_service import DocxTemplateService
+
+        docx_id = self._safe_slug(kwargs.get("docx_id"), fallback="") or self._new_docx_id()
+        template_id = self._safe_slug(kwargs.get("template_id"), fallback="")
+        artifact_id = self._safe_slug(kwargs.get("artifact_id"), fallback="")
+        output_basename = self._safe_slug(kwargs.get("output_basename"), fallback="generated_document")
+        requirements = str(kwargs.get("requirements") or "")
+        markdown = kwargs.get("markdown")
+        source_path = str(kwargs.get("source_path") or "").strip()
+        continue_session = bool(kwargs.get("continue_session"))
+
+        upload_root = self._upload_root()
+        template_service = DocxTemplateService(upload_root=upload_root)
+        workspace_dir = upload_root / "docx" / docx_id
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        self._relaxed_chmod(workspace_dir, 0o777)
+
+        source_file = workspace_dir / "source.md"
+        if markdown is not None and str(markdown) != "":
+            source_file.write_text(str(markdown), encoding="utf-8")
+        elif source_path:
+            resolved_source = self._resolve_source_file(source_path, upload_root=upload_root)
+            if resolved_source is None:
+                return ToolResult(
+                    success=False,
+                    output="source_path 不存在，或不在上传目录内。",
+                    error="invalid_source_path",
+                    data={"docx_id": docx_id, "source_path": source_path, "workspace_dir": str(workspace_dir)},
+                )
+            shutil.copyfile(resolved_source, source_file)
+        else:
+            return ToolResult(
+                success=False,
+                output="必须提供 markdown 或 source_path。",
+                error="missing_source",
+                data={"docx_id": docx_id, "workspace_dir": str(workspace_dir)},
+            )
+
+        requirements_file = workspace_dir / "requirements.md"
+        requirements_file.write_text(requirements, encoding="utf-8")
+        default_docx_style_prompt = template_service.get_default_docx_style_prompt()
+        default_docx_style_file = workspace_dir / "default_docx_style_prompt.md"
+        default_docx_style_file.write_text(default_docx_style_prompt, encoding="utf-8")
+        if default_docx_style_prompt.strip():
+            requirements = "\n\n".join(
+                [
+                    requirements.rstrip(),
+                    "# 平台默认 DOCX 样式要求",
+                    default_docx_style_prompt.strip(),
+                ]
+            ).strip()
+            requirements_file.write_text(requirements, encoding="utf-8")
+        metadata_file = workspace_dir / "docx_request.json"
+        metadata_file.write_text(
+            json.dumps(
+                {
+                    "docx_id": docx_id,
+                    "template_id": template_id,
+                    "artifact_id": artifact_id,
+                    "conversation_id": self.conversation_id,
+                    "user_id": self.user_id,
+                    "output_basename": output_basename,
+                    "source_file": str(source_file),
+                    "requirements_file": str(requirements_file),
+                    "default_docx_style_prompt_file": str(default_docx_style_file),
+                    "status": "preparing",
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        for path in (source_file, requirements_file, default_docx_style_file, metadata_file):
+            self._relaxed_chmod(path, 0o666)
+
+        template_payload: Optional[Dict[str, Any]] = None
+        template_files: List[str] = []
+        md_constraints_file = workspace_dir / "template_md_constraints.md"
+        if template_id:
+            try:
+                copied = template_service.copy_template_files_to_workspace(
+                    template_id=template_id,
+                    workspace_dir=workspace_dir,
+                )
             except ValueError:
                 return ToolResult(
                     success=False,
-                    output=f"不允许读取 repo/source 之外的路径: `{repo_relative_path}`。",
-                    error="repo_path_out_of_scope",
-                    data={"project_id": project_id, "repo_relative_path": repo_relative_path},
+                    output=f"模板不存在：{template_id}",
+                    error="template_not_found",
+                    data={"docx_id": docx_id, "template_id": template_id, "workspace_dir": str(workspace_dir)},
                 )
+            template_payload = dict(copied.get("template") or {})
+            template_files = [str(item) for item in list(copied.get("copied_files") or [])]
+            md_constraints = str(template_payload.get("md_constraints") or "")
+            docx_constraints = str(template_payload.get("docx_constraints") or "")
+            md_constraints_file.write_text(md_constraints, encoding="utf-8")
+            if docx_constraints.strip():
+                requirements = "\n\n".join(
+                    [
+                        requirements.rstrip(),
+                        "# 模板 DOCX 约束",
+                        docx_constraints.strip(),
+                    ]
+                ).strip()
+                requirements_file.write_text(requirements, encoding="utf-8")
+            self._relaxed_chmod(md_constraints_file, 0o666)
 
-            if not target_path.is_file():
-                return ToolResult(
-                    success=False,
-                    output=(
-                        f"仓库文件不存在: `repo/source/{repo_relative_path}`。"
-                        "这通常不是文件不可读，而是 repo_relative_path 猜错了。"
-                        "如果不确定真实路径，请先调用 `paper_research_search_repo` 用文件名或关键字定位，"
-                        "不要继续假设它在 `scripts/` 等目录下。"
-                    ),
-                    error="repo_file_not_found",
-                    data={
-                        "project_id": project_id,
-                        "repo_relative_path": repo_relative_path,
-                        "next_action": "paper_research_search_repo",
-                        "path_hint_invalid": True,
-                    },
-                )
-
-            text_payload = self._read_text_payload(
-                target_path,
-                mode=mode,
-                max_chars=max_chars,
-                chunk_index=chunk_index,
-                chunk_chars=chunk_chars,
-                page=page,
-                page_size_lines=page_size_lines,
-                line_start=line_start,
-                line_end=line_end,
-            )
-            relative_path = f"repo/source/{repo_relative_path}"
-            data = {
-                **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                "relative_path": relative_path,
-                "exists": True,
-                **text_payload,
-            }
-            lines = [
-                f"已读取 repo 文件: {relative_path}",
-                f"- Root alias: {self._PROJECT_ROOT_ALIAS}",
-                f"- Mode: {text_payload.get('mode')}",
-                f"- Truncated: {text_payload['truncated']}",
-                f"- Returned chars: {text_payload['returned_chars']}/{text_payload['total_chars']}",
-            ]
-            if text_payload.get("chunk_index") is not None:
-                lines.append(
-                    f"- Chunk: {text_payload.get('chunk_index')}/{text_payload.get('total_chunks')} (next={text_payload.get('next_chunk_index')})"
-                )
-            if text_payload.get("page") is not None:
-                lines.append(
-                    f"- Page: {text_payload.get('page')}/{text_payload.get('total_pages')} (next={text_payload.get('next_page')})"
-                )
-            if text_payload.get("line_start") is not None:
-                lines.append(
-                    f"- Returned lines: {text_payload.get('line_start')}-{text_payload.get('line_end')} / {text_payload.get('total_lines')}"
-                )
-            lines.extend([
-                "Content:",
-                str(text_payload["content"]),
-            ])
-            return ToolResult(success=True, output="\n".join(lines), data=data)
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchSearchRepoTool(_PaperResearchToolBase):
-    name = "paper_research_search_repo"
-    input_model = PaperResearchSearchRepoInput
-    parallel_safe = True
-    output_max_tokens = 9000
-    description = "在 repo/source 中按关键词或正则搜索内容，返回文件、行号和片段。"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "query": {"type": "string", "description": "搜索词或正则表达式。默认按固定字符串搜索；只有在 `is_regex=true` 时才按正则处理。"},
-            "max_results": {"type": "integer", "default": 20, "description": "最多返回多少条匹配。范围 1-100。"},
-            "case_sensitive": {"type": "boolean", "default": False, "description": "是否大小写敏感。"},
-            "is_regex": {"type": "boolean", "default": False, "description": "是否将 query 按正则表达式处理。"},
-            "glob": {"type": "string", "description": "可选文件 glob，例如 `*.py`、`*.sh` 或 `**/*.ipynb`；只用于缩小文件范围。"},
-            "context_lines": {
-                "type": "integer",
-                "default": 0,
-                "minimum": 0,
-                "maximum": 20,
-                "description": "可选，返回每个命中点上下各多少行上下文。范围 0-20，适合先 search 再按行读局部。",
+        running_job_payload = {
+            "docx_id": docx_id,
+            "template_id": template_id,
+            "template_name": str((template_payload or {}).get("name") or ""),
+            "artifact_id": artifact_id,
+            "conversation_id": self.conversation_id,
+            "workspace_dir": str(workspace_dir),
+            "source_path": str(source_file),
+            "requirements_path": str(requirements_file),
+            "output_basename": output_basename,
+            "status": "running",
+            "validation_status": "",
+            "files": [],
+            "metadata": {
+                "default_docx_style_prompt_file": str(default_docx_style_file),
+                "md_constraints_path": str(md_constraints_file) if template_id else "",
+                "template_files": template_files,
             },
-        },
-        "required": ["project_id", "query"],
-    }
+        }
+        metadata_file.write_text(
+            json.dumps(
+                {
+                    "docx_id": docx_id,
+                    "template_id": template_id,
+                    "template_name": running_job_payload["template_name"],
+                    "artifact_id": artifact_id,
+                    "conversation_id": self.conversation_id,
+                    "user_id": self.user_id,
+                    "output_basename": output_basename,
+                    "source_file": str(source_file),
+                    "requirements_file": str(requirements_file),
+                    "default_docx_style_prompt_file": str(default_docx_style_file),
+                    "md_constraints_path": str(md_constraints_file) if template_id else "",
+                    "template_files": template_files,
+                    "status": "running",
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self._relaxed_chmod(metadata_file, 0o666)
+        await self._upsert_docx_job(template_service, running_job_payload)
 
-    @staticmethod
-    def _decode_rg_value(payload: Any) -> str:
-        if isinstance(payload, dict):
-            text_value = payload.get("text")
-            if isinstance(text_value, str):
-                return text_value
-            bytes_value = payload.get("bytes")
-            if isinstance(bytes_value, str):
-                try:
-                    return base64.b64decode(bytes_value).decode("utf-8", errors="ignore")
-                except Exception:
-                    return ""
-        if isinstance(payload, str):
-            return payload
-        return ""
+        if not DocxRuntimeWorkerClient.enabled():
+            await self._upsert_docx_job(
+                template_service,
+                {
+                    **running_job_payload,
+                    "status": "failed",
+                    "error": "runtime_worker_disabled",
+                },
+            )
+            return ToolResult(
+                success=False,
+                output="runtime-worker 未启用，当前不能调用 Claude Code 生成 DOCX。",
+                error="runtime_worker_disabled",
+                data={"docx_id": docx_id, "workspace_dir": str(workspace_dir)},
+            )
 
-    @staticmethod
-    def _normalize_line_preview(value: str, *, limit: int = 240) -> str:
-        text = str(value or "").replace("\r", "").replace("\n", " ").strip()
-        if len(text) <= limit:
-            return text
-        return f"{text[: max(40, limit - 3)].rstrip()}..."
+        prompt = self._build_claude_prompt(workspace_dir=workspace_dir, output_basename=output_basename)
+        try:
+            live_stream_payload: Optional[Dict[str, Any]] = None
+            if _TOOL_LIVE_EVENT_EMITTER.get() is not None:
+                async for stream_item in DocxRuntimeWorkerClient().claude_stream(
+                    docx_id=docx_id,
+                    workspace_dir=workspace_dir,
+                    prompt=prompt,
+                    continue_session=continue_session,
+                ):
+                    if str(stream_item.get("type") or "") == "chunk":
+                        text = str(stream_item.get("text") or "")
+                        if text:
+                            await emit_tool_live_event(
+                                {
+                                    "type": "tool_output",
+                                    "data": {
+                                        "tool": self.name,
+                                        "input": {
+                                            "docx_id": docx_id,
+                                            "workspace_dir": str(workspace_dir),
+                                        },
+                                        "stream": str(stream_item.get("stream") or "stdout"),
+                                        "text": text,
+                                    },
+                                }
+                            )
+                        continue
+                    if str(stream_item.get("type") or "") == "result" and isinstance(stream_item.get("payload"), dict):
+                        live_stream_payload = dict(stream_item.get("payload") or {})
+                worker_payload = live_stream_payload or {
+                    "docx_id": docx_id,
+                    "workspace_dir": str(workspace_dir),
+                    "prompt": prompt,
+                    "continue_session": continue_session,
+                    "session_id": "",
+                    "assistant_text": "",
+                    "result_text": "",
+                    "is_error": True,
+                    "exit_code": None,
+                    "stdout": "",
+                    "stderr": "",
+                    "error": "docx_claude_stream_missing_result",
+                    "worker": "runtime-worker",
+                }
+            else:
+                worker_payload = await DocxRuntimeWorkerClient().claude(
+                    docx_id=docx_id,
+                    workspace_dir=workspace_dir,
+                    prompt=prompt,
+                    continue_session=continue_session,
+                )
+        except Exception as exc:
+            await self._upsert_docx_job(
+                template_service,
+                {
+                    **running_job_payload,
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            return ToolResult(
+                success=False,
+                output="\n".join(
+                    [
+                        "DOCX Claude 调用 runtime-worker 失败。",
+                        f"- Docx ID: {docx_id}",
+                        f"- Workspace: {workspace_dir}",
+                        f"- Error: {type(exc).__name__}: {exc}",
+                    ]
+                ),
+                error="docx_claude_worker_failed",
+                data={"docx_id": docx_id, "workspace_dir": str(workspace_dir)},
+            )
 
-    @classmethod
-    async def _search_with_rg(
-        cls,
-        *,
-        repo_dir: Path,
-        query: str,
-        max_results: int,
-        case_sensitive: bool,
-        is_regex: bool,
-        glob: Optional[str],
-    ) -> Dict[str, Any]:
-        if not shutil.which("rg"):
-            return {"available": False, "engine": "rg"}
-
-        command = [
-            "rg",
-            "--json",
-            "--line-number",
-            "--color",
-            "never",
-            "--hidden",
-            "--glob",
-            "!.git",
-            "--threads",
-            "1",
-        ]
-        if case_sensitive:
-            command.append("--case-sensitive")
-        else:
-            command.append("--ignore-case")
-        if not is_regex:
-            command.append("--fixed-strings")
-        if glob:
-            command.extend(["--glob", str(glob)])
-        command.extend([query, "."])
-
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=str(repo_dir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        files = self._collect_generated_files(workspace_dir, output_basename=output_basename)
+        validation_status = self._infer_validation_status(
+            worker_payload=worker_payload,
+            docx_path=str(files.get("docx_path") or ""),
+        )
+        result_text = str(worker_payload.get("result_text") or "").strip()
+        assistant_text = str(worker_payload.get("assistant_text") or "").strip()
+        rendered_text = result_text or assistant_text or "(empty)"
+        success = bool(files.get("docx_path")) and not bool(worker_payload.get("is_error"))
+        completed_status = "completed" if success else "failed"
+        completed_job_payload = {
+            **running_job_payload,
+            "status": completed_status,
+            "docx_path": files.get("docx_path") or "",
+            "pdf_path": files.get("pdf_path") or "",
+            "files": files.get("files") or [],
+            "validation_status": validation_status,
+            "session_id": str(worker_payload.get("session_id") or ""),
+            "error": str(worker_payload.get("error") or "") or ("" if success else "docx_missing_output"),
+            "metadata": {
+                **dict(running_job_payload.get("metadata") or {}),
+                "assistant_text": assistant_text,
+                "result_text": result_text,
+            },
+        }
+        metadata_file.write_text(
+            json.dumps(
+                {
+                    "docx_id": docx_id,
+                    "template_id": template_id,
+                    "template_name": str((template_payload or {}).get("name") or ""),
+                    "artifact_id": artifact_id,
+                    "conversation_id": self.conversation_id,
+                    "user_id": self.user_id,
+                    "output_basename": output_basename,
+                    "source_file": str(source_file),
+                    "requirements_file": str(requirements_file),
+                    "default_docx_style_prompt_file": str(default_docx_style_file),
+                    "md_constraints_path": str(md_constraints_file) if template_id else "",
+                    "template_files": template_files,
+                    "status": completed_status,
+                    "validation_status": validation_status,
+                    "session_id": str(worker_payload.get("session_id") or ""),
+                    "docx_path": files.get("docx_path") or "",
+                    "pdf_path": files.get("pdf_path") or "",
+                    "files": files.get("files") or [],
+                    "error": completed_job_payload["error"],
+                    "updated_at": datetime.utcnow().isoformat(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self._relaxed_chmod(metadata_file, 0o666)
+        await self._upsert_docx_job(template_service, completed_job_payload)
+        return ToolResult(
+            success=success,
+            output="\n".join(
+                [
+                    "已通过 runtime-worker 调用 Claude Code 生成 DOCX。",
+                    f"- Docx ID: {docx_id}",
+                    f"- Workspace: {workspace_dir}",
+                    f"- Continue session: {continue_session}",
+                    f"- Session: {str(worker_payload.get('session_id') or '').strip() or '(missing)'}",
+                    f"- DOCX: {files.get('docx_path') or '(missing)'}",
+                    f"- PDF: {files.get('pdf_path') or '(missing)'}",
+                    f"- Validation: {validation_status}",
+                    "Claude result:",
+                    rendered_text,
+                ]
+            ),
+            error=str(worker_payload.get("error") or "") or (None if success else "docx_missing_output"),
+            data={
+                "docx_id": docx_id,
+                "template_id": template_id,
+                "template_name": str((template_payload or {}).get("name") or ""),
+                "artifact_id": artifact_id,
+                "conversation_id": self.conversation_id,
+                "workspace_dir": str(workspace_dir),
+                "source_path": str(source_file),
+                "requirements_path": str(requirements_file),
+                "md_constraints_path": str(md_constraints_file) if template_id else "",
+                "output_basename": output_basename,
+                "docx_path": files.get("docx_path") or "",
+                "pdf_path": files.get("pdf_path") or "",
+                "files": files.get("files") or [],
+                "template_files": template_files,
+                "validation_status": validation_status,
+                "session_id": str(worker_payload.get("session_id") or ""),
+                "assistant_text": assistant_text,
+                "result_text": result_text,
+                "stdout": str(worker_payload.get("stdout") or ""),
+                "stderr": str(worker_payload.get("stderr") or ""),
+                "exit_code": worker_payload.get("exit_code"),
+                "worker": str(worker_payload.get("worker") or "runtime-worker"),
+                "is_error": bool(worker_payload.get("is_error")),
+            },
         )
 
-        matches: List[Dict[str, Any]] = []
-        matched_files: Set[str] = set()
-        truncated = False
-        parse_errors = 0
-        try:
-            assert process.stdout is not None
-            while True:
-                line = await process.stdout.readline()
-                if not line:
-                    break
-                try:
-                    event = json.loads(line.decode("utf-8", errors="ignore"))
-                except Exception:
-                    parse_errors += 1
-                    continue
-                if str(event.get("type") or "") != "match":
-                    continue
-                data = dict(event.get("data") or {})
-                repo_relative_path = cls._normalize_relative_path(cls._decode_rg_value(data.get("path")))
-                if not repo_relative_path:
-                    continue
-                line_number = int(data.get("line_number") or 0)
-                line_text = cls._normalize_line_preview(cls._decode_rg_value(data.get("lines")))
-                submatches = [
-                    cls._normalize_line_preview(cls._decode_rg_value(item.get("match")), limit=120)
-                    for item in list(data.get("submatches") or [])
-                    if cls._decode_rg_value(item.get("match"))
-                ]
-                matched_files.add(repo_relative_path)
-                matches.append(
-                    {
-                        "repo_relative_path": repo_relative_path,
-                        "relative_path": f"repo/source/{repo_relative_path}",
-                        "line_number": line_number,
-                        "line_text": line_text,
-                        "submatches": submatches,
-                    }
-                )
-                if len(matches) >= max_results:
-                    truncated = True
-                    process.terminate()
-                    break
-        finally:
-            try:
-                await asyncio.wait_for(process.communicate(), timeout=2.0)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.communicate()
 
-        return {
-            "available": True,
-            "engine": "rg",
-            "matches": matches,
-            "matched_files": sorted(matched_files),
-            "returned_matches": len(matches),
-            "truncated": truncated,
-            "parse_errors": parse_errors,
-            "returncode": process.returncode,
-        }
-
-    @classmethod
-    def _search_with_python_fallback(
-        cls,
-        *,
-        repo_dir: Path,
-        repo_files: Sequence[str],
-        query: str,
-        max_results: int,
-        case_sensitive: bool,
-        is_regex: bool,
-        glob: Optional[str],
-    ) -> Dict[str, Any]:
-        matches: List[Dict[str, Any]] = []
-        matched_files: Set[str] = set()
-        truncated = False
-        flags = 0 if case_sensitive else re.IGNORECASE
-        regex = re.compile(query, flags) if is_regex else None
-        fixed_query = query if case_sensitive else query.lower()
-        parse_errors = 0
-
-        for repo_relative_path in sorted(str(item or "").strip() for item in repo_files if str(item or "").strip()):
-            if glob and not fnmatch.fnmatch(repo_relative_path, glob):
-                continue
-            file_path = repo_dir / repo_relative_path
-            if not file_path.is_file():
-                continue
-            try:
-                with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
-                    for line_number, line in enumerate(handle, start=1):
-                        haystack = line if case_sensitive else line.lower()
-                        matched = bool(regex.search(line)) if regex is not None else fixed_query in haystack
-                        if not matched:
-                            continue
-                        matched_files.add(repo_relative_path)
-                        matches.append(
-                            {
-                                "repo_relative_path": repo_relative_path,
-                                "relative_path": f"repo/source/{repo_relative_path}",
-                                "line_number": line_number,
-                                "line_text": cls._normalize_line_preview(line),
-                                "submatches": [],
-                            }
-                        )
-                        if len(matches) >= max_results:
-                            truncated = True
-                            break
-                if truncated:
-                    break
-            except Exception:
-                parse_errors += 1
-                continue
-
-        return {
-            "available": True,
-            "engine": "python_fallback",
-            "matches": matches,
-            "matched_files": sorted(matched_files),
-            "returned_matches": len(matches),
-            "truncated": truncated,
-            "parse_errors": parse_errors,
-        }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            project_id = int(kwargs["project_id"])
-            query = str(kwargs.get("query") or "").strip()
-            max_results = int(kwargs.get("max_results") or 20)
-            case_sensitive = bool(kwargs.get("case_sensitive", False))
-            is_regex = bool(kwargs.get("is_regex", False))
-            glob = str(kwargs.get("glob") or "").strip() or None
-            context_lines = int(kwargs.get("context_lines") or 0)
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
-            if project_payload is None:
-                return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
-
-            workspace_dir = self._workspace_dir_for(workspace)
-            repo_dir = workspace_dir / "paper_repo"
-            if not repo_dir.is_dir():
-                return ToolResult(
-                    success=False,
-                    output="当前 Project 还没有可用的 repo/source。请先调用 paper_research_prepare 并检查 repo_reference。",
-                    error="repo_not_available",
-                    data={
-                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                        "project_id": project_id,
-                        "relative_path": "repo/source",
-                    },
-                )
-
-            repo_files = sorted(self._repo_file_set(workspace_dir))
-            if not repo_files:
-                repo_files = [
-                    self._normalize_relative_path(path.relative_to(repo_dir))
-                    for path in repo_dir.rglob("*")
-                    if path.is_file()
-                ]
-
-            try:
-                rg_payload = await self._search_with_rg(
-                    repo_dir=repo_dir,
-                    query=query,
-                    max_results=max_results,
-                    case_sensitive=case_sensitive,
-                    is_regex=is_regex,
-                    glob=glob,
-                )
-                if bool(rg_payload.get("available")) and int(rg_payload.get("returncode") or 0) in {0, 1, -15}:
-                    search_payload = rg_payload
-                else:
-                    search_payload = self._search_with_python_fallback(
-                        repo_dir=repo_dir,
-                        repo_files=repo_files,
-                        query=query,
-                        max_results=max_results,
-                        case_sensitive=case_sensitive,
-                        is_regex=is_regex,
-                        glob=glob,
-                    )
-            except re.error as exc:
-                return ToolResult(
-                    success=False,
-                    output=f"搜索正则无效: {exc}",
-                    error="invalid_search_regex",
-                    data={"project_id": project_id, "query": query, "glob": glob},
-                )
-
-            matches = list(search_payload.get("matches") or [])
-            if context_lines > 0:
-                enriched_matches: List[Dict[str, Any]] = []
-                for item in matches:
-                    enriched_matches.append(
-                        {
-                            **item,
-                            **self._build_repo_match_context(
-                                repo_dir=repo_dir,
-                                repo_relative_path=str(item.get("repo_relative_path") or ""),
-                                line_number=int(item.get("line_number") or 1),
-                                context_lines=context_lines,
-                            ),
-                        }
-                    )
-                matches = enriched_matches
-            matched_files = list(search_payload.get("matched_files") or [])
-            result_lines: List[str] = []
-            for item in matches:
-                result_lines.append(
-                    f"- {item.get('relative_path')}:{item.get('line_number')} | {item.get('line_text')}"
-                )
-                context_text = str(item.get("context_text") or "").strip()
-                if context_text:
-                    result_lines.append(
-                        f"  context {item.get('context_start_line')}-{item.get('context_end_line')}:\n{context_text}"
-                    )
-            lines = [
-                "已搜索 repo/source。",
-                f"- Project: /projects/{project_id}",
-                f"- Engine: {search_payload.get('engine')}",
-                f"- Query: {query}",
-                f"- Regex: {is_regex}",
-                f"- Case sensitive: {case_sensitive}",
-                f"- Glob: {glob or 'none'}",
-                f"- Context lines: {context_lines}",
-                f"- Matched files: {len(matched_files)}",
-                f"- Returned matches: {len(matches)}/{max_results}",
-                f"- Truncated: {bool(search_payload.get('truncated'))}",
-                "- Matches:",
-                *(result_lines or ["- none"]),
-            ]
-            return ToolResult(
-                success=True,
-                output="\n".join(lines),
-                data={
-                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                    "query": query,
-                    "glob": glob,
-                    "context_lines": context_lines,
-                    "case_sensitive": case_sensitive,
-                    "is_regex": is_regex,
-                    "engine": str(search_payload.get("engine") or "unknown"),
-                    "total_repo_files": len(repo_files),
-                    "matched_file_count": len(matched_files),
-                    "returned_matches": len(matches),
-                    "truncated": bool(search_payload.get("truncated")),
-                    "matches": matches,
-                },
-            )
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchBuildZoektIndexTool(_PaperResearchToolBase):
-    name = "paper_research_build_zoekt_index"
-    input_model = PaperResearchBuildZoektIndexInput
-    parallel_safe = True
-    description = "为当前 Project 的 repo/source 构建或刷新 Zoekt 代码检索索引。适合在大仓库里做高质量代码检索前先建立索引。"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "force_reindex": {"type": "boolean", "default": False, "description": "是否强制重建索引。"},
-        },
-        "required": ["project_id"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            project_id = int(kwargs["project_id"])
-            force_reindex = bool(kwargs.get("force_reindex", False))
-            project_payload, workspace, repo_dir, repo_error = await self._resolve_repo_workspace(db, project_id=project_id)
-            if repo_error is not None:
-                return repo_error
-            assert project_payload is not None and workspace is not None and repo_dir is not None
-
-            workspace_dir = self._workspace_dir_for(workspace)
-            payload = await ZoektCliService.build_index(
-                repo_dir=repo_dir,
-                workspace_dir=workspace_dir,
-                force_reindex=force_reindex,
-            )
-            if not bool(payload.get("success")):
-                error = str(payload.get("error") or "zoekt_index_failed")
-                return ToolResult(
-                    success=False,
-                    output=(
-                        "Zoekt 索引构建失败。\n"
-                        f"- Project: /projects/{project_id}\n"
-                        f"- Error: {error}\n"
-                        f"- Search binary: {payload.get('search_binary') or 'missing'}\n"
-                        f"- Git index binary: {payload.get('git_index_binary') or 'missing'}\n"
-                        f"- Plain index binary: {payload.get('plain_index_binary') or 'missing'}\n"
-                        f"- Stderr: {str(payload.get('stderr') or '').strip() or 'none'}"
-                    ),
-                    error=error,
-                    data={
-                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                        **dict(payload or {}),
-                    },
-                )
-
-            lines = [
-                "Zoekt 索引已就绪。",
-                f"- Project: /projects/{project_id}",
-                f"- Status: {payload.get('status')}",
-                f"- Engine: {payload.get('engine') or 'zoekt'}",
-                f"- Repo head: {payload.get('repo_head') or 'unknown'}",
-                f"- Repo dirty: {payload.get('repo_dirty')}",
-                f"- Index dir: {payload.get('index_dir')}",
-                f"- Index files: {payload.get('index_file_count')}",
-            ]
-            return ToolResult(
-                success=True,
-                output="\n".join(lines),
-                data={
-                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                    **dict(payload or {}),
-                },
-            )
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchSearchRepoZoektTool(_PaperResearchToolBase):
-    name = "paper_research_search_repo_zoekt"
-    input_model = PaperResearchSearchRepoZoektInput
+class PaperResearchSearchProjectZoektTool(_PaperResearchToolBase):
+    name = "paper_research_search_project_zoekt"
+    input_model = PaperResearchSearchProjectZoektInput
     parallel_safe = True
     output_max_tokens = 9000
     description = (
-        "使用 Zoekt 对 repo/source 做 trigram 代码检索。适合大仓库、跨文件搜索和高召回代码定位。"
-        "query 使用 Zoekt 查询语法，例如 `classification-results file:\\.sh$`。"
+        "使用 Zoekt 对整个 Project 根目录做高性能文本检索。"
+        "适合跨文件搜索代码、README、Markdown、JSON、配置文件和脚本内容，也支持文件名过滤、正则搜索、大小写控制、布尔组合、路径过滤、语言过滤和符号搜索。"
+        "返回路径都是相对于 Project 根目录的路径。"
+        "`project_id` 只能传 Project ID，不能传论文 `paper_id`。"
+        "如果只知道 `paper_id`，先用 `paper_research_status` 或 `paper_research_prepare` 解析出 Project。"
+        "重要：它是文本搜索，不是目录浏览。想看结构请用 `project_tree`；想读具体文件请用 `project_read_file`；不要把 `*` 当成“列出所有文件”的查询。"
     )
     parameters = {
         "type": "object",
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "query": {"type": "string", "description": "Zoekt 查询语法，例如 `classify file:\\.py$` 或 `symbol:train`。"},
-            "max_results": {"type": "integer", "default": 20, "description": "最多返回多少条命中。范围 1-100。"},
+            "query": {
+                "type": "string",
+                "description": (
+                "Zoekt 查询语法。优先提供具体术语、文件名或过滤条件，不要用 `*` 试图列目录。"
+                "常用写法："
+                "`fastText`（普通词搜索）、"
+                "`file:README`（按文件名/路径筛选）、"
+                "`content:\"train_supervised\"`（按内容短语搜索）、"
+                    "`regex:/train_(supervised|unsupervised)/`（正则搜索）、"
+                    "`case:yes content:\"FastText\"`（大小写敏感）、"
+                    "`lang:python content:\"load_model\"`（按语言过滤）、"
+                    "`sym:\"FastText\"`（搜索符号）、"
+                    "`file:\\.md$ reproduction`（路径/扩展名过滤）、"
+                    "`(README or docs) -file:website/`（布尔组合和排除）、"
+                    "`type:filename README`（只返回文件名匹配）。"
+                    "做论文复现探索时，优先用任务化查询，例如："
+                    "`(README or docs) supervised`、"
+                    "`bucket wordNgrams dim lr epoch`、"
+                    "`file:classification-results.sh test`、"
+                    "`file:dictionary.cc getLine`。"
+                    "如果 0 结果，先把查询缩短成一个强术语或一个具体文件名，再逐步加过滤。"
+                ),
+            },
+            "max_results": {"type": "integer", "default": 20, "description": "最多返回多少条命中，范围 1-100。更适合有目标地搜索，不适合把整个项目全列出来。"},
             "context_lines": {
                 "type": "integer",
                 "default": 0,
                 "minimum": 0,
                 "maximum": 20,
-                "description": "命中点上下各返回多少行局部上下文。",
+                "description": "每个命中点上下各返回多少行局部上下文。想看更多命中附近内容时增大它。",
             },
-            "auto_index": {"type": "boolean", "default": True, "description": "索引缺失时是否自动构建 Zoekt 索引。"},
-            "force_reindex": {"type": "boolean", "default": False, "description": "搜索前是否强制重建索引。"},
+            "auto_index": {"type": "boolean", "default": True, "description": "索引缺失时是否自动构建或复用 Project Zoekt 索引。通常保持 true。"},
+            "force_reindex": {"type": "boolean", "default": False, "description": "搜索前是否强制重建 Project Zoekt 索引。只有怀疑索引过期时再设 true。"},
         },
         "required": ["project_id", "query"],
     }
@@ -5739,17 +4321,16 @@ class PaperResearchSearchRepoZoektTool(_PaperResearchToolBase):
             context_lines = int(kwargs.get("context_lines") or 0)
             auto_index = bool(kwargs.get("auto_index", True))
             force_reindex = bool(kwargs.get("force_reindex", False))
-            project_payload, workspace, repo_dir, repo_error = await self._resolve_repo_workspace(db, project_id=project_id)
-            if repo_error is not None:
-                return repo_error
-            assert project_payload is not None and workspace is not None and repo_dir is not None
+            project_payload = await self._resolve_project_payload_only(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
 
-            workspace_dir = self._workspace_dir_for(workspace)
+            project_dir = self._project_dir_for(project_id)
             index_payload: Dict[str, Any] = {}
             if auto_index or force_reindex:
-                index_payload = await ZoektCliService.build_index(
-                    repo_dir=repo_dir,
-                    workspace_dir=workspace_dir,
+                index_payload = await ZoektCliService.build_project_index(
+                    project_dir=project_dir,
+                    workspace_dir=project_dir,
                     force_reindex=force_reindex,
                 )
                 if not bool(index_payload.get("success")):
@@ -5757,7 +4338,7 @@ class PaperResearchSearchRepoZoektTool(_PaperResearchToolBase):
                     return ToolResult(
                         success=False,
                         output=(
-                            "Zoekt 代码检索前的索引准备失败。\n"
+                            "Zoekt Project 搜索前的索引准备失败。\n"
                             f"- Project: /projects/{project_id}\n"
                             f"- Error: {error}\n"
                             f"- Search binary: {index_payload.get('search_binary') or 'missing'}\n"
@@ -5767,23 +4348,23 @@ class PaperResearchSearchRepoZoektTool(_PaperResearchToolBase):
                         ),
                         error=error,
                         data={
-                            **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                            **self._root_descriptor(project_payload=project_payload),
                             **dict(index_payload or {}),
                         },
                     )
 
-            search_payload = await ZoektCliService.search(
-                workspace_dir=workspace_dir,
+            search_payload = await ZoektCliService.search_project(
+                workspace_dir=project_dir,
                 query=query,
                 max_results=max_results,
             )
             if not bool(search_payload.get("success")):
                 error = str(search_payload.get("error") or "zoekt_search_failed")
                 if error == "zoekt_index_missing" and not auto_index:
-                    error_message = "Zoekt 索引不存在。请先调用 `paper_research_build_zoekt_index`，或把 auto_index 设为 true。"
+                    error_message = "Project Zoekt 索引不存在。请把 auto_index 设为 true，或先执行一次 Project Zoekt 搜索来自动建索引。"
                 else:
                     error_message = (
-                        "Zoekt 代码检索失败。\n"
+                        "Zoekt Project 搜索失败。\n"
                         f"- Error: {error}\n"
                         f"- Search binary: {search_payload.get('search_binary') or 'missing'}\n"
                         f"- Index dir: {search_payload.get('index_dir') or 'missing'}"
@@ -5793,7 +4374,7 @@ class PaperResearchSearchRepoZoektTool(_PaperResearchToolBase):
                     output=error_message,
                     error=error,
                     data={
-                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                        **self._root_descriptor(project_payload=project_payload),
                         **dict(search_payload or {}),
                     },
                 )
@@ -5804,20 +4385,35 @@ class PaperResearchSearchRepoZoektTool(_PaperResearchToolBase):
                 for item in matches:
                     line_number = int(item.get("line_number") or 0)
                     if line_number > 0:
+                        relative_path = str(item.get("source_relative_path") or item.get("relative_path") or "")
                         enriched_matches.append(
                             {
                                 **item,
-                                **self._build_repo_match_context(
-                                    repo_dir=repo_dir,
-                                    repo_relative_path=str(item.get("repo_relative_path") or ""),
+                                "project_relative_path": relative_path,
+                                **self._build_match_context(
+                                    root_dir=project_dir,
+                                    relative_path=relative_path,
                                     line_number=line_number,
                                     context_lines=context_lines,
                                 ),
                             }
                         )
                     else:
-                        enriched_matches.append(dict(item))
+                        enriched_matches.append(
+                            {
+                                **item,
+                                "project_relative_path": str(item.get("source_relative_path") or item.get("relative_path") or ""),
+                            }
+                        )
                 matches = enriched_matches
+            else:
+                matches = [
+                    {
+                        **item,
+                        "project_relative_path": str(item.get("source_relative_path") or item.get("relative_path") or ""),
+                    }
+                    for item in matches
+                ]
 
             result_lines: List[str] = []
             for item in matches:
@@ -5836,8 +4432,9 @@ class PaperResearchSearchRepoZoektTool(_PaperResearchToolBase):
                     result_lines.append(
                         f"  context {item.get('context_start_line')}-{item.get('context_end_line')}:\n{context_text}"
                     )
+            matched_relative_paths = list(search_payload.get("matched_relative_paths") or [])
             lines = [
-                "已使用 Zoekt 搜索 repo/source。",
+                "已使用 Zoekt 搜索 Project 根目录。",
                 f"- Project: /projects/{project_id}",
                 f"- Query: {query}",
                 f"- Auto index: {auto_index}",
@@ -5845,7 +4442,7 @@ class PaperResearchSearchRepoZoektTool(_PaperResearchToolBase):
                 f"- Index status: {index_payload.get('status') or 'unchanged'}",
                 f"- Index dir: {search_payload.get('index_dir')}",
                 f"- Context lines: {context_lines}",
-                f"- Matched files: {len(list(search_payload.get('matched_files') or []))}",
+                f"- Matched files: {len(matched_relative_paths)}",
                 f"- Returned matches: {len(matches)}/{max_results}",
                 f"- Truncated: {bool(search_payload.get('truncated'))}",
                 "- Matches:",
@@ -5855,7 +4452,7 @@ class PaperResearchSearchRepoZoektTool(_PaperResearchToolBase):
                 success=True,
                 output="\n".join(lines),
                 data={
-                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    **self._root_descriptor(project_payload=project_payload),
                     "query": query,
                     "context_lines": context_lines,
                     "auto_index": auto_index,
@@ -5863,318 +4460,15 @@ class PaperResearchSearchRepoZoektTool(_PaperResearchToolBase):
                     "engine": "zoekt",
                     "index_status": index_payload.get("status"),
                     "index_dir": search_payload.get("index_dir"),
-                    "matched_file_count": len(list(search_payload.get("matched_files") or [])),
+                    "matched_file_count": len(matched_relative_paths),
                     "returned_matches": len(matches),
                     "truncated": bool(search_payload.get("truncated")),
                     "matches": matches,
-                    "matched_files": list(search_payload.get("matched_files") or []),
+                    "matched_files": matched_relative_paths,
                     "zoekt": {
                         **dict(index_payload or {}),
                         **dict(search_payload or {}),
                     },
-                },
-            )
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchRunAiderTool(_PaperResearchToolBase):
-    name = "paper_research_run_aider"
-    input_model = PaperResearchRunAiderInput
-    output_max_tokens = 9000
-    description = (
-        "使用隔离安装的 aider CLI 对当前 Project 做受控编辑。"
-        "支持 `target_root=repo` 修改 repo/source，也支持 `target_root=workspace` 局部修改 planning/specs/drafts 下的 JSON/Markdown 产物。"
-        "优先把 `editable_files` 缩到最小；`read_only_files` 只提供上下文不允许修改；"
-        "`mode=architect` 适合多文件或 edit-format 容易失真的场景；"
-        "`dry_run=true` 只预演不落盘；`auto_test + test_cmd` 可在编辑后自动跑验证。"
-        "默认禁用 aider auto-commit，避免偷偷提交 git。"
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "instruction": {
-                "type": "string",
-                "description": "交给 aider 的单次自然语言任务说明。要求清楚写出目标、限制和验收标准。",
-            },
-            "target_root": {
-                "type": "string",
-                "enum": ["repo", "workspace"],
-                "default": "repo",
-                "description": "repo=在 repo/source 根目录运行 aider；workspace=在 Project workspace 根目录运行，并用 --no-git 允许局部改 JSON/MD truth files。",
-            },
-            "mode": {
-                "type": "string",
-                "enum": ["code", "architect", "ask"],
-                "default": "code",
-                "description": "code=直接编辑；architect=先规划再编辑，通常更稳；ask=以只读分析为主，适合修改前讨论或 dry_run。",
-            },
-            "editable_files": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "允许 aider 修改的相对路径列表。repo 模式下相对 repo/source；workspace 模式下相对 workspace 根。建议尽量小，减少上下文和误改范围。",
-            },
-            "read_only_files": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "只读上下文文件列表，加入 chat 但不允许修改。适合 README、schema、参考实现、关键配置等。",
-            },
-            "context_artifacts": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "把已有 workspace 归档产物内容拼进 prompt。支持 `paper_summary`、`paper_intake_result`、`experiment_spec`、`grounding_report`、`implementation_spec`、`run_drafts` 或直接给相对路径。",
-            },
-            "llm_provider": {
-                "type": "string",
-                "description": "可选，覆盖 aider 使用的 LLM provider。默认走当前后端默认 provider，并通过 OpenAI-compatible API 方式接入。",
-            },
-            "model_name": {"type": "string", "description": "可选，覆盖主模型。未显式写 provider 前缀时会自动按 openai-compatible 模型名处理。"},
-            "editor_model": {"type": "string", "description": "可选，architect 模式下的 editor model。"},
-            "weak_model": {"type": "string", "description": "可选，用于 commit message/history summarization 的弱模型。"},
-            "edit_format": {"type": "string", "description": "可选，覆盖 aider 主 edit format。"},
-            "editor_edit_format": {"type": "string", "description": "可选，覆盖 architect/editor 二段式里的 editor edit format。"},
-            "reasoning_effort": {"type": "string", "description": "可选，传给 aider 的 reasoning_effort 参数。仅在底层模型支持时才有意义。"},
-            "dry_run": {
-                "type": "boolean",
-                "default": False,
-                "description": "true 时只预演，不修改文件。适合先看 aider 会怎么动手。",
-            },
-            "map_tokens": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 64000,
-                "description": "可选，覆盖 aider repo map token budget。大仓库默认不宜过高。",
-            },
-            "api_timeout_seconds": {
-                "type": "integer",
-                "minimum": 30,
-                "maximum": 3600,
-                "description": "可选，单次模型 API timeout，作用于 aider 内部 LLM 请求。",
-            },
-            "auto_test": {
-                "type": "boolean",
-                "default": False,
-                "description": "是否在编辑后自动执行 test_cmd。",
-            },
-            "test_cmd": {
-                "type": "string",
-                "description": "可选，传给 aider 的测试命令，例如 `pytest backend/tests/test_x.py -q`。配合 auto_test=true 使用。",
-            },
-            "auto_lint": {
-                "type": "boolean",
-                "default": False,
-                "description": "是否在编辑后自动执行 lint_cmds。",
-            },
-            "lint_cmds": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "可选，传给 aider 的 lint commands。",
-            },
-            "allow_dirty_repo": {
-                "type": "boolean",
-                "default": False,
-                "description": "repo 模式下是否允许在已有未提交改动的工作树里继续运行 aider。默认 false，避免混入用户脏改动。",
-            },
-        },
-        "required": ["project_id", "instruction"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            project_id = int(kwargs["project_id"])
-            target_root = str(kwargs.get("target_root") or "repo").strip().lower() or "repo"
-            if target_root == "repo":
-                project_payload, workspace, repo_dir, repo_error = await self._resolve_repo_workspace(db, project_id=project_id)
-                if repo_error is not None:
-                    return repo_error
-                assert project_payload is not None and workspace is not None and repo_dir is not None
-                workspace_dir = self._workspace_dir_for(workspace)
-            else:
-                project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
-                if project_payload is None:
-                    return self._project_not_found(project_id)
-                if workspace is None:
-                    return self._workspace_not_ready(project_payload, project_id)
-                workspace_dir = self._workspace_dir_for(workspace)
-
-            payload = await AiderCliService.run(
-                workspace_dir=workspace_dir,
-                instruction=str(kwargs.get("instruction") or ""),
-                target_root=target_root,
-                editable_files=list(kwargs.get("editable_files") or []),
-                read_only_files=list(kwargs.get("read_only_files") or []),
-                context_artifacts=list(kwargs.get("context_artifacts") or []),
-                provider=str(kwargs.get("llm_provider") or settings.default_llm_provider or "").strip() or None,
-                model_name=str(kwargs.get("model_name") or "").strip() or None,
-                editor_model=str(kwargs.get("editor_model") or "").strip() or None,
-                weak_model=str(kwargs.get("weak_model") or "").strip() or None,
-                mode=str(kwargs.get("mode") or "code").strip() or "code",
-                edit_format=str(kwargs.get("edit_format") or "").strip() or None,
-                editor_edit_format=str(kwargs.get("editor_edit_format") or "").strip() or None,
-                reasoning_effort=str(kwargs.get("reasoning_effort") or "").strip() or None,
-                dry_run=bool(kwargs.get("dry_run", False)),
-                map_tokens=kwargs.get("map_tokens"),
-                api_timeout_seconds=kwargs.get("api_timeout_seconds"),
-                auto_test=bool(kwargs.get("auto_test", False)),
-                test_cmd=str(kwargs.get("test_cmd") or "").strip() or None,
-                auto_lint=bool(kwargs.get("auto_lint", False)),
-                lint_cmds=list(kwargs.get("lint_cmds") or []),
-                allow_dirty_repo=bool(kwargs.get("allow_dirty_repo", False)),
-            )
-
-            lines = [
-                "aider 已执行。",
-                f"- Project: /projects/{project_id}",
-                f"- Run ID: {payload.get('run_id')}",
-                f"- Target root: {payload.get('target_root')}",
-                f"- Mode: {payload.get('mode')}",
-                f"- Success: {bool(payload.get('success'))}",
-                f"- Dry run: {bool(payload.get('dry_run'))}",
-                f"- Changed files: {payload.get('changed_file_count')}",
-                f"- Run dir: {payload.get('run_dir')}",
-            ]
-            if payload.get("diff_path"):
-                lines.append(f"- Diff: {payload.get('diff_path')}")
-            if payload.get("stdout_path"):
-                lines.append(f"- Stdout: {payload.get('stdout_path')}")
-            if payload.get("error"):
-                lines.append(f"- Error: {payload.get('error')}")
-            excerpt = str(payload.get("stdout_excerpt") or "").strip()
-            if excerpt:
-                lines.extend(["Stdout excerpt:", excerpt])
-            return ToolResult(
-                success=bool(payload.get("success")),
-                output="\n".join(lines),
-                error=str(payload.get("error") or "") or None,
-                data={
-                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                    **dict(payload or {}),
-                    "aider_run": {
-                        "run_id": payload.get("run_id"),
-                        "target_root": payload.get("target_root"),
-                        "mode": payload.get("mode"),
-                        "success": bool(payload.get("success")),
-                        "changed_file_count": int(payload.get("changed_file_count") or 0),
-                        "changed_files": list(payload.get("changed_files") or []),
-                    },
-                },
-            )
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchReadAiderRunTool(_PaperResearchToolBase):
-    name = "paper_research_read_aider_run"
-    input_model = PaperResearchReadAiderRunInput
-    parallel_safe = True
-    output_max_tokens = 9000
-    description = "读取已归档 aider run 的摘要、stdout、prompt 或 diff。适合在 run 后回看它到底改了什么、为什么失败。"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "run_id": {"type": "string", "description": "aider run ID。"},
-            "include_stdout": {"type": "boolean", "default": True},
-            "include_prompt": {"type": "boolean", "default": False},
-            "include_diff": {"type": "boolean", "default": False},
-            "max_chars": {"type": "integer", "minimum": 200, "maximum": 200000, "default": 20000},
-        },
-        "required": ["project_id", "run_id"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            project_id = int(kwargs["project_id"])
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
-            if project_payload is None:
-                return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
-            payload = AiderCliService.read_run(
-                workspace_dir=self._workspace_dir_for(workspace),
-                run_id=str(kwargs.get("run_id") or "").strip(),
-                include_stdout=bool(kwargs.get("include_stdout", True)),
-                include_prompt=bool(kwargs.get("include_prompt", False)),
-                include_diff=bool(kwargs.get("include_diff", False)),
-                max_chars=int(kwargs.get("max_chars") or 20000),
-            )
-            lines = [
-                "已读取 aider run。",
-                f"- Project: /projects/{project_id}",
-                f"- Run ID: {payload.get('run_id') or kwargs.get('run_id')}",
-                f"- Success: {bool(payload.get('success'))}",
-            ]
-            if payload.get("error"):
-                lines.append(f"- Error: {payload.get('error')}")
-            if payload.get("message"):
-                lines.append(f"- Message: {payload.get('message')}")
-            if payload.get("stdout"):
-                lines.extend(["Stdout:", str(payload.get("stdout") or "")])
-            if payload.get("diff"):
-                lines.extend(["Diff:", str(payload.get("diff") or "")])
-            if payload.get("prompt"):
-                lines.extend(["Prompt:", str(payload.get("prompt") or "")])
-            return ToolResult(
-                success=bool(payload.get("success")),
-                output="\n".join(lines),
-                error=str(payload.get("error") or "") or None,
-                data={
-                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                    **dict(payload or {}),
-                },
-            )
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchTailAiderLogTool(_PaperResearchToolBase):
-    name = "paper_research_tail_aider_log"
-    input_model = PaperResearchTailAiderLogInput
-    parallel_safe = True
-    output_max_tokens = 9000
-    description = "快速读取 aider stdout 日志尾部。适合看最近一次编辑 run 的错误、模型拒绝、edit format 失败等。"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "run_id": {"type": "string", "description": "aider run ID。"},
-            "max_chars": {"type": "integer", "minimum": 200, "maximum": 200000, "default": 12000},
-        },
-        "required": ["project_id", "run_id"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            project_id = int(kwargs["project_id"])
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
-            if project_payload is None:
-                return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
-            payload = AiderCliService.tail_log(
-                workspace_dir=self._workspace_dir_for(workspace),
-                run_id=str(kwargs.get("run_id") or "").strip(),
-                max_chars=int(kwargs.get("max_chars") or 12000),
-            )
-            lines = [
-                "已读取 aider 日志尾部。",
-                f"- Project: /projects/{project_id}",
-                f"- Run ID: {payload.get('run_id') or kwargs.get('run_id')}",
-            ]
-            if payload.get("error"):
-                lines.append(f"- Error: {payload.get('error')}")
-            if payload.get("message"):
-                lines.append(f"- Message: {payload.get('message')}")
-            if payload.get("tail"):
-                lines.extend(["Log tail:", str(payload.get("tail") or "")])
-            return ToolResult(
-                success=bool(payload.get("success")),
-                output="\n".join(lines),
-                error=str(payload.get("error") or "") or None,
-                data={
-                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                    **dict(payload or {}),
                 },
             )
 
@@ -6524,200 +4818,6 @@ class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
                     "top_candidates": top_candidates,
                     "selected_main_path": selected_candidate,
                     "selected_main_path_reason": ", ".join(list(selected_candidate.get("reasons") or [])) if selected_candidate else None,
-                },
-            )
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchListOutputsTool(_PaperResearchToolBase):
-    name = "paper_research_list_outputs"
-    input_model = PaperResearchListOutputsInput
-    parallel_safe = True
-    output_max_tokens = 9000
-    description = "列出当前 Project/workspace 可管理的归档产物，可按 scope 过滤，供 LLM 判断是否需要清理现场。"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "scope": {
-                "type": "string",
-                "enum": ["all", "planning", "repo_analysis", "grounding", "implementation", "run_drafts", "executions", "results"],
-                "default": "all",
-                "description": "只返回指定 scope 的产物；all 返回全部。",
-            },
-        },
-        "required": ["project_id"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            from app.services.project_service import ProjectService
-
-            project_id = int(kwargs["project_id"])
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
-            if project_payload is None:
-                return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
-
-            scope = str(kwargs.get("scope") or "all").strip().lower() or "all"
-            service = ProjectService(db)
-            outputs = await service.list_workspace_outputs(
-                project_id=project_id,
-                user_id=self.user_id,
-                workspace_id=int(workspace.id),
-            )
-            if outputs is None:
-                return self._workspace_not_ready(project_payload, project_id)
-            items = list(outputs or [])
-            if scope != "all":
-                items = [item for item in items if str(item.get("scope") or "").strip() == scope]
-
-            lines = [
-                "已列出当前 Project/workspace 的归档产物。",
-                f"- Project: /projects/{project_id}",
-                f"- Scope: {scope}",
-                f"- Count: {len(items)}",
-            ]
-            if items:
-                lines.append("- Outputs:")
-                for item in items[:40]:
-                    lines.append(
-                        "  - "
-                        f"{item.get('relative_path')} "
-                        f"[scope={item.get('scope')}, kind={item.get('kind')}, present={bool(item.get('present'))}]"
-                    )
-            return ToolResult(
-                success=True,
-                output="\n".join(lines),
-                data={
-                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                    "scope": scope,
-                    "outputs": items,
-                    "count": len(items),
-                },
-            )
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchDeleteOutputTool(_PaperResearchToolBase):
-    name = "paper_research_delete_output"
-    input_model = PaperResearchDeleteOutputInput
-    description = "删除当前 Project/workspace 下的单个归档产物文件或 compare_report 记录。用于让 LLM 清理旧现场后重做。"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "relative_path": {"type": "string", "description": "要删除的产物相对路径，例如 `specs/grounding_report.json`。"},
-        },
-        "required": ["project_id", "relative_path"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            from app.services.project_service import ProjectService
-
-            project_id = int(kwargs["project_id"])
-            relative_path = str(kwargs.get("relative_path") or "").strip()
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
-            if project_payload is None:
-                return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
-
-            service = ProjectService(db)
-            payload = await service.delete_workspace_output(
-                project_id=project_id,
-                user_id=self.user_id,
-                workspace_id=int(workspace.id),
-                relative_path=relative_path,
-            )
-            if payload is None:
-                return ToolResult(
-                    success=False,
-                    output=f"未找到可删除的产物：{relative_path}",
-                    error="workspace_output_not_found",
-                    data={
-                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                        "relative_path": relative_path,
-                    },
-                )
-            return ToolResult(
-                success=True,
-                output=(
-                    "已删除 Project/workspace 产物。\n"
-                    f"- Project: /projects/{project_id}\n"
-                    f"- Relative path: {relative_path}"
-                ),
-                data={
-                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                    **dict(payload or {}),
-                },
-            )
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchCleanupScopeTool(_PaperResearchToolBase):
-    name = "paper_research_cleanup_scope"
-    input_model = PaperResearchCleanupScopeInput
-    description = "按 scope 清理当前 Project/workspace 产物，例如 planning/grounding/executions。用于让 LLM 重做某阶段前先清现场。"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "scope": {
-                "type": "string",
-                "enum": ["all", "planning", "repo_analysis", "grounding", "implementation", "run_drafts", "executions", "results"],
-                "default": "all",
-                "description": "要清理的产物范围。all 表示清空全部可管理产物并保留 paper_repo。",
-            },
-        },
-        "required": ["project_id", "scope"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            from app.services.project_service import ProjectService
-
-            project_id = int(kwargs["project_id"])
-            scope = str(kwargs.get("scope") or "all").strip().lower() or "all"
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
-            if project_payload is None:
-                return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
-
-            service = ProjectService(db)
-            payload = await service.cleanup_workspace_outputs_scope(
-                project_id=project_id,
-                user_id=self.user_id,
-                workspace_id=int(workspace.id),
-                scope=scope,
-            )
-            if payload is None:
-                return self._workspace_not_ready(project_payload, project_id)
-
-            lines = [
-                "已清理 Project/workspace 产物。",
-                f"- Project: /projects/{project_id}",
-                f"- Scope: {scope}",
-                f"- Deleted files: {int(payload.get('deleted_file_count') or 0)}",
-                f"- Deleted dirs: {int(payload.get('deleted_dir_count') or 0)}",
-                f"- Deleted runs: {int(payload.get('deleted_run_count') or 0)}",
-            ]
-            deleted_paths = [str(item).strip() for item in list(payload.get("deleted_paths") or []) if str(item).strip()]
-            if deleted_paths:
-                lines.append("- Deleted paths:")
-                lines.extend(f"  - {item}" for item in deleted_paths[:30])
-            return ToolResult(
-                success=True,
-                output="\n".join(lines),
-                data={
-                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                    **dict(payload or {}),
                 },
             )
 
@@ -7079,479 +5179,6 @@ class PaperResearchGitShowTool(_PaperResearchToolBase):
         return await self._with_db(_handler)
 
 
-class PaperResearchWriteGroundingReportTool(_PaperResearchToolBase):
-    name = "paper_research_write_grounding_report"
-    input_model = PaperResearchWriteGroundingReportInput
-    description = "将 grounding 阶段的结构化证据闭环报告归档到当前 Project 工作区。"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID（>=1）。"},
-            "grounding_report": {
-                "type": "object",
-                "description": (
-                    "要保存的 grounding_report JSON。必须覆盖 repo、entrypoint、dataset、runtime、"
-                    "external_dependencies、summary 六个顶层对象，并将事实收敛为 grounded/absent/blocked/unknown。"
-                    "summary 里应尽量明确 `run_decision=ready|runnable_with_patch|blocked`，表示当前 repo 主路径的可运行判断。"
-                    "如果把一组 dataset/external URLs 声明为 grounded，必须为每个必要官方链接提供成功的 probe 结果，"
-                    "或明确证明本地已存在。canonical 结构中 `dataset.sources` 保存数据源，"
-                    "`external_dependencies.urls` 只放 URL 字符串，`external_dependencies.probe_results` 单独保存逐条 probe 结果。"
-                    "每条 `external_dependencies.probe_results` 至少应包含 `url` 与布尔 `ok`，可附带 `status_code/content_type/detected_kind/diagnosis/page_kind`。"
-                    "如果 probe 结果是 `gdrive_confirm_required`、`download_gate`、Google Drive virus-scan warning，或脚本已能自动处理 confirm gate，这表示官方链接仍然存活且可恢复；"
-                    "此时不要把 `dataset.status` / `external_dependencies.status` 写成 `blocked`，也不要把它重写成 `not_found`。"
-                    "只有明确 `not_found` / `access_denied` / `quota_limited` / `http_4xx` 这类终态时，才应把对应 section 写成 `blocked`。"
-                    "blocked 场景应把失败原因写进各 section 的 `blockers`/`blocker_details`，并把替代源候选写进 "
-                    "`dataset.alternative_source_candidates` 或 `external_dependencies.alternative_source_candidates`。"
-                ),
-            },
-        },
-        "required": ["project_id", "grounding_report"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            project_id = int(kwargs["project_id"])
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
-            if project_payload is None:
-                return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
-
-            workspace_dir = self._workspace_dir_for(workspace)
-            relative_path = "specs/grounding_report.json"
-            actual_path = workspace_dir / "specs" / "grounding_report.json"
-            payload = dict(kwargs.get("grounding_report") or {})
-            payload.setdefault("schema_version", "grounding_report_v1")
-            payload.setdefault("paper_id", project_payload.get("paper_id"))
-            payload.setdefault("project_id", int(project_id))
-            payload.setdefault("workspace_id", int(workspace.id))
-            payload.setdefault("notebook_id", str(workspace.notebook_id or ""))
-            payload.setdefault("root_alias", self._PROJECT_ROOT_ALIAS)
-            payload.setdefault("repo_root_relative_path", "repo/source")
-            payload = self._normalize_grounding_report_payload(payload, workspace_dir=workspace_dir)
-            validation_errors = self._validate_grounding_report_payload(payload, workspace_dir=workspace_dir)
-            if validation_errors:
-                structured_errors = self._structured_grounding_validation_errors(
-                    project_id=project_id,
-                    payload=payload,
-                    validation_errors=validation_errors,
-                )
-                return ToolResult(
-                    success=False,
-                    output=(
-                        "grounding_report JSON 未通过归档校验，未写入文件。\n"
-                        + "\n".join(f"- {item}" for item in validation_errors[:12])
-                    ),
-                    error="grounding_report_invalid",
-                    data={
-                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                        "relative_path": relative_path,
-                        "saved": False,
-                        "validation_errors": validation_errors,
-                        "structured_validation_errors": structured_errors,
-                    },
-                )
-
-            actual_path.parent.mkdir(parents=True, exist_ok=True)
-            actual_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-
-            completion = self._grounding_completion_summary(payload)
-            lines = [
-                "已写入 grounding report。",
-                f"- Project: /projects/{project_id}",
-                f"- Relative path: {relative_path}",
-                f"- Overall status: {completion.get('overall_status')}",
-            ]
-            blockers = [str(item).strip() for item in list(completion.get("blockers") or []) if str(item).strip()]
-            next_actions = [str(item).strip() for item in list(completion.get("next_actions") or []) if str(item).strip()]
-            if blockers:
-                lines.append("- Blockers:")
-                lines.extend(f"  - {item}" for item in blockers[:6])
-            if next_actions:
-                lines.append("- Next actions:")
-                lines.extend(f"  - {item}" for item in next_actions[:4])
-            return ToolResult(
-                success=True,
-                output="\n".join(lines),
-                data={
-                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                    "relative_path": relative_path,
-                    "saved": True,
-                    "current_stage": "grounding",
-                    "grounding_status": completion.get("overall_status"),
-                    "grounding_ready": bool(completion.get("complete")),
-                    "content": payload,
-                },
-            )
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchReadGroundingReportTool(_PaperResearchToolBase):
-    name = "paper_research_read_grounding_report"
-    input_model = PaperResearchReadGroundingReportInput
-    parallel_safe = True
-    output_max_tokens = 9000
-    description = "读取当前 Project 已归档的 grounding_report。"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "mode": {
-                "type": "string",
-                "enum": ["auto", "full", "chunk", "page", "line_range"],
-                "default": "auto",
-                "description": "读取模式。full 返回全文；chunk/page/line_range 返回原文分段，不做摘要。",
-            },
-            "max_chars": {"type": "integer", "default": 20000, "description": "兼容旧调用的字符窗口参数；chunk 模式下会作为默认 chunk_chars。"},
-            "chunk_index": {"type": "integer", "description": "chunk 模式下的块序号（1-based）。"},
-            "chunk_chars": {"type": "integer", "description": "chunk 模式下每块字符数。"},
-            "page": {"type": "integer", "description": "page 模式下的页号（1-based，按行分页）。"},
-            "page_size_lines": {"type": "integer", "description": "page 模式下每页多少行。"},
-            "line_start": {"type": "integer", "description": "line_range 模式起始行号（1-based）。"},
-            "line_end": {"type": "integer", "description": "line_range 模式结束行号（1-based）。"},
-        },
-        "required": ["project_id"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        return await PaperResearchReadArtifactTool(
-            self.db,
-            self.user_id,
-            db_session_factory=self.db_session_factory,
-        ).execute(
-            project_id=int(kwargs["project_id"]),
-            relative_path="specs/grounding_report.json",
-            mode=str(kwargs.get("mode") or "auto"),
-            max_chars=int(kwargs.get("max_chars") or 20000),
-            chunk_index=kwargs.get("chunk_index"),
-            chunk_chars=kwargs.get("chunk_chars"),
-            page=kwargs.get("page"),
-            page_size_lines=kwargs.get("page_size_lines"),
-            line_start=kwargs.get("line_start"),
-            line_end=kwargs.get("line_end"),
-        )
-
-
-class PaperResearchWriteImplementationSpecTool(_PaperResearchToolBase):
-    name = "paper_research_write_implementation_spec"
-    input_model = PaperResearchWriteImplementationSpecInput
-    description = "将 implementation-ready JSON 归档到当前 Project 工作区。"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "implementation_spec": {"type": "object", "description": "要保存的 implementation spec JSON。"},
-        },
-        "required": ["project_id", "implementation_spec"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            project_id = int(kwargs["project_id"])
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
-            if project_payload is None:
-                return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
-
-            workspace_dir = self._workspace_dir_for(workspace)
-            relative_path = "specs/implementation_spec.json"
-            actual_path = workspace_dir / "specs" / "implementation_spec.json"
-            payload = dict(kwargs.get("implementation_spec") or {})
-            payload.setdefault("schema_version", "implementation_spec_v1")
-            payload.setdefault("project_id", int(project_id))
-            payload.setdefault("workspace_id", int(workspace.id))
-            payload.setdefault("notebook_id", str(workspace.notebook_id or ""))
-            payload.setdefault("root_alias", self._PROJECT_ROOT_ALIAS)
-            payload.setdefault("repo_root_relative_path", "repo/source")
-            from app.services.project_runtime_service import ProjectRuntimeService
-
-            runtime_inspection = await ProjectRuntimeService().inspect_runtime(
-                workspace_dir=workspace_dir,
-                project_id=project_id,
-                workspace_id=int(workspace.id),
-                notebook_id=str(workspace.notebook_id or ""),
-            )
-            payload = self._normalize_implementation_spec_payload(
-                payload,
-                workspace_dir=workspace_dir,
-                runtime_inspection=runtime_inspection,
-            )
-            validation_errors = self._validate_implementation_spec_payload(payload, workspace_dir=workspace_dir)
-            grounding_report = self._read_grounding_report_payload(workspace_dir)
-            grounding_conflicts = self._implementation_grounding_conflicts(
-                payload=payload,
-                grounding_report=grounding_report,
-            )
-            if validation_errors or grounding_conflicts:
-                return ToolResult(
-                    success=False,
-                    output=(
-                        "implementation_spec JSON 未通过归档校验，未写入文件。\n"
-                        + "\n".join(f"- {item}" for item in validation_errors[:12])
-                        + (
-                            (
-                                "\n- 与 grounding_report 的冲突:\n"
-                                + "\n".join(f"  - {item.get('message')}" for item in grounding_conflicts[:8])
-                            )
-                            if grounding_conflicts
-                            else ""
-                        )
-                    ),
-                    error="implementation_spec_invalid",
-                    data={
-                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                        "relative_path": relative_path,
-                        "saved": False,
-                        "validation_errors": validation_errors,
-                        "schema_errors": [
-                            {
-                                "path": re.match(r"^`([^`]+)`", item).group(1) if re.match(r"^`([^`]+)`", item) else "unknown",
-                                "code": "schema_constraint_failed",
-                                "message": item,
-                            }
-                            for item in validation_errors
-                        ],
-                        "grounding_conflicts": grounding_conflicts,
-                    },
-                )
-
-            actual_path.parent.mkdir(parents=True, exist_ok=True)
-            actual_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-
-            data = {
-                **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                "relative_path": relative_path,
-                "saved": True,
-                "content": payload,
-            }
-            lines = [
-                "已写入 implementation spec。",
-                f"- Project: /projects/{project_id}",
-                f"- Root alias: {self._PROJECT_ROOT_ALIAS}",
-                f"- Relative path: {relative_path}",
-            ]
-            return ToolResult(success=True, output="\n".join(lines), data=data)
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchReadImplementationSpecTool(_PaperResearchToolBase):
-    name = "paper_research_read_implementation_spec"
-    input_model = PaperResearchReadImplementationSpecInput
-    parallel_safe = True
-    output_max_tokens = 9000
-    description = "读取当前 Project 已归档的 implementation spec。"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "mode": {
-                "type": "string",
-                "enum": ["auto", "full", "chunk", "page", "line_range"],
-                "default": "auto",
-                "description": "读取模式。full 返回全文；chunk/page/line_range 返回原文分段，不做摘要。",
-            },
-            "max_chars": {"type": "integer", "default": 20000, "description": "兼容旧调用的字符窗口参数；chunk 模式下会作为默认 chunk_chars。"},
-            "chunk_index": {"type": "integer", "description": "chunk 模式下的块序号（1-based）。"},
-            "chunk_chars": {"type": "integer", "description": "chunk 模式下每块字符数。"},
-            "page": {"type": "integer", "description": "page 模式下的页号（1-based，按行分页）。"},
-            "page_size_lines": {"type": "integer", "description": "page 模式下每页多少行。"},
-            "line_start": {"type": "integer", "description": "line_range 模式起始行号（1-based）。"},
-            "line_end": {"type": "integer", "description": "line_range 模式结束行号（1-based）。"},
-        },
-        "required": ["project_id"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        return await PaperResearchReadArtifactTool(
-            self.db,
-            self.user_id,
-            db_session_factory=self.db_session_factory,
-        ).execute(
-            project_id=int(kwargs["project_id"]),
-            relative_path="specs/implementation_spec.json",
-            mode=str(kwargs.get("mode") or "auto"),
-            max_chars=int(kwargs.get("max_chars") or 20000),
-            chunk_index=kwargs.get("chunk_index"),
-            chunk_chars=kwargs.get("chunk_chars"),
-            page=kwargs.get("page"),
-            page_size_lines=kwargs.get("page_size_lines"),
-            line_start=kwargs.get("line_start"),
-            line_end=kwargs.get("line_end"),
-        )
-
-
-class PaperResearchWriteRunDraftsTool(_PaperResearchToolBase):
-    name = "paper_research_write_run_drafts"
-    input_model = PaperResearchWriteRunDraftsInput
-    description = (
-        "校验并归档 implementation-spec 派生出的 run drafts JSON 到当前 Project 工作区。"
-        "每个 draft 必须使用当前 schema：id/title/objective/entrypoint{type,path_or_hint}/"
-        "depends_on/data_requirements/env_requirements/params/expected_outputs/blockers/evidence_files/grounding_notes。"
-        "repo_script/notebook/config 只能引用已经存在的 repo 文件；README 里的手工步骤或命令摘要应写成 "
-        "readme_command/dataset_step/manual_step，不要伪造一个 repo_script。"
-        "这里的 repo_script 只表示“真实存在的 repo 文件”，并不等于 execution_spec 阶段一定使用 "
-        "execution_intent.repo_script；如果该文件是可执行 shell 脚本，execution 阶段通常应直接写 argv。"
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "run_drafts": {
-                "type": "object",
-                "description": (
-                    "要保存的 run_drafts JSON。entrypoint.type 只能是 repo_script/notebook/config/"
-                    "readme_command/dataset_step/manual_step/unknown。"
-                    "repo_script/notebook/config 必须提供 repo-relative 的 entrypoint.path_or_hint，例如 seq2seq.py。"
-                    "evidence_files 必须是 canonical artifact 路径，例如 repo/source/seq2seq.py 或 specs/implementation_spec.json。"
-                    "如果当前动作只是“按 README 运行某条命令”或“先下载数据再执行”，优先用 readme_command/dataset_step/manual_step；"
-                    "不要把尚未存在的 wrapper 脚本名填成 repo_script。"
-                    "无效示例：entrypoint.type=repo_script 且 path_or_hint=classification-results-ag-news-only.sh（仓库里并不存在）。"
-                    "有效示例：entrypoint.type=repo_script,path_or_hint=classification-results.sh；"
-                    "或 entrypoint.type=readme_command,path_or_hint='run classification-results.sh after make'。"
-                    "注意：如果该 repo_script 是 shell 脚本，execution_spec 阶段应直接写 argv，如 "
-                    "[\"./classification-results.sh\"]，不要把它误翻译成 Python repo_script intent。"
-                ),
-            },
-        },
-        "required": ["project_id", "run_drafts"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        async def _handler(db: AsyncSession) -> ToolResult:
-            project_id = int(kwargs["project_id"])
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
-            if project_payload is None:
-                return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
-
-            workspace_dir = self._workspace_dir_for(workspace)
-            relative_path = "drafts/run_drafts.json"
-            actual_path = workspace_dir / "drafts" / "run_drafts.json"
-            payload = dict(kwargs.get("run_drafts") or {})
-            payload.setdefault("schema_version", "run_drafts_v1")
-            payload.setdefault("project_id", int(project_id))
-            payload.setdefault("workspace_id", int(workspace.id))
-            payload.setdefault("notebook_id", str(workspace.notebook_id or ""))
-            payload.setdefault("root_alias", self._PROJECT_ROOT_ALIAS)
-            payload.setdefault("implementation_spec_relative_path", "specs/implementation_spec.json")
-            payload.setdefault("repo_root_relative_path", "repo/source")
-            payload = self._normalize_run_drafts_payload(payload, workspace_dir=workspace_dir)
-
-            validation_errors = self._validate_run_drafts_payload(payload, workspace_dir=workspace_dir)
-            if validation_errors:
-                grouped_errors = self._group_run_draft_validation_errors(
-                    payload=payload,
-                    validation_errors=validation_errors,
-                )
-                return ToolResult(
-                    success=False,
-                    output=(
-                        "run_drafts JSON 未通过归档校验，未写入文件。\n"
-                        + "\n".join(f"- {item}" for item in validation_errors[:12])
-                    ),
-                    error="run_drafts_schema_invalid",
-                    data={
-                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                        "relative_path": relative_path,
-                        "saved": False,
-                        "validation_errors": validation_errors,
-                        "draft_errors": grouped_errors.get("draft_errors") or [],
-                        "global_errors": grouped_errors.get("global_errors") or [],
-                        "allowed_kinds": sorted(self._RUN_DRAFT_KINDS),
-                        "allowed_entrypoint_types": sorted(self._RUN_DRAFT_ENTRYPOINT_TYPES),
-                        "required_draft_fields": [
-                            "id",
-                            "kind",
-                            "title",
-                            "objective",
-                            "entrypoint",
-                            "depends_on",
-                            "data_requirements",
-                            "env_requirements",
-                            "params",
-                            "expected_outputs",
-                            "blockers",
-                            "evidence_files",
-                            "grounding_notes",
-                        ],
-                        "entrypoint_contract": {
-                            "field": "entrypoint.path_or_hint",
-                            "repo_relative_example": "seq2seq.py",
-                            "canonical_evidence_example": "repo/source/seq2seq.py",
-                        },
-                    },
-                )
-
-            actual_path.parent.mkdir(parents=True, exist_ok=True)
-            actual_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-
-            data = {
-                **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                "relative_path": relative_path,
-                "saved": True,
-                "content": payload,
-            }
-            lines = [
-                "已写入 run drafts。",
-                f"- Project: /projects/{project_id}",
-                f"- Root alias: {self._PROJECT_ROOT_ALIAS}",
-                f"- Relative path: {relative_path}",
-            ]
-            return ToolResult(success=True, output="\n".join(lines), data=data)
-
-        return await self._with_db(_handler)
-
-
-class PaperResearchReadRunDraftsTool(_PaperResearchToolBase):
-    name = "paper_research_read_run_drafts"
-    input_model = PaperResearchReadRunDraftsInput
-    parallel_safe = True
-    output_max_tokens = 9000
-    description = "读取当前 Project 已归档的 run drafts JSON。"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "mode": {
-                "type": "string",
-                "enum": ["auto", "full", "chunk", "page", "line_range"],
-                "default": "auto",
-                "description": "读取模式。full 返回全文；chunk/page/line_range 返回原文分段，不做摘要。",
-            },
-            "max_chars": {"type": "integer", "default": 20000, "description": "兼容旧调用的字符窗口参数；chunk 模式下会作为默认 chunk_chars。"},
-            "chunk_index": {"type": "integer", "description": "chunk 模式下的块序号（1-based）。"},
-            "chunk_chars": {"type": "integer", "description": "chunk 模式下每块字符数。"},
-            "page": {"type": "integer", "description": "page 模式下的页号（1-based，按行分页）。"},
-            "page_size_lines": {"type": "integer", "description": "page 模式下每页多少行。"},
-            "line_start": {"type": "integer", "description": "line_range 模式起始行号（1-based）。"},
-            "line_end": {"type": "integer", "description": "line_range 模式结束行号（1-based）。"},
-        },
-        "required": ["project_id"],
-    }
-
-    async def _execute(self, **kwargs) -> ToolResult:
-        return await PaperResearchReadArtifactTool(
-            self.db,
-            self.user_id,
-            db_session_factory=self.db_session_factory,
-        ).execute(
-            project_id=int(kwargs["project_id"]),
-            relative_path="drafts/run_drafts.json",
-            mode=str(kwargs.get("mode") or "auto"),
-            max_chars=int(kwargs.get("max_chars") or 20000),
-            chunk_index=kwargs.get("chunk_index"),
-            chunk_chars=kwargs.get("chunk_chars"),
-            page=kwargs.get("page"),
-            page_size_lines=kwargs.get("page_size_lines"),
-            line_start=kwargs.get("line_start"),
-            line_end=kwargs.get("line_end"),
-        )
-
-
 class PaperResearchInspectRuntimeTool(_PaperResearchToolBase):
     name = "paper_research_inspect_runtime"
     input_model = PaperResearchInspectRuntimeInput
@@ -7616,14 +5243,15 @@ class PaperResearchProbeRepoTool(_PaperResearchToolBase):
     parallel_safe = True
     timeout_seconds = 45.0
     description = (
-        "检查官方仓库 URL 是否仍可访问、是否可 clone，并返回默认分支等最小 repo 存活信号。"
-        "优先使用当前 Project 已归档的 repo_reference。"
+        "轻量探测官方仓库 URL 是否仍可访问、是否可 clone，并返回默认分支等最小远程存活信号。"
+        "优先使用当前 Project 已归档的 repo URL；也可以显式传 `repo_url`。"
+        "这个工具只验证远程仓库状态，不会修改 Project 文件，也不会替代本地项目内的文本搜索。"
     )
     parameters = {
         "type": "object",
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "repo_url": {"type": "string", "description": "可选，显式指定要探测的官方仓库 URL；缺省时优先使用当前 Project 的 repo_reference。"},
+            "repo_url": {"type": "string", "description": "可选，显式指定要探测的官方仓库 URL；缺省时优先使用当前 Project 已归档的仓库 URL。"},
         },
         "required": ["project_id"],
     }
@@ -7631,22 +5259,33 @@ class PaperResearchProbeRepoTool(_PaperResearchToolBase):
     async def _execute(self, **kwargs) -> ToolResult:
         async def _handler(db: AsyncSession) -> ToolResult:
             project_id = int(kwargs["project_id"])
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            project_payload = await self._resolve_project_payload_only(db, project_id=project_id)
             if project_payload is None:
                 return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
 
-            workspace_dir = self._workspace_dir_for(workspace)
-            repo_reference = self._read_json_file(workspace_dir / "repo_reference.json")
-            repo_url = str(kwargs.get("repo_url") or repo_reference.get("repo_url") or "").strip()
+            project_dir = self._project_dir_for(project_id)
+            readme_intake = self._read_json_file(project_dir / "reference" / "repo" / "readme_intake.json")
+            repo_reference = self._read_json_file(project_dir / "repo_reference.json")
+            explicit_repo_url = str(kwargs.get("repo_url") or "").strip()
+            intake_repo_url = str(readme_intake.get("repo_url") or "").strip()
+            legacy_repo_url = str(repo_reference.get("repo_url") or "").strip()
+            repo_url = explicit_repo_url or intake_repo_url or legacy_repo_url
+            repo_url_source = (
+                "explicit"
+                if explicit_repo_url
+                else "reference/repo/readme_intake.json"
+                if intake_repo_url
+                else "repo_reference"
+                if legacy_repo_url
+                else "missing"
+            )
             if not repo_url:
                 return ToolResult(
                     success=False,
-                    output="没有可探测的 repo URL。请先提供 repo_url，或先让 Project 归档 repo_reference。",
+                    output="没有可探测的 repo URL。请先提供 repo_url，或先通过 paper_research_prepare 生成 Project reference。",
                     error="repo_url_missing",
                     data={
-                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                        **self._root_descriptor(project_payload=project_payload),
                         "project_id": project_id,
                         "repo_url": None,
                         "source": "missing",
@@ -7660,7 +5299,7 @@ class PaperResearchProbeRepoTool(_PaperResearchToolBase):
                     output=f"repo URL 无效或不受支持: {repo_url}",
                     error="repo_url_invalid",
                     data={
-                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                        **self._root_descriptor(project_payload=project_payload),
                         "project_id": project_id,
                         "repo_url": repo_url,
                     },
@@ -7713,7 +5352,7 @@ class PaperResearchProbeRepoTool(_PaperResearchToolBase):
             except Exception as exc:  # noqa: BLE001
                 git_error = f"{type(exc).__name__}: {exc}"
 
-            local_signals = self._repo_local_signals(workspace_dir)
+            local_signals = self._repo_local_signals(project_dir)
             diagnosis = "ready" if cloneable else "repo_page_reachable_but_not_cloneable" if page_ok else "repo_unreachable"
             suggested_next_action = (
                 "use_as_official_repo"
@@ -7723,10 +5362,10 @@ class PaperResearchProbeRepoTool(_PaperResearchToolBase):
                 else "do_not_execute_clone"
             )
             payload = {
-                **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                **self._root_descriptor(project_payload=project_payload),
                 "project_id": project_id,
                 "repo_url": repo_url,
-                "source": "explicit" if str(kwargs.get("repo_url") or "").strip() else "repo_reference",
+                "source": repo_url_source,
                 "host": parsed.netloc,
                 "status_code": status_code,
                 "final_url": final_url,
@@ -7771,27 +5410,27 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
     parallel_safe = True
     timeout_seconds = 45.0
     description = (
-        "对论文流程中的官方下载链接或外部文档链接做轻量测活。"
-        "如果直接命中文件流，会立即确认；如果返回 HTML 页，会先做页面语义解析并在小范围内继续 resolve 页面中的候选下载/资源链接，再给出最终标记。"
-        "Google Drive 的 confirm/virus-scan/download gate 页面应视为“官方链接存活但仍需确认步骤”，不是 dead link；只有明确 not_found/access_denied/quota 等终态才算 blocked。"
-        "只读取响应头、极小字节片段和少量 HTML 内容，不执行真实下载。"
+        "对论文 README、论文正文或外部资源里的 URL 做轻量测活。"
+        "如果直接命中文件流，会立即确认；如果返回 HTML 页面，会先做页面语义解析，再在小范围内继续 resolve 页面中的候选下载或资源链接。"
+        "Google Drive 的 confirm、virus-scan 或 download gate 页面应视为“链接仍存活但还需要确认步骤”，不是 dead link；只有明确 not_found、access_denied、quota 等终态才算 blocked。"
+        "它只读取响应头、极小字节片段和少量 HTML 内容，不会执行真实下载。"
     )
     parameters = {
         "type": "object",
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "url": {"type": "string", "description": "要探测的 URL。应优先使用 README/论文中给出的官方 URL。"},
+            "url": {"type": "string", "description": "要探测的 URL。优先用于 README、论文或官方页面里给出的外部资源链接。"},
             "expected_kind": {
                 "type": "string",
                 "enum": ["auto", "html", "file", "hdf5", "zip", "json", "text"],
                 "default": "auto",
-                "description": "期望拿到的内容类型。对 README/项目页/文档页优先用 html；对数据集、模型权重、压缩包、Google Drive 下载门页这类真实下载链接优先用 file。只有在你明确需要证明特定文件格式时才用 hdf5/zip/json/text；否则不要把 .tar.gz / gzip 这类可下载文件误判成 zip 失败。",
+                "description": "期望内容类型。README、项目页、文档页优先用 `html`；数据集、模型权重、压缩包、Google Drive 下载门页这类真实下载链接优先用 `file`。只有在明确需要验证特定文件格式时再用 hdf5、zip、json 或 text。",
             },
-            "read_bytes": {"type": "integer", "default": 64, "description": "最多读取多少字节用于 magic-bytes 判断。范围 8-512；不会下载整个文件。"},
+            "read_bytes": {"type": "integer", "default": 64, "description": "最多读取多少字节用于 magic-bytes 判断，范围 8-512；不会下载整个文件。"},
             "resolve_download_gate": {
                 "type": "boolean",
                 "default": False,
-                "description": "仅当探到下载门页/确认页时显式设为 true。开启后会尝试解析 Google Drive confirm/cookie/download-form，把门页继续解析成真实文件流验证；若结果是 gdrive_confirm_required / download_gate / virus-scan warning，应把它当作“链接存活、仍需确认步骤”，而不是 dead link。普通 HTML 参考页会自动做一次内部 resolve，不需要依赖这个开关。",
+                "description": "只在明确遇到下载门页或确认页时再设 true。开启后会继续解析 Google Drive confirm、cookie、download-form 等门页，把它尽量解析到真实文件流；如果结果是 confirm_required、download_gate 或 virus-scan warning，应把它理解成“链接存活但需要确认步骤”。",
             },
         },
         "required": ["project_id", "url"],
@@ -7800,11 +5439,9 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
     async def _execute(self, **kwargs) -> ToolResult:
         async def _handler(db: AsyncSession) -> ToolResult:
             project_id = int(kwargs["project_id"])
-            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            project_payload = await self._resolve_project_payload_only(db, project_id=project_id)
             if project_payload is None:
                 return self._project_not_found(project_id)
-            if workspace is None:
-                return self._workspace_not_ready(project_payload, project_id)
 
             url = str(kwargs.get("url") or "").strip()
             expected_kind = str(kwargs.get("expected_kind") or "auto").strip().lower() or "auto"
@@ -7817,7 +5454,7 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                     output=f"URL 无效或不受支持: {url}",
                     error="probe_url_invalid",
                     data={
-                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                        **self._root_descriptor(project_payload=project_payload),
                         "project_id": project_id,
                         "url": url,
                     },
@@ -8124,7 +5761,7 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                 resolved = await _resolve_probe_target(url, depth=0, visited=set(), trace=[])
 
             payload = {
-                **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                **self._root_descriptor(project_payload=project_payload),
                 "project_id": project_id,
                 "url": url,
                 "expected_kind": expected_kind,
@@ -8315,6 +5952,168 @@ class PaperResearchWriteExecutionSpecTool(_PaperResearchToolBase):
                 lines.append("- Runtime warnings:")
                 lines.extend(warning_lines)
             return ToolResult(success=True, output="\n".join(lines), data=saved)
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchLaunchClaudeCodeTool(_PaperResearchToolBase):
+    name = "paper_research_launch_claude_code"
+    input_model = PaperResearchLaunchClaudeCodeInput
+    description = (
+        "通过 LangGraph 控制面在 runtime-worker 里启动一次 Claude Code 协同执行。"
+        "这个工具会自动读取 stage1 产物、生成 task brief、写 execution_spec、并启动 claude_code runtime。"
+        "适合把明确的 repo 任务交给容器里的 Claude Code 自主推进，再通过 paper_research_read_execution 观察进度。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "task": {
+                "type": "string",
+                "description": (
+                    "要交给 Claude Code 的明确任务。应直接描述 repo 内要完成的事，例如："
+                    "read the repo, run the documented baseline, fix concrete runtime blockers, and report progress."
+                ),
+            },
+            "execution_id": {
+                "type": "string",
+                "description": "可选，自定义 execution_id。缺省时自动生成 claude-code-xxxx。",
+            },
+            "model": {
+                "type": "string",
+                "description": "可选，覆盖默认 Claude/百炼模型名，例如 qwen3.6-plus。",
+            },
+            "max_turns": {
+                "type": "integer",
+                "description": "可选，限制 Claude Code 本轮最大 turns 数。",
+            },
+            "add_dirs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选，额外授予 Claude Code 访问的工作区目录。",
+            },
+            "allowed_tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选，显式允许的 Claude Code tool 名单。",
+            },
+            "disallowed_tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选，显式禁用的 Claude Code tool 名单。",
+            },
+            "append_system_prompt": {
+                "type": "string",
+                "description": "可选，追加到 Claude Code 的 system prompt。",
+            },
+            "permission_mode": {
+                "type": "string",
+                "description": "可选，仅在 dangerously_skip_permissions=false 时使用的 Claude Code permission mode。",
+            },
+            "dangerously_skip_permissions": {
+                "type": "boolean",
+                "default": True,
+                "description": "是否以 yolo/跳过权限确认模式启动 Claude Code。",
+            },
+        },
+        "required": ["project_id", "task"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            from app.services.execution_continuation_service import get_execution_continuation_manager
+
+            project_id = int(kwargs["project_id"])
+            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+            if workspace is None:
+                return self._workspace_not_ready(project_payload, project_id)
+
+            workspace_dir = self._workspace_dir_for(workspace)
+            service = ClaudeCodeCollaborationGraphService()
+            result = await service.launch(
+                project_id=project_id,
+                workspace_id=int(workspace.id),
+                workspace_dir=workspace_dir,
+                project_title=str(project_payload.get("title") or "").strip(),
+                task=str(kwargs.get("task") or "").strip(),
+                execution_id=str(kwargs.get("execution_id") or "").strip() or None,
+                model=str(kwargs.get("model") or "").strip() or None,
+                max_turns=kwargs.get("max_turns"),
+                add_dirs=list(kwargs.get("add_dirs") or []),
+                allowed_tools=list(kwargs.get("allowed_tools") or []),
+                disallowed_tools=list(kwargs.get("disallowed_tools") or []),
+                append_system_prompt=str(kwargs.get("append_system_prompt") or "").strip(),
+                permission_mode=str(kwargs.get("permission_mode") or "").strip(),
+                dangerously_skip_permissions=bool(kwargs.get("dangerously_skip_permissions", True)),
+            )
+
+            launch_result = dict(result.get("launch_result") or {})
+            status = str(launch_result.get("status") or "").strip().lower()
+            normalized_execution_id = str(result.get("execution_id") or launch_result.get("execution_id") or "").strip()
+
+            if (
+                status in {"running", "pending"}
+                and self.route_profile == "chat"
+                and self.conversation_id is not None
+                and normalized_execution_id
+            ):
+                try:
+                    await get_execution_continuation_manager().schedule(
+                        user_id=self.user_id,
+                        conversation_id=self.conversation_id,
+                        project_id=project_id,
+                        execution_id=normalized_execution_id,
+                        stage="execution",
+                        purpose="Claude Code repo collaboration",
+                        active_skill_names=["paper-reproduction"],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[PaperResearch] failed to schedule Claude Code continuation: conversation_id={}, execution_id={}, error={}",
+                        self.conversation_id,
+                        normalized_execution_id,
+                        exc,
+                    )
+
+            lines = [
+                "已启动 Claude Code 协同执行。",
+                f"- Project: /projects/{project_id}",
+                f"- Execution ID: {normalized_execution_id or 'unknown'}",
+                f"- Status: {status or 'unknown'}",
+                f"- Task brief: {result.get('task_brief_relative_path') or 'unknown'}",
+                f"- Execution spec: {result.get('execution_spec_relative_path') or 'unknown'}",
+            ]
+            if result.get("launch_summary"):
+                lines.append("- Launch summary:")
+                lines.extend(str(result.get("launch_summary") or "").splitlines())
+            if launch_result.get("message"):
+                lines.append(f"- Message: {launch_result.get('message')}")
+            if launch_result.get("error"):
+                lines.append(f"- Error: {launch_result.get('error')}")
+
+            return ToolResult(
+                success=status in {"running", "pending", "completed"},
+                output="\n".join(lines),
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    **result,
+                    "background_execution": {
+                        "execution_id": normalized_execution_id,
+                        "project_id": project_id,
+                        "status": status,
+                        "display_name": "Claude Code collaboration",
+                        "stage": "execution",
+                        "purpose": "Claude Code repo collaboration",
+                        "next_action": "调用 paper_research_read_execution 观察进度与结果。",
+                    },
+                    "background_execution_user_summary": "\n".join(lines),
+                    "background_execution_started": status in {"running", "pending"},
+                    "background_execution_completed": status in {"completed", "failed", "blocked", "cancelled"},
+                },
+                error=None if status in {"running", "pending", "completed"} else str(launch_result.get("error") or "claude_code_launch_failed"),
+            )
 
         return await self._with_db(_handler)
 
@@ -8927,7 +6726,7 @@ class KnowledgeSearchTool(ToolBase):
     }
     input_model = KnowledgeSearchInput
     retry_count = 0
-    
+
     def __init__(
         self,
         db: Optional[AsyncSession],
@@ -8938,7 +6737,7 @@ class KnowledgeSearchTool(ToolBase):
         self.user_id = user_id
         self.db_session_factory = db_session_factory
         self.query_rewrite_service = get_query_rewrite_service()
-    
+
     def _resolve_timeout_seconds(self) -> float:
         primary_timeout = float(getattr(settings, "knowledge_search_timeout_ms", 45000)) / 1000.0
         return max(primary_timeout, super()._resolve_timeout_seconds())
@@ -9796,10 +7595,10 @@ class KnowledgeSearchTool(ToolBase):
         if not SHARING_ENABLED:
             logger.debug("共享功能未启用 (agent_tools)")
             return set()
-        
+
         try:
             logger.debug(f"获取用户 {self.user_id} 的共享知识库 (agent_tools)")
-            
+
             # 获取当前用户信息
             user_result = await db.execute(
                 select(User).where(User.id == self.user_id)
@@ -9808,16 +7607,16 @@ class KnowledgeSearchTool(ToolBase):
             if not current_user:
                 logger.warning(f"用户 {self.user_id} 不存在")
                 return set()
-            
+
             logger.debug(f"当前用户: {current_user.username}, 角色: {current_user.role}, 导师ID: {current_user.mentor_id}")
-            
+
             # 获取用户加入的研究组
             group_ids_result = await db.execute(
                 select(GroupMember.group_id).where(GroupMember.user_id == self.user_id)
             )
             group_ids = [row[0] for row in group_ids_result.fetchall()]
             logger.debug(f"用户加入的研究组: {group_ids}")
-            
+
             # 如果是导师，获取管理的研究组
             if current_user.role == UserRole.MENTOR.value:
                 mentor_groups_result = await db.execute(
@@ -9825,7 +7624,7 @@ class KnowledgeSearchTool(ToolBase):
                 )
                 mentor_group_ids = [row[0] for row in mentor_groups_result.fetchall()]
                 group_ids = list(set(group_ids + mentor_group_ids))
-            
+
             # 构建共享条件
             conditions = [
                 and_(
@@ -9833,7 +7632,7 @@ class KnowledgeSearchTool(ToolBase):
                     SharedResource.shared_with_id == self.user_id
                 ),
             ]
-            
+
             if group_ids:
                 conditions.append(
                     and_(
@@ -9841,7 +7640,7 @@ class KnowledgeSearchTool(ToolBase):
                         SharedResource.shared_with_id.in_(group_ids)
                     )
                 )
-            
+
             if current_user.mentor_id:
                 conditions.append(
                     and_(
@@ -9849,7 +7648,7 @@ class KnowledgeSearchTool(ToolBase):
                         SharedResource.owner_id == current_user.mentor_id
                     )
                 )
-            
+
             if current_user.role == UserRole.STUDENT.value and group_ids:
                 mentor_ids_result = await db.execute(
                     select(ResearchGroup.mentor_id).where(ResearchGroup.id.in_(group_ids))
@@ -9862,7 +7661,7 @@ class KnowledgeSearchTool(ToolBase):
                             SharedResource.owner_id.in_(mentor_ids)
                         )
                     )
-            
+
             # 查询共享的知识库ID
             shared_result = await db.execute(
                 select(SharedResource.resource_id).where(
@@ -9876,7 +7675,7 @@ class KnowledgeSearchTool(ToolBase):
                     )
                 )
             )
-            
+
             # resource_id 是字符串，需要转为整数（知识库ID是整数）
             result = set()
             for row in shared_result.fetchall():
@@ -9913,7 +7712,7 @@ class CalculatorTool(ToolBase):
         "required": ["expression"]
     }
     input_model = CalculatorInput
-    
+
     def __init__(self):
         # 安全的数学函数映射
         self.safe_functions = {
@@ -9946,7 +7745,7 @@ class CalculatorTool(ToolBase):
             'radians': math.radians,
             'degrees': math.degrees,
         }
-    
+
     async def _execute(self, expression: str) -> ToolResult:
         """执行数学计算（asteval 安全求值）。"""
         expr = expression.strip()
@@ -10026,12 +7825,12 @@ class DateTimeTool(Tool):
         },
         "required": ["action"]
     }
-    
+
     async def execute(self, action: str, format: str = "%Y-%m-%d %H:%M:%S") -> ToolResult:
         """获取日期时间信息"""
         try:
             now = datetime.now()
-            
+
             if action == "now":
                 result = now.strftime("%Y-%m-%d %H:%M:%S")
                 output = f"当前时间: {result}"
@@ -10054,13 +7853,13 @@ class DateTimeTool(Tool):
                     output=f"不支持的操作: {action}",
                     error="invalid_action"
                 )
-            
+
             return ToolResult(
                 success=True,
                 output=output,
                 data={"action": action, "result": result, "timestamp": int(now.timestamp())}
             )
-            
+
         except Exception as e:
             return ToolResult(
                 success=False,
@@ -10090,7 +7889,7 @@ class TextAnalysisTool(Tool):
         },
         "required": ["text"]
     }
-    
+
     async def execute(self, text: str, analysis_type: str = "stats") -> ToolResult:
         """分析文本"""
         try:
@@ -10098,19 +7897,19 @@ class TextAnalysisTool(Tool):
                 # 基本统计
                 char_count = len(text)
                 char_no_space = len(text.replace(" ", "").replace("\n", ""))
-                
+
                 # 中文字数
                 chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
-                
+
                 # 英文单词数
                 english_words = len(re.findall(r'[a-zA-Z]+', text))
-                
+
                 # 句子数（简单估计）
                 sentences = len(re.findall(r'[。！？.!?]+', text)) or 1
-                
+
                 # 段落数
                 paragraphs = len([p for p in text.split('\n') if p.strip()])
-                
+
                 output = f"""文本统计分析:
 - 总字符数: {char_count}
 - 字符数(不含空格): {char_no_space}
@@ -10119,7 +7918,7 @@ class TextAnalysisTool(Tool):
 - 句子数: {sentences}
 - 段落数: {paragraphs}
 - 平均句长: {char_no_space / sentences:.1f} 字符"""
-                
+
                 return ToolResult(
                     success=True,
                     output=output,
@@ -10132,43 +7931,43 @@ class TextAnalysisTool(Tool):
                         "paragraphs": paragraphs
                     }
                 )
-            
+
             elif analysis_type == "keywords":
                 # 简单的关键词提取（基于词频）
                 # 中文分词简单处理
                 words = re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z]+', text.lower())
-                
+
                 # 过滤停用词（简单列表）
-                stopwords = {'的', '是', '在', '和', '了', '有', '不', '这', '为', '上', 
+                stopwords = {'的', '是', '在', '和', '了', '有', '不', '这', '为', '上',
                             'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
                             'to', 'of', 'and', 'in', 'that', 'it', 'for', 'on', 'with'}
                 words = [w for w in words if w not in stopwords and len(w) > 1]
-                
+
                 # 统计词频
                 word_freq = {}
                 for w in words:
                     word_freq[w] = word_freq.get(w, 0) + 1
-                
+
                 # 取前10个高频词
                 top_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:10]
-                
+
                 output = "关键词提取（按频率排序）:\n"
                 for word, freq in top_words:
                     output += f"- {word}: {freq}次\n"
-                
+
                 return ToolResult(
                     success=True,
                     output=output,
                     data={"keywords": dict(top_words)}
                 )
-            
+
             else:
                 return ToolResult(
                     success=False,
                     output=f"不支持的分析类型: {analysis_type}",
                     error="invalid_analysis_type"
                 )
-                
+
         except Exception as e:
             return ToolResult(
                 success=False,
@@ -10200,7 +7999,7 @@ class UnitConverterTool(Tool):
         },
         "required": ["value", "from_unit", "to_unit"]
     }
-    
+
     def __init__(self):
         # 单位转换因子（都转换为基本单位）
         self.conversions = {
@@ -10208,30 +8007,30 @@ class UnitConverterTool(Tool):
             'm': 1, 'km': 1000, 'cm': 0.01, 'mm': 0.001,
             'mile': 1609.344, 'yard': 0.9144, 'foot': 0.3048, 'inch': 0.0254,
             '米': 1, '千米': 1000, '厘米': 0.01, '毫米': 0.001,
-            
+
             # 重量 (基本单位: 克)
             'g': 1, 'kg': 1000, 'mg': 0.001, 'ton': 1000000,
             'lb': 453.592, 'oz': 28.3495,
             '克': 1, '千克': 1000, '毫克': 0.001, '吨': 1000000,
-            
+
             # 数据存储 (基本单位: 字节)
             'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4,
             'byte': 1, 'bit': 0.125,
         }
-        
+
         # 单位类别
         self.categories = {
             'length': ['m', 'km', 'cm', 'mm', 'mile', 'yard', 'foot', 'inch', '米', '千米', '厘米', '毫米'],
             'weight': ['g', 'kg', 'mg', 'ton', 'lb', 'oz', '克', '千克', '毫克', '吨'],
             'data': ['B', 'KB', 'MB', 'GB', 'TB', 'byte', 'bit'],
         }
-    
+
     def _get_category(self, unit: str) -> Optional[str]:
         for category, units in self.categories.items():
             if unit in units:
                 return category
         return None
-    
+
     async def execute(self, value: float, from_unit: str, to_unit: str) -> ToolResult:
         """执行单位转换"""
         try:
@@ -10250,7 +8049,7 @@ class UnitConverterTool(Tool):
                     output=f"{value}°F = {result:.2f}°C",
                     data={"value": value, "from": from_unit, "to": to_unit, "result": result}
                 )
-            
+
             # 检查单位是否支持
             if from_unit not in self.conversions:
                 return ToolResult(
@@ -10264,28 +8063,28 @@ class UnitConverterTool(Tool):
                     output=f"不支持的目标单位: {to_unit}",
                     error="unsupported_unit"
                 )
-            
+
             # 检查单位是否属于同一类别
             from_category = self._get_category(from_unit)
             to_category = self._get_category(to_unit)
-            
+
             if from_category != to_category:
                 return ToolResult(
                     success=False,
                     output=f"无法在不同类别的单位之间转换: {from_unit}({from_category}) -> {to_unit}({to_category})",
                     error="category_mismatch"
                 )
-            
+
             # 执行转换
             base_value = value * self.conversions[from_unit]
             result = base_value / self.conversions[to_unit]
-            
+
             return ToolResult(
                 success=True,
                 output=f"{value} {from_unit} = {result:.6g} {to_unit}",
                 data={"value": value, "from": from_unit, "to": to_unit, "result": result}
             )
-            
+
         except Exception as e:
             return ToolResult(
                 success=False,
@@ -10300,6 +8099,22 @@ class ActivateSkillInput(BaseModel):
         default="replace",
         description="replace 表示替换当前会话的 active skills；append 表示追加。",
     )
+
+
+class DocumentArtifactReadInput(BaseModel):
+    block_ids: List[str] = Field(
+        default_factory=list,
+        max_length=50,
+        description="可选：只读取指定 block_id；为空则读取全部 block。",
+    )
+    include_constraints: bool = Field(default=True, description="是否包含整体和分块写作约束。")
+    include_markdown: bool = Field(default=True, description="是否包含 block 当前 Markdown 内容。")
+
+
+class DocumentArtifactUpdateBlockInput(BaseModel):
+    block_id: str = Field(..., min_length=1, max_length=120, description="要更新的 block_id。")
+    markdown: str = Field(..., max_length=300000, description="写入该 block 的完整 Markdown 内容。")
+    status: Optional[str] = Field(default="draft", max_length=40, description="可选状态，例如 draft/final。")
 
 
 class ActivateSkillTool(ToolBase):
@@ -10401,19 +8216,213 @@ class ActivateSkillTool(ToolBase):
         )
 
 
+class DocumentArtifactReadTool(ToolBase):
+    name = "document_artifact_read"
+    description = (
+        "读取当前会话绑定的文档 artifact。用于生成文档、按模板填写内容、修改某些章节前，先查看整体约束、block 列表和现有 Markdown。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "block_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选：只读取指定 block_id；为空读取全部 block。",
+                "default": [],
+            },
+            "include_constraints": {
+                "type": "boolean",
+                "description": "是否返回整体/分块写作约束。",
+                "default": True,
+            },
+            "include_markdown": {
+                "type": "boolean",
+                "description": "是否返回当前 Markdown 内容。",
+                "default": True,
+            },
+        },
+        "required": [],
+    }
+    input_model = DocumentArtifactReadInput
+    retry_count = 0
+    output_max_tokens = 5000
+
+    def __init__(
+        self,
+        db: Optional[AsyncSession],
+        user_id: int,
+        *,
+        conversation_id: Optional[int],
+        db_session_factory: Optional[Callable[[], AsyncSession]] = None,
+    ):
+        self.db = db
+        self.user_id = int(user_id)
+        self.conversation_id = int(conversation_id) if conversation_id is not None else None
+        self.db_session_factory = db_session_factory
+
+    async def _with_db(self, handler: Callable[[AsyncSession], Any]) -> ToolResult:
+        if self.db is not None:
+            return await handler(self.db)
+        if self.db_session_factory is None:
+            return ToolResult(success=False, output="document artifact 工具不可用：数据库会话未初始化。", error="db_unavailable")
+        async with self.db_session_factory() as session:
+            return await handler(session)
+
+    async def _execute(
+        self,
+        block_ids: Optional[List[str]] = None,
+        include_constraints: bool = True,
+        include_markdown: bool = True,
+    ) -> ToolResult:
+        if self.conversation_id is None:
+            return ToolResult(success=False, output="document_artifact_read 只能在绑定会话的 chat 回合中使用。", error="conversation_required")
+
+        async def handler(db: AsyncSession) -> ToolResult:
+            from app.services.document_artifact_service import DocumentArtifactService
+
+            try:
+                payload = await DocumentArtifactService().read_blocks_for_tool(
+                    db,
+                    user_id=self.user_id,
+                    conversation_id=int(self.conversation_id),
+                    block_ids=block_ids or [],
+                    include_constraints=include_constraints,
+                    include_markdown=include_markdown,
+                )
+            except ValueError as exc:
+                return ToolResult(success=False, output=str(exc), error="document_artifact_unavailable")
+            return ToolResult(
+                success=True,
+                output=json.dumps(payload, ensure_ascii=False, indent=2),
+                data=payload,
+            )
+
+        return await self._with_db(handler)
+
+
+class DocumentArtifactUpdateBlockTool(ToolBase):
+    name = "document_artifact_update_block"
+    description = (
+        "更新当前会话文档 artifact 的一个 block。只能写入当前 active artifact 内已有 block_id 的完整 Markdown，不创建新文件。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "block_id": {
+                "type": "string",
+                "description": "要更新的 block_id，先用 document_artifact_read 查看可用 block。",
+            },
+            "markdown": {
+                "type": "string",
+                "description": "该 block 的完整 Markdown 内容。调用时应提交完整块内容，而不是 diff。",
+            },
+            "status": {
+                "type": "string",
+                "description": "可选状态，例如 draft/final。",
+                "default": "draft",
+            },
+        },
+        "required": ["block_id", "markdown"],
+    }
+    input_model = DocumentArtifactUpdateBlockInput
+    retry_count = 0
+    output_max_tokens = 1200
+
+    def __init__(
+        self,
+        db: Optional[AsyncSession],
+        user_id: int,
+        *,
+        conversation_id: Optional[int],
+        db_session_factory: Optional[Callable[[], AsyncSession]] = None,
+    ):
+        self.db = db
+        self.user_id = int(user_id)
+        self.conversation_id = int(conversation_id) if conversation_id is not None else None
+        self.db_session_factory = db_session_factory
+
+    async def _with_db(self, handler: Callable[[AsyncSession], Any]) -> ToolResult:
+        if self.db is not None:
+            return await handler(self.db)
+        if self.db_session_factory is None:
+            return ToolResult(success=False, output="document artifact 工具不可用：数据库会话未初始化。", error="db_unavailable")
+        async with self.db_session_factory() as session:
+            return await handler(session)
+
+    async def _execute(self, block_id: str, markdown: str, status: str = "draft") -> ToolResult:
+        if self.conversation_id is None:
+            return ToolResult(success=False, output="document_artifact_update_block 只能在绑定会话的 chat 回合中使用。", error="conversation_required")
+
+        async def handler(db: AsyncSession) -> ToolResult:
+            from app.services.document_artifact_service import DocumentArtifactService
+
+            try:
+                artifact = await DocumentArtifactService().update_block(
+                    db,
+                    user_id=self.user_id,
+                    conversation_id=int(self.conversation_id),
+                    block_id=block_id,
+                    markdown=markdown,
+                    status=status,
+                )
+            except ValueError as exc:
+                return ToolResult(success=False, output=str(exc), error="document_artifact_update_failed")
+            block_count = len(list(artifact.get("blocks") or []))
+            output = "\n".join(
+                [
+                    "已更新文档 artifact block。",
+                    f"- artifact_id: {artifact.get('artifact_id')}",
+                    f"- block_id: {block_id}",
+                    f"- blocks: {block_count}",
+                    f"- updated_at: {artifact.get('updated_at')}",
+                ]
+            )
+            return ToolResult(
+                success=True,
+                output=output,
+                data={
+                    "artifact_id": artifact.get("artifact_id"),
+                    "block_id": block_id,
+                    "updated_at": artifact.get("updated_at"),
+                },
+            )
+
+        return await self._with_db(handler)
+
+
 class LiteratureSearchInput(BaseModel):
     query: str = Field(min_length=1, max_length=500)
     source: str = Field(default="auto")
-    max_results: int = Field(default=5, ge=1, le=20)
+    max_results: int = Field(default=10, ge=1, le=100)
+    offset: int = Field(default=0, ge=0)
+    page_token: Optional[str] = Field(default=None, max_length=2000)
     year_start: Optional[int] = None
     year_end: Optional[int] = None
+    fields: Optional[List[str]] = None
+    open_access: bool = False
+    sort_by: Optional[str] = None
+    sort_order: str = "desc"
+    abstract_max_chars: int = Field(default=800, ge=0, le=6000)
+
+    @field_validator("fields", mode="before")
+    @classmethod
+    def _normalize_fields(cls, value: Any) -> Optional[List[str]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            items = [item.strip() for item in re.split(r"[,;，；]", value) if item.strip()]
+            return items or None
+        if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+            items = [str(item).strip() for item in list(value) if str(item or "").strip()]
+            return items or None
+        return None
 
 
 class LiteratureSearchTool(ToolBase):
     """学术文献搜索工具 - 自动在多个学术数据源间回退。"""
     name = "literature_search"
     parallel_safe = True
-    description = "搜索学术论文和文献。默认会自动尝试 OpenAlex、Semantic Scholar、arXiv、PubMed、CrossRef，并在需要时进行多源融合。适用于学术研究、文献综述、找相关论文等场景。"
+    description = "搜索学术论文和文献。默认使用 auto，在 OpenAlex、Semantic Scholar、arXiv、PubMed、CrossRef 间自动回退。适用于学术研究、文献综述、找相关论文等场景。"
     parameters = {
         "type": "object",
         "properties": {
@@ -10423,14 +8432,23 @@ class LiteratureSearchTool(ToolBase):
             },
             "source": {
                 "type": "string",
-                "description": "数据源: auto（默认，自动多路尝试）、semantic_scholar、arxiv、pubmed、openalex、crossref，或 multi（多源并行融合）",
-                "enum": ["auto", "semantic_scholar", "arxiv", "pubmed", "openalex", "crossref", "multi"],
+                "description": "数据源: auto（默认，自动回退）、semantic_scholar、arxiv、pubmed、openalex、crossref",
+                "enum": ["auto", "semantic_scholar", "arxiv", "pubmed", "openalex", "crossref"],
                 "default": "auto"
             },
             "max_results": {
                 "type": "integer",
-                "description": "返回结果数量，默认5",
-                "default": 5
+                "description": "返回结果数量，默认10，最多100。做综述时可提高到20-50，再配合 offset/page_token 翻页。",
+                "default": 10
+            },
+            "offset": {
+                "type": "integer",
+                "description": "偏移量。支持 offset 分页的数据源可用；Semantic Scholar/CrossRef 优先使用 page_token。",
+                "default": 0
+            },
+            "page_token": {
+                "type": "string",
+                "description": "续页 token/cursor。Semantic Scholar、CrossRef 等支持时会返回 next_token，可传回继续搜索。"
             },
             "year_start": {
                 "type": "integer",
@@ -10439,32 +8457,74 @@ class LiteratureSearchTool(ToolBase):
             "year_end": {
                 "type": "integer",
                 "description": "结束年份过滤（可选）"
+            },
+            "fields": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "研究领域过滤。Semantic Scholar 用 fieldsOfStudy；arXiv 可传 cs.AI/cs.LG 等分类；其他源会尽量忽略或降级。"
+            },
+            "open_access": {
+                "type": "boolean",
+                "description": "仅返回开放获取或有开放许可倾向的结果；不同数据源支持程度不同。",
+                "default": False
+            },
+            "sort_by": {
+                "type": "string",
+                "description": "排序字段：relevance, latest, citations, updated, submitted, recent, title, author, journal, references。",
+                "enum": ["relevance", "latest", "citations", "updated", "submitted", "recent", "title", "author", "journal", "references"]
+            },
+            "sort_order": {
+                "type": "string",
+                "description": "排序方向：desc 或 asc。",
+                "enum": ["desc", "asc"],
+                "default": "desc"
+            },
+            "abstract_max_chars": {
+                "type": "integer",
+                "description": "每条结果在工具输出中保留的摘要字符数，默认800，最多6000。完整摘要也会保留在结构化 data 中。",
+                "default": 800
             }
         },
         "required": ["query"]
     }
     input_model = LiteratureSearchInput
-    
+
     def __init__(self):
         from app.services.literature_service import get_literature_service
         self.service = get_literature_service()
-    
+
     async def _execute(
         self,
         query: str,
         source: str = "auto",
-        max_results: int = 5,
+        max_results: int = 10,
+        offset: int = 0,
+        page_token: Optional[str] = None,
         year_start: int = None,
-        year_end: int = None
+        year_end: int = None,
+        fields: Optional[List[str]] = None,
+        open_access: bool = False,
+        sort_by: Optional[str] = None,
+        sort_order: str = "desc",
+        abstract_max_chars: int = 800,
     ) -> ToolResult:
         """执行学术文献搜索"""
         logger.info(f"[LiteratureSearch] 搜索: {query}, source={source}")
-        
+
         try:
             kwargs = {}
-            if year_start and year_end:
+            if year_start is not None or year_end is not None:
                 kwargs["year_range"] = (year_start, year_end)
-            
+            if fields:
+                kwargs["fields_of_study"] = [str(item).strip() for item in list(fields or []) if str(item).strip()]
+            if open_access:
+                kwargs["open_access_only"] = True
+            if page_token:
+                kwargs["page_token"] = page_token
+            if sort_by:
+                kwargs["sort_by"] = sort_by
+                kwargs["sort_order"] = sort_order
+
             if source == "multi":
                 multi_source_count = 4
                 if hasattr(self.service, "multi_source_count"):
@@ -10476,7 +8536,12 @@ class LiteratureSearchTool(ToolBase):
                 result = await self.service.search_multi(
                     query=query,
                     limit_per_source=per_source,
-                    **kwargs,
+                    offset=offset,
+                    year_range=kwargs.get("year_range"),
+                    fields_of_study=kwargs.get("fields_of_study"),
+                    open_access_only=kwargs.get("open_access_only", False),
+                    sort_by=kwargs.get("sort_by"),
+                    sort_order=kwargs.get("sort_order"),
                 )
                 papers = result.get("papers", [])[:max_results]
                 result["papers"] = papers
@@ -10485,6 +8550,7 @@ class LiteratureSearchTool(ToolBase):
                     query=query,
                     source=source,
                     limit=max_results,
+                    offset=offset,
                     **kwargs,
                 )
 
@@ -10494,11 +8560,11 @@ class LiteratureSearchTool(ToolBase):
                     output=f"搜索失败: {result['error']}",
                     error=result["error"]
                 )
-            
+
             papers = result.get("papers", [])
             requested_source = str(source or "auto").strip() or "auto"
             resolved_source = str(result.get("resolved_source") or requested_source).strip() or requested_source
-            
+
             if not papers:
                 return ToolResult(
                     success=True,
@@ -10510,12 +8576,14 @@ class LiteratureSearchTool(ToolBase):
                         "resolved_source": result.get("resolved_source"),
                         "attempted_sources": result.get("attempted_sources", []),
                         "partial_errors": result.get("partial_errors", {}),
-                    }
+                        "offset": offset,
+                        "next_token": result.get("next_token"),
+                    },
                 )
-            
+
             # 格式化输出
-            output = self._format_results(query, resolved_source, papers)
-            
+            output = self._format_results(query, resolved_source, papers, abstract_max_chars=abstract_max_chars)
+
             return ToolResult(
                 success=True,
                 output=output,
@@ -10527,10 +8595,13 @@ class LiteratureSearchTool(ToolBase):
                     "attempted_sources": result.get("attempted_sources", []),
                     "partial_errors": result.get("partial_errors", {}),
                     "sources": result.get("sources", {}),
-                    "total": result.get("total", len(papers))
+                    "total": result.get("total", len(papers)),
+                    "offset": result.get("offset", offset),
+                    "has_more": result.get("has_more"),
+                    "next_token": result.get("next_token"),
                 }
             )
-            
+
         except Exception as e:
             logger.error(f"[LiteratureSearch] 搜索错误: {e}")
             return ToolResult(
@@ -10538,8 +8609,8 @@ class LiteratureSearchTool(ToolBase):
                 output=f"文献搜索错误: {str(e)}",
                 error=str(e)
             )
-    
-    def _format_results(self, query: str, source: str, papers: list) -> str:
+
+    def _format_results(self, query: str, source: str, papers: list, *, abstract_max_chars: int = 800) -> str:
         """格式化搜索结果"""
         source_name = {
             "auto": "自动学术搜索链",
@@ -10551,37 +8622,51 @@ class LiteratureSearchTool(ToolBase):
             "multi": "OpenAlex + Semantic Scholar + arXiv + PubMed",
         }.get(source, source)
         output_parts = [f"在 {source_name} 搜索 '{query}' 的结果：\n"]
-        
+
         for i, paper in enumerate(papers, 1):
             # 作者列表
             authors = paper.authors[:3] if paper.authors else []
             author_str = ", ".join([a.get("name", "") for a in authors])
             if len(paper.authors) > 3:
                 author_str += " 等"
-            
+
             output_parts.append(f"\n【{i}】{paper.title}")
             if paper.year:
                 output_parts.append(f" ({paper.year})")
             output_parts.append(f"\n作者: {author_str or '未知'}")
-            
+
             if paper.venue:
                 output_parts.append(f"\n发表: {paper.venue}")
-            
+
             if paper.citation_count > 0:
                 output_parts.append(f"\n引用数: {paper.citation_count}")
-            
+
             if paper.abstract:
-                # 截断摘要
-                abstract = paper.abstract[:200] + "..." if len(paper.abstract) > 200 else paper.abstract
-                output_parts.append(f"\n摘要: {abstract}")
-            
+                max_chars = max(0, int(abstract_max_chars or 0))
+                abstract = str(paper.abstract or "")
+                if max_chars and len(abstract) > max_chars:
+                    abstract = abstract[:max_chars] + "..."
+                elif max_chars <= 0:
+                    abstract = ""
+                if abstract:
+                    output_parts.append(f"\n摘要: {abstract}")
+
+            if paper.doi:
+                output_parts.append(f"\nDOI: {paper.doi}")
+
+            if paper.arxiv_id:
+                output_parts.append(f"\narXiv: {paper.arxiv_id}")
+
+            if paper.pdf_url:
+                output_parts.append(f"\nPDF: {paper.pdf_url}")
+
             if paper.url:
                 output_parts.append(f"\n链接: {paper.url}")
-            
+
             output_parts.append("\n")
-        
+
         return "".join(output_parts)
-    
+
     def _paper_to_dict(self, paper) -> dict:
         """将论文对象转换为字典"""
         return {
@@ -10602,6 +8687,1676 @@ class LiteratureSearchTool(ToolBase):
         }
 
 
+class _LiteratureReviewWorkspaceMixin:
+    """Shared path and manifest helpers for literature review tools."""
+
+    def __init__(self, user_id: Optional[int] = None):
+        self.user_id = int(user_id) if user_id is not None else None
+
+    @staticmethod
+    def _upload_root() -> Path:
+        configured = str(os.getenv("UPLOAD_DIR") or "").strip()
+        if configured:
+            return Path(os.path.abspath(configured))
+        mounted = Path("/app/uploads")
+        if mounted.exists():
+            return mounted.resolve()
+        return Path(os.path.abspath("./uploads"))
+
+    @staticmethod
+    def _safe_slug(value: Any, *, fallback: str) -> str:
+        text = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(value or "").strip()).strip("-._")
+        return (text or fallback)[:160]
+
+    @classmethod
+    def _new_review_id(cls) -> str:
+        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        return cls._safe_slug(f"review-{timestamp}-{uuid.uuid4().hex[:8]}", fallback="review")
+
+    @classmethod
+    def _review_id(cls, raw: Any) -> str:
+        return cls._safe_slug(raw, fallback="") or cls._new_review_id()
+
+    @classmethod
+    def _review_root_for(cls, literature_review_id: str) -> Path:
+        review_id = cls._review_id(literature_review_id)
+        return cls._upload_root() / "literature_reviews" / review_id
+
+    @staticmethod
+    def _ensure_review_dirs(root: Path) -> None:
+        for name in ("searches", "pdf", "md", "review"):
+            (root / name).mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _manifest_path(root: Path) -> Path:
+        return root / "manifest.json"
+
+    @classmethod
+    def _load_manifest(cls, root: Path) -> Dict[str, Any]:
+        path = cls._manifest_path(root)
+        if not path.is_file():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @classmethod
+    def _write_manifest(cls, root: Path, manifest: Dict[str, Any]) -> None:
+        cls._ensure_review_dirs(root)
+        payload = dict(manifest or {})
+        payload["updated_at"] = datetime.utcnow().isoformat()
+        cls._manifest_path(root).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def _update_manifest_paper(cls, root: Path, paper_key: str, values: Dict[str, Any]) -> Dict[str, Any]:
+        manifest = cls._load_manifest(root)
+        papers = manifest.get("papers")
+        if not isinstance(papers, dict):
+            papers = {}
+        existing = dict(papers.get(paper_key) or {}) if isinstance(papers.get(paper_key), dict) else {}
+        existing.update({key: value for key, value in dict(values or {}).items() if value is not None})
+        existing["paper_key"] = paper_key
+        existing["updated_at"] = datetime.utcnow().isoformat()
+        papers[paper_key] = existing
+        manifest["papers"] = papers
+        cls._write_manifest(root, manifest)
+        return existing
+
+    @classmethod
+    def _path_under_root(cls, path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def _resolve_review_file(cls, root: Path, raw_path: str, *, default_subdir: str) -> Optional[Path]:
+        raw = str(raw_path or "").strip()
+        if not raw:
+            return None
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            if "/" not in raw.replace("\\", "/"):
+                candidate = root / default_subdir / raw
+            else:
+                candidate = root / raw
+        if not cls._path_under_root(candidate, root):
+            return None
+        resolved = candidate.resolve()
+        return resolved if resolved.is_file() else None
+
+    @classmethod
+    def _paper_key_from_metadata(cls, *, title: Any = None, doi: Any = None, arxiv_id: Any = None, external_id: Any = None) -> str:
+        seed = str(doi or arxiv_id or external_id or title or "").strip()
+        if not seed:
+            seed = f"paper-{uuid.uuid4().hex[:8]}"
+        return cls._safe_slug(seed.lower(), fallback=f"paper-{uuid.uuid4().hex[:8]}")
+
+    @staticmethod
+    def _compact_text(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip())
+
+    @classmethod
+    def _metadata_value(cls, metadata: Dict[str, Any], key: str) -> str:
+        value = dict(metadata or {}).get(key)
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False, default=str)
+        return cls._compact_text(value)
+
+    @classmethod
+    def _author_names(cls, metadata: Dict[str, Any]) -> List[str]:
+        raw_authors = dict(metadata or {}).get("authors")
+        if not isinstance(raw_authors, list):
+            return []
+        names: List[str] = []
+        for item in raw_authors:
+            if isinstance(item, dict):
+                name = cls._compact_text(
+                    item.get("name")
+                    or item.get("display_name")
+                    or item.get("author")
+                    or item.get("full_name")
+                )
+            else:
+                name = cls._compact_text(item)
+            if name:
+                names.append(name)
+        return names
+
+    @staticmethod
+    def _doi_url(doi: str) -> str:
+        value = str(doi or "").strip()
+        if not value:
+            return ""
+        if re.match(r"^https?://", value, flags=re.IGNORECASE):
+            return value
+        value = re.sub(r"^(?:doi:\s*)", "", value, flags=re.IGNORECASE).strip()
+        value = re.sub(r"^(?:dx\.)?doi\.org/", "", value, flags=re.IGNORECASE).strip()
+        return f"https://doi.org/{value}" if value else ""
+
+    @staticmethod
+    def _bibtex_escape(value: str) -> str:
+        return str(value or "").replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+    @classmethod
+    def _citation_strings(cls, *, paper_key: str, metadata: Dict[str, Any]) -> Dict[str, str]:
+        authors = cls._author_names(metadata)
+        authors_text = ", ".join(authors) if authors else "作者未提供"
+        bibtex_authors = " and ".join(authors)
+        title = cls._metadata_value(metadata, "title") or "题名未提供"
+        year = cls._metadata_value(metadata, "year") or "年份未提供"
+        venue = cls._metadata_value(metadata, "venue")
+        doi = cls._metadata_value(metadata, "doi")
+        doi_url = cls._doi_url(doi)
+        arxiv_id = cls._metadata_value(metadata, "arxiv_id")
+        arxiv_url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else ""
+        url = cls._metadata_value(metadata, "url")
+        pdf_url = cls._metadata_value(metadata, "pdf_url")
+        best_link = doi_url or url or arxiv_url or pdf_url
+
+        apa_parts = [f"{authors_text}.", f"({year}).", f"{title}."]
+        if venue:
+            apa_parts.append(f"{venue}.")
+        if best_link:
+            apa_parts.append(best_link)
+        apa = " ".join(apa_parts)
+
+        gbt_parts = [f"{authors_text}.", f"{title}[J/OL]."]
+        if venue:
+            gbt_parts.append(f"{venue},")
+        gbt_parts.append(f"{year}.")
+        if doi:
+            gbt_parts.append(f"DOI: {doi}.")
+        elif best_link:
+            gbt_parts.append(best_link)
+        gbt = " ".join(gbt_parts)
+
+        bibtex_key = cls._safe_slug(paper_key, fallback="paper").replace(".", "-")
+        bibtex_fields = [f"  title = {{{cls._bibtex_escape(title)}}}"]
+        if bibtex_authors:
+            bibtex_fields.append(f"  author = {{{cls._bibtex_escape(bibtex_authors)}}}")
+        if year != "年份未提供":
+            bibtex_fields.append(f"  year = {{{cls._bibtex_escape(year)}}}")
+        if venue:
+            bibtex_fields.append(f"  journal = {{{cls._bibtex_escape(venue)}}}")
+        if doi:
+            bibtex_fields.append(f"  doi = {{{cls._bibtex_escape(doi)}}}")
+        if best_link:
+            bibtex_fields.append(f"  url = {{{cls._bibtex_escape(best_link)}}}")
+        bibtex = "@misc{" + bibtex_key + ",\n" + ",\n".join(bibtex_fields) + "\n}"
+        return {"apa": apa, "gbt7714": gbt, "bibtex": bibtex}
+
+    @classmethod
+    def _paper_metadata_for_path(cls, root: Path, *, paper_key: str = "", relative_path: str = "") -> Dict[str, Any]:
+        manifest = cls._load_manifest(root)
+        papers = manifest.get("papers") if isinstance(manifest, dict) else {}
+        if not isinstance(papers, dict):
+            return {}
+
+        normalized_key = cls._safe_slug(paper_key, fallback="")
+        if normalized_key and isinstance(papers.get(normalized_key), dict):
+            metadata = dict(papers.get(normalized_key) or {})
+            metadata.setdefault("paper_key", normalized_key)
+            return metadata
+
+        normalized_rel = str(relative_path or "").replace("\\", "/").strip("/")
+        normalized_name = Path(normalized_rel).name
+        for key, value in papers.items():
+            if not isinstance(value, dict):
+                continue
+            metadata = dict(value or {})
+            candidate_paths = [
+                metadata.get("md_path"),
+                metadata.get("review_path"),
+                metadata.get("pdf_path"),
+            ]
+            for candidate in candidate_paths:
+                candidate_rel = str(candidate or "").replace("\\", "/").strip()
+                if not candidate_rel:
+                    continue
+                if normalized_rel and (
+                    candidate_rel.endswith(normalized_rel)
+                    or candidate_rel.endswith(f"/{normalized_rel}")
+                    or Path(candidate_rel).name == normalized_name
+                ):
+                    metadata.setdefault("paper_key", str(key))
+                    return metadata
+        return {}
+
+    @classmethod
+    def _paper_identity(cls, root: Path, *, paper_key: str = "", relative_path: str = "") -> Dict[str, Any]:
+        resolved_key = cls._safe_slug(paper_key or Path(str(relative_path or "")).stem, fallback="")
+        metadata = cls._paper_metadata_for_path(root, paper_key=resolved_key, relative_path=relative_path)
+        if metadata.get("paper_key"):
+            resolved_key = cls._safe_slug(metadata.get("paper_key"), fallback=resolved_key)
+        doi = cls._metadata_value(metadata, "doi")
+        arxiv_id = cls._metadata_value(metadata, "arxiv_id")
+        doi_url = cls._doi_url(doi)
+        arxiv_url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else ""
+        link = cls._metadata_value(metadata, "url") or doi_url or arxiv_url or cls._metadata_value(metadata, "pdf_url")
+        citations = cls._citation_strings(paper_key=resolved_key or "paper", metadata=metadata)
+        return {
+            "paper_key": resolved_key,
+            "title": cls._metadata_value(metadata, "title") or resolved_key or "未提供",
+            "authors": cls._author_names(metadata),
+            "year": cls._metadata_value(metadata, "year"),
+            "venue": cls._metadata_value(metadata, "venue"),
+            "doi": doi,
+            "link": link,
+            "pdf_url": cls._metadata_value(metadata, "pdf_url"),
+            "citation_apa": citations["apa"],
+            "citation_gbt7714": citations["gbt7714"],
+            "citation_bibtex": citations["bibtex"],
+            "metadata": metadata,
+        }
+
+
+class LiteratureReviewStartTool(_LiteratureReviewWorkspaceMixin, ToolBase):
+    name = "literature_review_start"
+    input_model = LiteratureReviewStartInput
+    parallel_safe = False
+    description = (
+        "创建或恢复论文综述任务目录。工作根目录固定为 "
+        "`/app/uploads/literature_reviews/{literature_review_id}`，不属于 Project，也不绑定知识库。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "literature_review_id": {"type": "string", "description": "可选综述任务 ID。未提供时自动生成。"},
+            "topic": {"type": "string", "description": "明确的综述主题。没有明确主题时应先询问用户。"},
+            "target_paper_count": {"type": "integer", "default": 12, "description": "目标可读全文论文数，默认 12。"},
+            "notes": {"type": "string", "description": "可选补充要求。"},
+        },
+        "required": ["topic"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        review_id = self._review_id(kwargs.get("literature_review_id"))
+        root = self._review_root_for(review_id)
+        self._ensure_review_dirs(root)
+        manifest = self._load_manifest(root)
+        manifest.update(
+            {
+                "literature_review_id": review_id,
+                "topic": str(kwargs.get("topic") or "").strip(),
+                "target_paper_count": int(kwargs.get("target_paper_count") or 12),
+                "notes": str(kwargs.get("notes") or "").strip(),
+                "user_id": self.user_id,
+                "created_at": manifest.get("created_at") or datetime.utcnow().isoformat(),
+            }
+        )
+        self._write_manifest(root, manifest)
+        return ToolResult(
+            success=True,
+            output="\n".join(
+                [
+                    "论文综述任务已准备。",
+                    f"- literature_review_id: {review_id}",
+                    f"- topic: {manifest['topic']}",
+                    f"- target_paper_count: {manifest['target_paper_count']}",
+                    f"- root: {root}",
+                    "- directories: pdf/, md/, review/",
+                ]
+            ),
+            data={
+                "literature_review_id": review_id,
+                "root": str(root),
+                "pdf_dir": str(root / "pdf"),
+                "md_dir": str(root / "md"),
+                "review_dir": str(root / "review"),
+                "manifest_path": str(self._manifest_path(root)),
+                "topic": manifest["topic"],
+                "target_paper_count": manifest["target_paper_count"],
+            },
+        )
+
+
+class LiteratureReviewDownloadPdfTool(_LiteratureReviewWorkspaceMixin, ToolBase):
+    name = "literature_review_download_pdf"
+    input_model = LiteratureReviewDownloadPdfInput
+    timeout_seconds = 180.0
+    retry_count = 0
+    parallel_safe = False
+    description = (
+        "把综述候选论文 PDF 下载到 `/app/uploads/literature_reviews/{literature_review_id}/pdf/`。"
+        "会按论文页下载逻辑尝试 arXiv 与直连 PDF 候选；不会加入知识库，也不会写 Project。"
+    )
+    parameters = {
+        "type": "object",
+            "properties": {
+                "literature_review_id": {"type": "string", "description": "综述任务 ID。"},
+                "pdf_url": {"type": "string", "description": "直连 PDF URL。"},
+                "arxiv_id": {"type": "string", "description": "可选 arXiv ID；缺少 pdf_url 时会生成 arXiv PDF 链接。"},
+                "title": {"type": "string", "description": "论文标题，用于 manifest 和文件名。"},
+                "abstract": {"type": "string", "description": "搜索接口返回的原始摘要；review_writer 会按元数据引用，不让模型补写。"},
+                "source": {"type": "string", "description": "搜索来源，如 openalex/arxiv/semantic_scholar。"},
+                "external_id": {"type": "string", "description": "外部论文 ID。"},
+                "doi": {"type": "string", "description": "DOI。"},
+                "url": {"type": "string", "description": "论文页面链接。"},
+                "venue": {"type": "string", "description": "期刊/会议/来源名称。"},
+                "year": {"type": "integer", "description": "发表年份。"},
+                "authors": {"type": "array", "items": {"type": "object"}, "description": "作者列表。"},
+                "citation_count": {"type": "integer", "description": "搜索接口返回的引用数。"},
+                "reference_count": {"type": "integer", "description": "搜索接口返回的参考文献数。"},
+                "fields_of_study": {"type": "array", "items": {"type": "string"}, "description": "搜索接口返回的学科/领域标签。"},
+                "paper_key": {"type": "string", "description": "可选稳定论文 key。未提供时根据 DOI/arXiv/title 生成。"},
+                "overwrite": {"type": "boolean", "default": False, "description": "是否覆盖已下载 PDF。"},
+            },
+        "required": ["literature_review_id"],
+    }
+    _MDPI_ISSN_SLUGS: Dict[str, str] = {
+        "1424-8220": "sensors",
+        "2072-4292": "remotesensing",
+        "2073-4395": "agronomy",
+    }
+    _MDPI_CODE_SLUGS: Dict[str, str] = {
+        "s": "sensors",
+        "rs": "remotesensing",
+        "agronomy": "agronomy",
+        "sustainability": "sustainability",
+        "applsci": "applsci",
+        "plants": "plants",
+        "agriculture": "agriculture",
+        "animals": "animals",
+        "water": "water",
+        "energies": "energies",
+        "ijms": "ijms",
+        "ijerph": "ijerph",
+        "foods": "foods",
+    }
+    _MDPI_VENUE_SLUGS: Dict[str, str] = {
+        "remote sensing": "remotesensing",
+        "sensors": "sensors",
+        "agronomy": "agronomy",
+    }
+
+    @staticmethod
+    def _normalize_arxiv_id(value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        if raw.startswith("arxiv:"):
+            raw = raw[6:]
+        if "v" in raw and raw.rsplit("v", 1)[-1].isdigit():
+            raw = raw.rsplit("v", 1)[0]
+        return raw
+
+    @classmethod
+    def _extract_arxiv_id_from_text(cls, value: Any) -> Optional[str]:
+        token = unquote(str(value or "").strip())
+        if not token:
+            return None
+
+        url_patterns = (
+            r"10\.48550/arxiv\.([^\s\"'<>?#]+)",
+            r"arxiv(?:\.org)?/(?:abs|pdf|html)/([^/?#]+)",
+            r"\barxiv:\s*([^\s]+)",
+        )
+        for pattern in url_patterns:
+            match = re.search(pattern, token, flags=re.IGNORECASE)
+            if match:
+                return cls._normalize_arxiv_id(match.group(1).removesuffix(".pdf").rstrip(").,;]}"))
+
+        direct = token.strip().removesuffix(".pdf")
+        if re.fullmatch(r"(?:\d{4}\.\d{4,5}|[a-z\-]+(?:\.[A-Za-z\-]+)?/\d{7})(?:v\d+)?", direct, flags=re.IGNORECASE):
+            return cls._normalize_arxiv_id(direct)
+        return None
+
+    @classmethod
+    def _infer_arxiv_id_from_candidates(cls, *values: Any) -> Optional[str]:
+        for value in values:
+            arxiv_id = cls._extract_arxiv_id_from_text(value)
+            if arxiv_id:
+                return arxiv_id
+        return None
+
+    @classmethod
+    def _build_arxiv_pdf_url(cls, arxiv_id: Any) -> Optional[str]:
+        normalized = cls._normalize_arxiv_id(arxiv_id)
+        if not normalized:
+            return None
+        return f"https://arxiv.org/pdf/{normalized}"
+
+    @classmethod
+    def _mdpi_slug_from_metadata(cls, venue: Any, doi: Any, issn: str = "") -> str:
+        venue_key = re.sub(r"\s+", " ", str(venue or "").strip().lower())
+        if venue_key in cls._MDPI_VENUE_SLUGS:
+            return cls._MDPI_VENUE_SLUGS[venue_key]
+        compact_venue = re.sub(r"[^a-z0-9]+", "", venue_key)
+        if compact_venue:
+            return compact_venue
+
+        if issn and issn in cls._MDPI_ISSN_SLUGS:
+            return cls._MDPI_ISSN_SLUGS[issn]
+
+        doi_tail = re.sub(
+            r"^(?:https?://)?(?:dx\.)?doi\.org/10\.3390/",
+            "",
+            str(doi or "").strip().lower(),
+            flags=re.IGNORECASE,
+        )
+        doi_tail = re.sub(r"^10\.3390/", "", doi_tail, flags=re.IGNORECASE)
+        match = re.match(r"([a-z]+)", doi_tail)
+        if match:
+            code = match.group(1)
+            return cls._MDPI_CODE_SLUGS.get(code, code)
+        return ""
+
+    @classmethod
+    def _build_mdpi_pdf_candidates(cls, kwargs: Dict[str, Any]) -> List[str]:
+        candidates: List[str] = []
+        for value in (kwargs.get("pdf_url"), kwargs.get("url"), kwargs.get("external_id")):
+            token = str(value or "").strip()
+            if not token:
+                continue
+            parsed = urlparse(token)
+            if "mdpi.com" not in parsed.netloc.lower():
+                continue
+            match = re.search(
+                r"/(?P<issn>\d{4}-\d{3}[\dXx])/(?P<volume>\d+)/(?P<issue>\d+)/(?P<article>\d+)/pdf\b",
+                parsed.path,
+                flags=re.IGNORECASE,
+            )
+            if not match:
+                continue
+            slug = cls._mdpi_slug_from_metadata(kwargs.get("venue"), kwargs.get("doi"), match.group("issn"))
+            if not slug:
+                continue
+            volume = str(int(match.group("volume")))
+            article = match.group("article").lstrip("0") or "0"
+            article_tokens = [article.zfill(5)]
+            if article_tokens[0] != article:
+                article_tokens.append(article)
+            for article_token in article_tokens:
+                base = f"{slug}-{volume}-{article_token}"
+                for suffix in ("", "-v2", "-v3"):
+                    candidates.append(
+                        f"https://mdpi-res.com/d_attachment/{slug}/{base}/article_deploy/{base}{suffix}.pdf"
+                    )
+        return candidates
+
+    @classmethod
+    def _extract_ieee_arnumber(cls, *values: Any) -> Optional[str]:
+        for value in values:
+            token = unquote(str(value or "").strip())
+            if not token:
+                continue
+            for pattern in (
+                r"[?&]arnumber=(\d+)",
+                r"/document/(\d+)",
+                r"/0*(\d{7,8})\.pdf\b",
+            ):
+                match = re.search(pattern, token, flags=re.IGNORECASE)
+                if match:
+                    return str(int(match.group(1)))
+        return None
+
+    @classmethod
+    def _build_ieee_pdf_candidates(cls, kwargs: Dict[str, Any]) -> List[str]:
+        arnumber = cls._extract_ieee_arnumber(kwargs.get("pdf_url"), kwargs.get("url"), kwargs.get("external_id"))
+        if not arnumber:
+            return []
+        return [f"https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber={arnumber}"]
+
+    @classmethod
+    def _build_pdf_download_candidates(cls, kwargs: Dict[str, Any]) -> List[str]:
+        arxiv_id = cls._infer_arxiv_id_from_candidates(
+            kwargs.get("arxiv_id"),
+            kwargs.get("external_id") if str(kwargs.get("source") or "").strip().lower() == "arxiv" else None,
+            kwargs.get("pdf_url"),
+            kwargs.get("url"),
+            kwargs.get("doi"),
+        )
+
+        candidates: List[str] = []
+        if arxiv_id:
+            arxiv_pdf_url = cls._build_arxiv_pdf_url(arxiv_id)
+            if arxiv_pdf_url:
+                candidates.append(arxiv_pdf_url)
+
+        candidates.extend(cls._build_mdpi_pdf_candidates(kwargs))
+
+        direct_pdf_url = str(kwargs.get("pdf_url") or "").strip()
+        if direct_pdf_url:
+            candidates.append(direct_pdf_url)
+
+        for candidate in (
+            kwargs.get("url"),
+            kwargs.get("external_id"),
+        ):
+            token = str(candidate or "").strip()
+            if token.lower().split("?", 1)[0].endswith(".pdf"):
+                candidates.append(token)
+
+        candidates.extend(cls._build_ieee_pdf_candidates(kwargs))
+
+        unique_candidates: List[str] = []
+        seen: Set[str] = set()
+        for candidate in candidates:
+            normalized = candidate.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_candidates.append(normalized)
+        return unique_candidates
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        from app.services.literature_service import get_literature_service
+
+        review_id = self._review_id(kwargs.get("literature_review_id"))
+        root = self._review_root_for(review_id)
+        self._ensure_review_dirs(root)
+        pdf_candidates = self._build_pdf_download_candidates(kwargs)
+        if not pdf_candidates:
+            return ToolResult(
+                success=False,
+                output="缺少可下载的 PDF URL。请优先选择带 pdf_url 的搜索结果，或传 arxiv_id。",
+                error="missing_pdf_url",
+                data={"literature_review_id": review_id, "root": str(root)},
+            )
+
+        paper_key = self._safe_slug(kwargs.get("paper_key"), fallback="") or self._paper_key_from_metadata(
+            title=kwargs.get("title"),
+            doi=kwargs.get("doi"),
+            arxiv_id=kwargs.get("arxiv_id"),
+            external_id=kwargs.get("external_id"),
+        )
+        pdf_path = root / "pdf" / f"{paper_key}.pdf"
+        download_url = ""
+        download_errors: List[Dict[str, str]] = []
+        if pdf_path.exists() and not bool(kwargs.get("overwrite")):
+            success = True
+            error = ""
+            download_url = pdf_candidates[0]
+        else:
+            success = False
+            error = ""
+            service = get_literature_service()
+            for candidate_url in pdf_candidates:
+                success, error = await service.download_pdf(candidate_url, str(pdf_path))
+                if success:
+                    download_url = candidate_url
+                    break
+                download_errors.append({"url": candidate_url, "error": error or "unknown_error"})
+        if not success:
+            attempted = "\n".join(
+                f"- {item['url']}: {item['error']}"
+                for item in download_errors
+            )
+            return ToolResult(
+                success=False,
+                output=f"PDF 下载失败，已尝试 {len(pdf_candidates)} 个候选链接。\n{attempted}",
+                error="pdf_download_failed",
+                data={
+                    "literature_review_id": review_id,
+                    "paper_key": paper_key,
+                    "pdf_url": pdf_candidates[0],
+                    "attempted_pdf_urls": pdf_candidates,
+                    "download_errors": download_errors,
+                    "pdf_path": str(pdf_path),
+                },
+            )
+
+        paper_meta = self._update_manifest_paper(
+            root,
+            paper_key,
+            {
+                "title": str(kwargs.get("title") or "").strip(),
+                "abstract": str(kwargs.get("abstract") or "").strip(),
+                "source": str(kwargs.get("source") or "").strip(),
+                "external_id": str(kwargs.get("external_id") or "").strip(),
+                "doi": str(kwargs.get("doi") or "").strip(),
+                "arxiv_id": str(kwargs.get("arxiv_id") or "").strip(),
+                "url": str(kwargs.get("url") or "").strip(),
+                "venue": str(kwargs.get("venue") or "").strip(),
+                "year": kwargs.get("year"),
+                "authors": kwargs.get("authors") or [],
+                "citation_count": kwargs.get("citation_count"),
+                "reference_count": kwargs.get("reference_count"),
+                "fields_of_study": kwargs.get("fields_of_study") or [],
+                "pdf_url": download_url or pdf_candidates[0],
+                "original_pdf_url": str(kwargs.get("pdf_url") or "").strip(),
+                "attempted_pdf_urls": pdf_candidates,
+                "pdf_download_errors": download_errors,
+                "pdf_path": str(pdf_path),
+                "pdf_downloaded": True,
+            },
+        )
+        return ToolResult(
+            success=True,
+            output="\n".join(
+                [
+                    "PDF 已保存到论文综述目录。",
+                    f"- literature_review_id: {review_id}",
+                    f"- paper_key: {paper_key}",
+                    f"- pdf_path: {pdf_path}",
+                    f"- download_url: {download_url or pdf_candidates[0]}",
+                    "下一步通常调用 read_full_pdf 生成完整 Markdown。",
+                ]
+            ),
+            data={
+                "literature_review_id": review_id,
+                "paper_key": paper_key,
+                "pdf_url": download_url or pdf_candidates[0],
+                "attempted_pdf_urls": pdf_candidates,
+                "pdf_path": str(pdf_path),
+                "paper": paper_meta,
+            },
+        )
+
+
+class LiteratureReviewJsonReadTool(_LiteratureReviewWorkspaceMixin, ToolBase):
+    name = "literature_review_json_read"
+    input_model = LiteratureReviewJsonReadInput
+    timeout_seconds = 20.0
+    retry_count = 0
+    output_max_tokens = 64000
+    parallel_safe = True
+    description = (
+        "按 review_id 浏览文献综述工作区。默认 mode=list，主列 `review/*.md` 和 `review/final.md`，"
+        "并附 DOI/链接、标题、作者、年份、来源和引用格式。mode=read 可读取 list 返回的 review Markdown，"
+        "也可读取 `md/*.json` PDF-to-Markdown 解析报告。注意：`md/*.json` 是 PDF 解析副产物，不是综述 JSON。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "literature_review_id": {"type": "string", "description": "综述任务 ID，例如 review-20260425053243-85976a3c。"},
+            "mode": {"type": "string", "enum": ["list", "read"], "default": "list", "description": "list=列出 review/*.md 为主，并附 md/*.json 解析报告数量；read=全量读取指定 review Markdown 或 md/*.json。"},
+            "relative_path": {"type": "string", "description": "mode=read 时使用。建议传 list 返回的路径，例如 review/final.md、review/paper.md 或 md/paper.json。"},
+        },
+        "required": ["literature_review_id"],
+    }
+
+    @classmethod
+    def _resolve_readable_artifact(cls, root: Path, raw_path: str) -> Optional[Path]:
+        raw = str(raw_path or "").strip().replace("\\", "/")
+        if not raw or "\x00" in raw:
+            return None
+        candidate = Path(raw)
+        allowed_roots = [root / "review", root / "md"]
+        if candidate.is_absolute():
+            if not any(cls._path_under_root(candidate, allowed_root) for allowed_root in allowed_roots):
+                return None
+        else:
+            parts = [part for part in raw.split("/") if part not in {"", "."}]
+            if not parts or any(part == ".." for part in parts):
+                return None
+            if len(parts) == 1:
+                candidate = root / "review" / parts[0]
+            else:
+                candidate = root / "/".join(parts)
+            if not any(cls._path_under_root(candidate, allowed_root) for allowed_root in allowed_roots):
+                return None
+        resolved = candidate.resolve()
+        if resolved.suffix.lower() not in {".md", ".json"} or not resolved.is_file():
+            return None
+        return resolved
+
+    def _artifact_file_entry(self, root: Path, path: Path) -> Dict[str, Any]:
+        relative_path = path.relative_to(root).as_posix()
+        paper_key = self._safe_slug(path.stem, fallback=path.stem)
+        identity = self._paper_identity(root, paper_key=paper_key, relative_path=relative_path)
+        stat = path.stat()
+        return {
+            "relative_path": relative_path,
+            "filename": path.name,
+            "kind": "final_review" if relative_path == "review/final.md" else ("paper_review" if relative_path.startswith("review/") else "pdf2md_report"),
+            "paper_key": identity.get("paper_key") or paper_key,
+            "title": identity.get("title") or "未提供",
+            "authors": identity.get("authors") or [],
+            "year": identity.get("year") or "",
+            "venue": identity.get("venue") or "",
+            "doi": identity.get("doi") or "",
+            "link": identity.get("link") or "",
+            "citation_gbt7714": identity.get("citation_gbt7714") or "",
+            "size_bytes": stat.st_size,
+            "modified_at": datetime.utcfromtimestamp(stat.st_mtime).isoformat(),
+        }
+
+    def _metadata_lines_for_entry(self, entry: Dict[str, Any], *, include_citation: bool = True) -> List[str]:
+        authors = ", ".join(entry["authors"]) if entry.get("authors") else "未提供"
+        doi = str(entry.get("doi") or "").strip()
+        link = str(entry.get("link") or "").strip()
+        doi_link = self._doi_url(doi) if doi else link
+        lines = [
+            f"   - kind: {entry.get('kind') or 'unknown'}",
+            f"   - paper_key: {entry.get('paper_key') or '未提供'}",
+            f"   - 标题: {entry.get('title') or '未提供'}",
+            f"   - 作者: {authors}",
+            f"   - 年份/来源: {entry.get('year') or '未提供'} / {entry.get('venue') or '未提供'}",
+            f"   - DOI 链接: {doi_link or '未提供'}",
+        ]
+        if include_citation:
+            lines.append(f"   - GB/T 7714: {entry.get('citation_gbt7714') or '未提供'}")
+        return lines
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        review_id = self._review_id(kwargs.get("literature_review_id"))
+        root = self._review_root_for(review_id)
+        review_dir = root / "review"
+        md_dir = root / "md"
+        mode = str(kwargs.get("mode") or "list").strip().lower()
+        if not root.is_dir():
+            return ToolResult(
+                success=False,
+                output=f"找不到文献综述工作区：{review_id}",
+                error="literature_review_not_found",
+                data={"literature_review_id": review_id, "root": str(root)},
+            )
+
+        if mode == "read":
+            path = self._resolve_readable_artifact(root, str(kwargs.get("relative_path") or ""))
+            if path is None:
+                return ToolResult(
+                    success=False,
+                    output="找不到可读取的文献综述文件。请先用 mode=list 获取路径，再传 relative_path。可读：review/*.md、review/final.md、md/*.json。",
+                    error="literature_review_artifact_not_found",
+                    data={"literature_review_id": review_id, "review_dir": str(review_dir), "md_dir": str(md_dir)},
+                )
+            content = path.read_text(encoding="utf-8", errors="replace")
+            parsed: Optional[Any] = None
+            fence = "markdown"
+            if path.suffix.lower() == ".json":
+                fence = "json"
+                try:
+                    parsed = json.loads(content)
+                    content = json.dumps(parsed, ensure_ascii=False, indent=2, default=str)
+                except Exception:
+                    parsed = None
+            entry = self._artifact_file_entry(root, path)
+            output_lines = [
+                "已全量读取文献综述工作区文件。",
+                f"- literature_review_id: {review_id}",
+                f"- relative_path: {entry['relative_path']}",
+                f"- kind: {entry['kind']}",
+                *self._metadata_lines_for_entry(entry, include_citation=True),
+            ]
+            if path.suffix.lower() == ".json":
+                output_lines.append("- 注意: 这是 PDF-to-Markdown 解析报告 JSON，不是 LLM 综述 JSON。")
+            output_lines.extend(
+                [
+                    "",
+                    f"```{fence}",
+                    content,
+                    "```",
+                ]
+            )
+            return ToolResult(
+                success=True,
+                output="\n".join(output_lines),
+                data={
+                    "literature_review_id": review_id,
+                    "relative_path": entry["relative_path"],
+                    "entry": entry,
+                    "json": parsed,
+                    "content": content,
+                },
+            )
+
+        review_files = sorted(path for path in review_dir.glob("*.md") if path.is_file()) if review_dir.is_dir() else []
+        final_files = [path for path in review_files if path.name == "final.md"]
+        paper_review_files = [path for path in review_files if path.name != "final.md"]
+        ordered_review_files = final_files + paper_review_files
+        report_files = sorted(path for path in md_dir.glob("*.json") if path.is_file()) if md_dir.is_dir() else []
+        md_files = sorted(path for path in md_dir.glob("*.md") if path.is_file()) if md_dir.is_dir() else []
+        review_entries = [self._artifact_file_entry(root, path) for path in ordered_review_files]
+        report_entries = [self._artifact_file_entry(root, path) for path in report_files]
+        lines = [
+            "已列出文献综述 review Markdown 文件。",
+            f"- literature_review_id: {review_id}",
+            f"- review_dir: {review_dir}",
+            f"- review_md_count: {len(review_entries)}",
+            f"- paper_fulltext_md_count: {len(md_files)}",
+            f"- pdf2md_report_json_count: {len(report_entries)}",
+            "- 说明: 论文全文大多是英文；检索 `md/*.md` 请优先使用英文 query。中文 query 更适合检索 `review/*.md`。",
+            "- 说明: `md/*.json` 是 PDF-to-Markdown 解析报告，不是综述 JSON。",
+            "",
+        ]
+        if not review_entries:
+            lines.append("未找到 `review/*.md`。如果已有 PDF/全文 Markdown，请先调用 `review_writer mode=paper/final` 生成 review。")
+        else:
+            for index, entry in enumerate(review_entries, start=1):
+                lines.append(f"{index}. `{entry['relative_path']}`")
+                lines.extend(self._metadata_lines_for_entry(entry, include_citation=True))
+        if report_entries:
+            lines.extend(
+                [
+                    "",
+                    "PDF-to-Markdown 解析报告 JSON 路径（需要解析结构/页数/来源映射时再读）：",
+                ]
+            )
+            for index, entry in enumerate(report_entries, start=1):
+                lines.append(f"{index}. `{entry['relative_path']}`")
+        return ToolResult(
+            success=True,
+            output="\n".join(lines),
+            data={
+                "literature_review_id": review_id,
+                "root": str(root),
+                "review_dir": str(review_dir),
+                "md_dir": str(md_dir),
+                "review_files": review_entries,
+                "pdf2md_report_files": report_entries,
+            },
+        )
+
+class LiteratureReviewSearchZoektTool(_LiteratureReviewWorkspaceMixin, ToolBase):
+    name = "literature_review_search_zoekt"
+    input_model = LiteratureReviewSearchZoektInput
+    timeout_seconds = 240.0
+    retry_count = 0
+    output_max_tokens = 12000
+    parallel_safe = False
+    description = (
+        "在指定文献综述任务内用 Zoekt 检索 Markdown。scope=paper 检索 `md/*.md` 论文全文，"
+        "这些论文通常是英文，必须优先使用英文 query；scope=review 检索 `review/*.md` 单篇/最终综述，"
+        "可以使用中文 query；scope=all 同时检索两者。返回命中行、可选上下文，以及论文标题、作者、DOI/链接和引用格式。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "literature_review_id": {"type": "string", "description": "综述任务 ID，例如 review-20260425053243-85976a3c。"},
+            "query": {"type": "string", "description": "Zoekt 查询语法。检索论文全文 md/*.md 时优先使用英文；检索 review/*.md 时可使用中文。"},
+            "scope": {"type": "string", "enum": ["all", "paper", "review"], "default": "all", "description": "paper=英文论文全文 md/*.md；review=中文/用户语言综述 review/*.md；all=两者都搜。"},
+            "max_results": {"type": "integer", "default": 20, "description": "最多返回命中数，1-100。"},
+            "context_lines": {"type": "integer", "default": 2, "description": "每个命中行前后附带的上下文行数，0-20。"},
+            "auto_index": {"type": "boolean", "default": True, "description": "索引缺失时是否自动构建。通常保持 true。"},
+            "force_reindex": {"type": "boolean", "default": False, "description": "搜索前是否强制重建 Zoekt 索引。"},
+        },
+        "required": ["literature_review_id", "query"],
+    }
+
+    @staticmethod
+    def _read_context(path: Path, *, line_number: int, context_lines: int) -> List[Dict[str, Any]]:
+        if line_number <= 0 or context_lines <= 0:
+            return []
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return []
+        start = max(1, int(line_number) - int(context_lines))
+        end = min(len(lines), int(line_number) + int(context_lines))
+        return [
+            {"line_number": number, "text": lines[number - 1]}
+            for number in range(start, end + 1)
+        ]
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        review_id = self._review_id(kwargs.get("literature_review_id"))
+        root = self._review_root_for(review_id)
+        md_dir = root / "md"
+        review_dir = root / "review"
+        query = str(kwargs.get("query") or "").strip()
+        scope = str(kwargs.get("scope") or "all").strip().lower()
+        if scope not in {"all", "paper", "review"}:
+            scope = "all"
+        max_results = int(kwargs.get("max_results") or 20)
+        context_lines = int(kwargs.get("context_lines") or 0)
+        if not root.is_dir():
+            return ToolResult(
+                success=False,
+                output=f"找不到文献综述工作区：{review_id}",
+                error="literature_review_not_found",
+                data={"literature_review_id": review_id, "root": str(root)},
+            )
+
+        target_candidates: List[tuple[str, Path, str]] = []
+        if scope in {"all", "paper"}:
+            target_candidates.append(("paper", md_dir, "md"))
+        if scope in {"all", "review"}:
+            target_candidates.append(("review", review_dir, "review"))
+        targets = [
+            item
+            for item in target_candidates
+            if item[1].is_dir() and any(path.is_file() and path.suffix.lower() == ".md" for path in item[1].glob("*.md"))
+        ]
+        if not targets:
+            detail = "md/*.md 和 review/*.md 都不存在"
+            if scope == "paper":
+                detail = "md/*.md 不存在。请先下载 PDF 并调用 read_full_pdf。"
+            elif scope == "review":
+                detail = "review/*.md 不存在。请先调用 review_writer 生成单篇或最终 review。"
+            return ToolResult(
+                success=False,
+                output=f"没有可检索的 Markdown：{detail}",
+                error="literature_review_markdown_empty",
+                data={"literature_review_id": review_id, "root": str(root), "md_dir": str(md_dir), "review_dir": str(review_dir), "scope": scope},
+            )
+
+        index_payloads: List[Dict[str, Any]] = []
+        search_payloads: List[Dict[str, Any]] = []
+        matches: List[Dict[str, Any]] = []
+        failures: List[Dict[str, Any]] = []
+
+        for target_kind, search_dir, relative_prefix in targets:
+            index_payload: Optional[Dict[str, Any]] = None
+            if bool(kwargs.get("auto_index", True)) or bool(kwargs.get("force_reindex", False)):
+                index_payload = await ZoektCliService.build_project_index(
+                    project_dir=search_dir,
+                    workspace_dir=search_dir,
+                    force_reindex=bool(kwargs.get("force_reindex", False)),
+                )
+                index_payloads.append({"scope": target_kind, **dict(index_payload or {})})
+                if not bool(index_payload.get("success")):
+                    failures.append({"scope": target_kind, "stage": "index", "payload": index_payload})
+                    if scope != "all":
+                        return ToolResult(
+                            success=False,
+                            output=(
+                                "文献综述 Markdown Zoekt 索引准备失败。\n"
+                                f"- scope: {target_kind}\n"
+                                f"- error: {index_payload.get('error') or 'unknown'}\n"
+                                f"- dir: {search_dir}"
+                            ),
+                            error=str(index_payload.get("error") or "literature_review_zoekt_index_failed"),
+                            data={"literature_review_id": review_id, "scope": scope, "index": index_payload},
+                        )
+                    continue
+
+            search_payload = await ZoektCliService.search_project(
+                workspace_dir=search_dir,
+                query=query,
+                max_results=max_results,
+            )
+            search_payloads.append({"scope": target_kind, **dict(search_payload or {})})
+            if not bool(search_payload.get("success")):
+                failures.append({"scope": target_kind, "stage": "search", "payload": search_payload})
+                if scope != "all":
+                    error_message = str(search_payload.get("error") or "literature_review_zoekt_search_failed")
+                    if error_message == "zoekt_index_missing":
+                        output = "文献综述 Markdown Zoekt 索引不存在。请把 auto_index 设为 true。"
+                    else:
+                        output = f"文献综述 Markdown Zoekt 搜索失败。\n- scope: {target_kind}\n- error: {error_message}\n- query: {query}"
+                    return ToolResult(
+                        success=False,
+                        output=output,
+                        error=error_message,
+                        data={"literature_review_id": review_id, "scope": scope, "index": index_payload, "search": search_payload},
+                    )
+                continue
+
+            for item in list(search_payload.get("matches") or []):
+                source_relative_path = str(item.get("source_relative_path") or item.get("repo_relative_path") or "").strip().replace("\\", "/")
+                if not source_relative_path:
+                    continue
+                actual_path = (search_dir / source_relative_path).resolve()
+                if not self._path_under_root(actual_path, search_dir) or not actual_path.is_file():
+                    continue
+                relative_path = f"{relative_prefix}/{source_relative_path}"
+                paper_key = self._safe_slug(Path(source_relative_path).stem, fallback="")
+                identity = self._paper_identity(root, paper_key=paper_key, relative_path=relative_path)
+                enriched = dict(item)
+                enriched["scope"] = target_kind
+                enriched["source_relative_path"] = source_relative_path
+                enriched["relative_path"] = relative_path
+                enriched["paper"] = {key: value for key, value in identity.items() if key != "metadata"}
+                if context_lines > 0:
+                    enriched["context"] = self._read_context(
+                        actual_path,
+                        line_number=int(item.get("line_number") or 0),
+                        context_lines=context_lines,
+                    )
+                matches.append(enriched)
+
+        matches = sorted(matches, key=lambda row: float(row.get("score") or 0.0), reverse=True)[:max_results]
+        if not matches and failures and len(failures) == len(targets):
+            error_message = str((failures[0].get("payload") or {}).get("error") or "literature_review_zoekt_search_failed")
+            return ToolResult(
+                success=False,
+                output=f"文献综述 Markdown Zoekt 搜索失败。\n- scope: {scope}\n- error: {error_message}\n- query: {query}",
+                error=error_message,
+                data={"literature_review_id": review_id, "scope": scope, "failures": failures, "index": index_payloads, "search": search_payloads},
+            )
+
+        lines = [
+            "已使用 Zoekt 搜索文献综述 Markdown。",
+            f"- literature_review_id: {review_id}",
+            f"- scope: {scope}",
+            f"- searched_dirs: {', '.join(f'{kind}={path}' for kind, path, _prefix in targets)}",
+            f"- query: {query}",
+            f"- returned_matches: {len(matches)}",
+            f"- truncated: {any(bool(payload.get('truncated')) for payload in search_payloads)}",
+            "- 提示: `scope=paper` 搜索英文论文全文，请优先用英文 query；`scope=review` 搜索中文/用户语言综述，可用中文 query。",
+            "",
+        ]
+        if not matches:
+            lines.append(
+                "未命中。若要找论文全文证据，请用英文术语重试并设置 scope=paper；"
+                "若要找已写出的综述段落，请用中文术语重试并设置 scope=review。"
+            )
+        for index, item in enumerate(matches, start=1):
+            paper = dict(item.get("paper") or {})
+            authors = ", ".join(list(paper.get("authors") or [])) or "未提供"
+            line_number = int(item.get("line_number") or 0)
+            location = f"{item.get('relative_path')}:{line_number}" if line_number > 0 else str(item.get("relative_path") or "")
+            lines.extend(
+                [
+                    f"{index}. `{location}`",
+                    f"   - scope: {item.get('scope') or 'unknown'}",
+                    f"   - paper_key: {paper.get('paper_key') or '未提供'}",
+                    f"   - 标题: {paper.get('title') or '未提供'}",
+                    f"   - 作者: {authors}",
+                    f"   - 年份/来源: {paper.get('year') or '未提供'} / {paper.get('venue') or '未提供'}",
+                    f"   - DOI/链接: {paper.get('doi') or paper.get('link') or '未提供'}",
+                    f"   - GB/T 7714: {paper.get('citation_gbt7714') or '未提供'}",
+                    f"   - 命中: {str(item.get('line_text') or '').strip()}",
+                ]
+            )
+            context = list(item.get("context") or [])
+            if context:
+                lines.append("   - 上下文:")
+                for context_item in context:
+                    lines.append(f"     {context_item['line_number']}: {context_item['text']}")
+
+        return ToolResult(
+            success=True,
+            output="\n".join(lines),
+            data={
+                "literature_review_id": review_id,
+                "root": str(root),
+                "md_dir": str(md_dir),
+                "review_dir": str(review_dir),
+                "scope": scope,
+                "query": query,
+                "matches": matches,
+                "failures": failures,
+                "index": index_payloads,
+                "search": search_payloads,
+            },
+        )
+
+class ReadFullPdfTool(_LiteratureReviewWorkspaceMixin, ToolBase):
+    name = "read_full_pdf"
+    input_model = ReadFullPdfInput
+    timeout_seconds = 300.0
+    retry_count = 0
+    output_max_tokens = 9000
+    parallel_safe = False
+    description = (
+        "读取综述目录中的 PDF，并用本地 PDF-to-Markdown 管线生成完整 Markdown 到 "
+        "`/app/uploads/literature_reviews/{literature_review_id}/md/`。"
+        "默认只返回文件路径和统计信息；如 return_content=true，会把完整 Markdown 放入 observation。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "literature_review_id": {"type": "string", "description": "综述任务 ID。"},
+            "paper_key": {"type": "string", "description": "论文 key；默认读取 pdf/{paper_key}.pdf 并写 md/{paper_key}.md。"},
+            "pdf_path": {"type": "string", "description": "可选 PDF 路径。支持综述 root 下相对路径或绝对路径。"},
+            "mode": {"type": "string", "enum": ["fast", "hybrid"], "default": "fast", "description": "PDF 解析模式。默认 fast。"},
+            "return_content": {"type": "boolean", "default": False, "description": "是否在 observation 中返回完整 Markdown。默认 false，避免撑爆上下文。"},
+        },
+        "required": ["literature_review_id"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        from app.services.pdf_rag_ingest_service import get_pdf_rag_ingest_service
+
+        review_id = self._review_id(kwargs.get("literature_review_id"))
+        root = self._review_root_for(review_id)
+        self._ensure_review_dirs(root)
+        paper_key = self._safe_slug(kwargs.get("paper_key"), fallback="")
+        pdf_path = self._resolve_review_file(root, str(kwargs.get("pdf_path") or ""), default_subdir="pdf")
+        if pdf_path is None and paper_key:
+            candidate = root / "pdf" / f"{paper_key}.pdf"
+            pdf_path = candidate.resolve() if candidate.is_file() and self._path_under_root(candidate, root) else None
+        if pdf_path is None:
+            return ToolResult(
+                success=False,
+                output="找不到可读取的 PDF。请传 paper_key 或综述目录内的 pdf_path。",
+                error="pdf_not_found",
+                data={"literature_review_id": review_id, "root": str(root)},
+            )
+        if not paper_key:
+            paper_key = self._safe_slug(pdf_path.stem, fallback=f"paper-{uuid.uuid4().hex[:8]}")
+
+        ingest = await get_pdf_rag_ingest_service().ingest_pdf(
+            file_path=str(pdf_path),
+            document_name=pdf_path.name,
+            mode=str(kwargs.get("mode") or "fast"),
+        )
+        markdown = str(ingest.get("document_text") or "")
+        if not markdown.strip():
+            return ToolResult(
+                success=False,
+                output=f"PDF 转 Markdown 失败或无文本内容: {ingest.get('failure_reason') or 'empty_markdown'}",
+                error="pdf_markdown_empty",
+                data={
+                    "literature_review_id": review_id,
+                    "paper_key": paper_key,
+                    "pdf_path": str(pdf_path),
+                    "ingest": ingest,
+                },
+            )
+
+        md_path = root / "md" / f"{paper_key}.md"
+        md_path.write_text(markdown, encoding="utf-8")
+        report_path = root / "md" / f"{paper_key}.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "paper_key": paper_key,
+                    "pdf_path": str(pdf_path),
+                    "md_path": str(md_path),
+                    "extractor": ingest.get("extractor"),
+                    "report": ingest.get("report") or {},
+                    "document_source_spans": ingest.get("document_source_spans") or [],
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+        report = dict(ingest.get("report") or {})
+        self._update_manifest_paper(
+            root,
+            paper_key,
+            {
+                "pdf_path": str(pdf_path),
+                "md_path": str(md_path),
+                "markdown_chars": len(markdown),
+                "page_count": report.get("page_count"),
+                "extractor": ingest.get("extractor"),
+                "pdf_read_at": datetime.utcnow().isoformat(),
+            },
+        )
+        header = "\n".join(
+            [
+                "PDF 已完整转换为 Markdown。",
+                f"- literature_review_id: {review_id}",
+                f"- paper_key: {paper_key}",
+                f"- pdf_path: {pdf_path}",
+                f"- md_path: {md_path}",
+                f"- chars: {len(markdown)}",
+                f"- pages: {report.get('page_count', 'unknown')}",
+            ]
+        )
+        output = f"{header}\n\n完整 Markdown:\n\n{markdown}" if bool(kwargs.get("return_content")) else header
+        return ToolResult(
+            success=True,
+            output=output,
+            data={
+                "literature_review_id": review_id,
+                "paper_key": paper_key,
+                "pdf_path": str(pdf_path),
+                "md_path": str(md_path),
+                "report_path": str(report_path),
+                "markdown_chars": len(markdown),
+                "page_count": report.get("page_count"),
+                "extractor": ingest.get("extractor"),
+                "return_content": bool(kwargs.get("return_content")),
+            },
+        )
+
+
+class ReviewWriterTool(_LiteratureReviewWorkspaceMixin, ToolBase):
+    name = "review_writer"
+    input_model = ReviewWriterInput
+    timeout_seconds = 0.0
+    retry_count = 0
+    output_max_tokens = 12000
+    parallel_safe = False
+    description = (
+        "读取 literature_review 目录中的完整 Markdown 或单篇 review，使用平台默认 LLM 生成基础 Markdown 综述。"
+        "单篇结果写入 `/review/{paper_key}.md`，最终综述写入 `/review/final.md`。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "literature_review_id": {"type": "string", "description": "综述任务 ID。"},
+            "topic": {"type": "string", "description": "明确综述主题。"},
+            "mode": {"type": "string", "enum": ["paper", "final"], "default": "paper", "description": "paper=生成单篇 review；final=汇总已有单篇 review。"},
+            "paper_key": {"type": "string", "description": "单篇模式下的论文 key。"},
+            "md_path": {"type": "string", "description": "可选完整论文 Markdown 路径。支持综述 root 下相对路径或绝对路径。"},
+            "requirements": {"type": "string", "description": "额外写作要求。"},
+            "target_paper_count": {"type": "integer", "default": 12, "description": "最终综述最低单篇 review 数量，默认 12。"},
+        },
+        "required": ["literature_review_id", "topic"],
+    }
+
+    @staticmethod
+    def _llm_max_tokens() -> int:
+        return max(2048, int(getattr(settings, "llm_max_tokens", 4096) or 4096))
+
+    async def _call_llm(self, *, system_prompt: str, user_prompt: str) -> str:
+        response = await LLMService().chat(
+            messages=[{"role": "user", "content": user_prompt}],
+            system_prompt=system_prompt,
+            temperature=0.2,
+            max_tokens=self._llm_max_tokens(),
+            source="literature_review.review_writer",
+        )
+        return str(response.get("content") or "").strip()
+
+    def _resolve_md_for_paper(self, root: Path, paper_key: str, md_path: str) -> Optional[Path]:
+        resolved = self._resolve_review_file(root, md_path, default_subdir="md") if md_path else None
+        if resolved is not None:
+            return resolved
+        if paper_key:
+            candidate = root / "md" / f"{paper_key}.md"
+            if candidate.is_file() and self._path_under_root(candidate, root):
+                return candidate.resolve()
+        return None
+
+    def _paper_metadata(self, root: Path, paper_key: str) -> Dict[str, Any]:
+        manifest = self._load_manifest(root)
+        papers = manifest.get("papers") if isinstance(manifest, dict) else {}
+        if isinstance(papers, dict) and isinstance(papers.get(paper_key), dict):
+            return dict(papers.get(paper_key) or {})
+        return {}
+
+    @staticmethod
+    def _compact_text(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip())
+
+    @classmethod
+    def _metadata_value(cls, metadata: Dict[str, Any], key: str) -> str:
+        value = metadata.get(key)
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False, default=str)
+        return cls._compact_text(value)
+
+    @classmethod
+    def _author_names(cls, metadata: Dict[str, Any]) -> List[str]:
+        raw_authors = metadata.get("authors")
+        if not isinstance(raw_authors, list):
+            return []
+        names: List[str] = []
+        for item in raw_authors:
+            if isinstance(item, dict):
+                name = cls._compact_text(
+                    item.get("name")
+                    or item.get("display_name")
+                    or item.get("author")
+                    or item.get("full_name")
+                )
+            else:
+                name = cls._compact_text(item)
+            if name:
+                names.append(name)
+        return names
+
+    @staticmethod
+    def _doi_url(doi: str) -> str:
+        value = str(doi or "").strip()
+        if not value:
+            return ""
+        if re.match(r"^https?://", value, flags=re.IGNORECASE):
+            return value
+        value = re.sub(r"^(?:doi:\s*)", "", value, flags=re.IGNORECASE).strip()
+        value = re.sub(r"^(?:dx\.)?doi\.org/", "", value, flags=re.IGNORECASE).strip()
+        return f"https://doi.org/{value}" if value else ""
+
+    @staticmethod
+    def _bibtex_escape(value: str) -> str:
+        return str(value or "").replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+    @classmethod
+    def _citation_strings(cls, *, paper_key: str, metadata: Dict[str, Any]) -> Dict[str, str]:
+        authors = cls._author_names(metadata)
+        authors_text = ", ".join(authors) if authors else "作者未提供"
+        bibtex_authors = " and ".join(authors)
+        title = cls._metadata_value(metadata, "title") or "题名未提供"
+        year = cls._metadata_value(metadata, "year") or "年份未提供"
+        venue = cls._metadata_value(metadata, "venue")
+        doi = cls._metadata_value(metadata, "doi")
+        doi_url = cls._doi_url(doi)
+        arxiv_id = cls._metadata_value(metadata, "arxiv_id")
+        arxiv_url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else ""
+        url = cls._metadata_value(metadata, "url")
+        pdf_url = cls._metadata_value(metadata, "pdf_url")
+        best_link = doi_url or url or arxiv_url or pdf_url
+
+        apa_parts = [f"{authors_text}.", f"({year}).", f"{title}."]
+        if venue:
+            apa_parts.append(f"{venue}.")
+        if best_link:
+            apa_parts.append(best_link)
+        apa = " ".join(apa_parts)
+
+        gbt_parts = [f"{authors_text}.", f"{title}[J/OL]."]
+        if venue:
+            gbt_parts.append(f"{venue},")
+        gbt_parts.append(f"{year}.")
+        if doi:
+            gbt_parts.append(f"DOI: {doi}.")
+        elif best_link:
+            gbt_parts.append(best_link)
+        gbt = " ".join(gbt_parts)
+
+        bibtex_key = cls._safe_slug(paper_key, fallback="paper").replace(".", "-")
+        bibtex_fields = [f"  title = {{{cls._bibtex_escape(title)}}}"]
+        if bibtex_authors:
+            bibtex_fields.append(f"  author = {{{cls._bibtex_escape(bibtex_authors)}}}")
+        if year != "年份未提供":
+            bibtex_fields.append(f"  year = {{{cls._bibtex_escape(year)}}}")
+        if venue:
+            bibtex_fields.append(f"  journal = {{{cls._bibtex_escape(venue)}}}")
+        if doi:
+            bibtex_fields.append(f"  doi = {{{cls._bibtex_escape(doi)}}}")
+        if best_link:
+            bibtex_fields.append(f"  url = {{{cls._bibtex_escape(best_link)}}}")
+        bibtex = "@misc{" + bibtex_key + ",\n" + ",\n".join(bibtex_fields) + "\n}"
+        return {"apa": apa, "gbt7714": gbt, "bibtex": bibtex}
+
+    @staticmethod
+    def _present_or_missing(value: str) -> str:
+        return value if str(value or "").strip() else "未提供"
+
+    @classmethod
+    def _fixed_paper_source_block(cls, *, paper_key: str, metadata: Dict[str, Any]) -> str:
+        title = cls._metadata_value(metadata, "title") or paper_key
+        authors = ", ".join(cls._author_names(metadata))
+        abstract = str(metadata.get("abstract") or "").strip()
+        doi = cls._metadata_value(metadata, "doi")
+        doi_url = cls._doi_url(doi)
+        arxiv_id = cls._metadata_value(metadata, "arxiv_id")
+        arxiv_url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else ""
+        citations = cls._citation_strings(paper_key=paper_key, metadata=metadata)
+        fields = metadata.get("fields_of_study")
+        fields_text = ", ".join(str(item).strip() for item in fields if str(item).strip()) if isinstance(fields, list) else cls._compact_text(fields)
+        return "\n".join(
+            [
+                "## 检索摘要、链接与引用",
+                "",
+                "> 下面信息由平台根据 `literature_search` / `literature_review_download_pdf` 元数据生成；缺失字段只标记为“未提供”，不由模型补写。",
+                "",
+                f"- paper_key：{paper_key}",
+                f"- 标题：{cls._present_or_missing(title)}",
+                f"- 作者：{cls._present_or_missing(authors)}",
+                f"- 年份：{cls._present_or_missing(cls._metadata_value(metadata, 'year'))}",
+                f"- 来源/会议期刊：{cls._present_or_missing(cls._metadata_value(metadata, 'venue'))}",
+                f"- 数据源：{cls._present_or_missing(cls._metadata_value(metadata, 'source'))}",
+                f"- 外部 ID：{cls._present_or_missing(cls._metadata_value(metadata, 'external_id'))}",
+                f"- DOI：{cls._present_or_missing(doi)}",
+                f"- DOI 链接：{cls._present_or_missing(doi_url)}",
+                f"- arXiv：{cls._present_or_missing(arxiv_id)}",
+                f"- arXiv 链接：{cls._present_or_missing(arxiv_url)}",
+                f"- 论文页面：{cls._present_or_missing(cls._metadata_value(metadata, 'url'))}",
+                f"- PDF URL：{cls._present_or_missing(cls._metadata_value(metadata, 'pdf_url'))}",
+                f"- 引用数：{cls._present_or_missing(cls._metadata_value(metadata, 'citation_count'))}",
+                f"- 参考文献数：{cls._present_or_missing(cls._metadata_value(metadata, 'reference_count'))}",
+                f"- 领域标签：{cls._present_or_missing(fields_text)}",
+                "",
+                "### 检索摘要",
+                "",
+                abstract if abstract else "未提供",
+                "",
+                "### 引用格式",
+                "",
+                f"- APA：{citations['apa']}",
+                f"- GB/T 7714：{citations['gbt7714']}",
+                "",
+                "```bibtex",
+                citations["bibtex"],
+                "```",
+            ]
+        )
+
+    @staticmethod
+    def _attach_fixed_paper_block(content: str, fixed_block: str, *, fallback_title: str) -> str:
+        body = str(content or "").strip()
+        if fixed_block in body:
+            return body
+        if body.startswith("# "):
+            lines = body.splitlines()
+            title_line = lines[0].strip()
+            rest = "\n".join(lines[1:]).strip()
+            return f"{title_line}\n\n{fixed_block}\n\n{rest}".strip()
+        return f"# {fallback_title}\n\n{fixed_block}\n\n{body}".strip()
+
+    @staticmethod
+    def _table_cell(value: Any) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        return text.replace("|", "\\|") if text else "未提供"
+
+    def _fixed_reference_catalog(self, *, root: Path, review_files: List[Path]) -> str:
+        rows = [
+            "| paper_key | 标题 | 作者 | 年份 | DOI | 链接 | PDF | APA | GB/T 7714 |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for path in review_files:
+            paper_key = self._safe_slug(path.stem, fallback=path.stem)
+            metadata = self._paper_metadata(root, paper_key)
+            citations = self._citation_strings(paper_key=paper_key, metadata=metadata)
+            doi = self._metadata_value(metadata, "doi")
+            doi_url = self._doi_url(doi)
+            arxiv_id = self._metadata_value(metadata, "arxiv_id")
+            arxiv_url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else ""
+            link = self._metadata_value(metadata, "url") or doi_url or arxiv_url
+            rows.append(
+                "| "
+                + " | ".join(
+                    [
+                        self._table_cell(paper_key),
+                        self._table_cell(self._metadata_value(metadata, "title")),
+                        self._table_cell(", ".join(self._author_names(metadata))),
+                        self._table_cell(self._metadata_value(metadata, "year")),
+                        self._table_cell(doi),
+                        self._table_cell(link),
+                        self._table_cell(self._metadata_value(metadata, "pdf_url")),
+                        self._table_cell(citations["apa"]),
+                        self._table_cell(citations["gbt7714"]),
+                    ]
+                )
+                + " |"
+            )
+        return "\n".join(["## 参考论文清单（固定元数据）", "", *rows])
+
+    @staticmethod
+    def _attach_fixed_reference_catalog(content: str, catalog: str) -> str:
+        body = str(content or "").strip()
+        if "## 参考论文清单（固定元数据）" in body:
+            return body
+        return f"{body}\n\n{catalog}".strip()
+
+    async def _write_paper_review(self, *, root: Path, review_id: str, topic: str, paper_key: str, md_path: Path, requirements: str) -> ToolResult:
+        markdown = md_path.read_text(encoding="utf-8")
+        metadata = self._paper_metadata(root, paper_key)
+        fixed_source_block = self._fixed_paper_source_block(paper_key=paper_key, metadata=metadata)
+        fallback_title = self._metadata_value(metadata, "title") or paper_key
+        system_prompt = (
+            "你是严谨的科研论文综述写作助手。只能依据用户提供的论文全文 Markdown 和元数据写作；"
+            "不要编造未出现的实验、结论、引用或比较。链接、DOI、引用格式只能使用平台提供的固定元数据块；"
+            "固定元数据块缺失的字段必须保持“未提供”。输出中文 Markdown。"
+        )
+        user_prompt = "\n".join(
+            [
+                f"综述主题：{topic}",
+                f"论文 key：{paper_key}",
+                f"论文元数据：{json.dumps(metadata, ensure_ascii=False, default=str)}",
+                f"额外要求：{requirements or '无'}",
+                "",
+                "下面是平台生成的固定元数据块。不要改写、补齐或删除其中的摘要、链接、DOI 和引用格式：",
+                fixed_source_block,
+                "",
+                "请为这篇论文生成一份用于后续总综述汇编的单篇 review Markdown。",
+                "不要重复固定元数据块；你的可生成部分结构固定为：",
+                "## 与综述主题的关系",
+                "## 核心问题与方法",
+                "## 关键发现",
+                "## 证据与实验",
+                "## 局限与争议",
+                "## 可纳入最终综述的要点",
+                "",
+                "下面是完整论文 Markdown：",
+                markdown,
+            ]
+        )
+        content = await self._call_llm(system_prompt=system_prompt, user_prompt=user_prompt)
+        if not content:
+            return ToolResult(
+                success=False,
+                output="review_writer 未生成内容。",
+                error="empty_review",
+                data={"literature_review_id": review_id, "paper_key": paper_key, "md_path": str(md_path)},
+            )
+        content = self._attach_fixed_paper_block(content, fixed_source_block, fallback_title=fallback_title)
+        review_path = root / "review" / f"{paper_key}.md"
+        review_path.write_text(content, encoding="utf-8")
+        self._update_manifest_paper(
+            root,
+            paper_key,
+            {
+                "md_path": str(md_path),
+                "review_path": str(review_path),
+                "review_chars": len(content),
+                "review_written_at": datetime.utcnow().isoformat(),
+            },
+        )
+        return ToolResult(
+            success=True,
+            output="\n".join(
+                [
+                    "单篇论文 review 已生成。",
+                    f"- literature_review_id: {review_id}",
+                    f"- paper_key: {paper_key}",
+                    f"- md_path: {md_path}",
+                    f"- review_path: {review_path}",
+                    f"- chars: {len(content)}",
+                ]
+            ),
+            data={
+                "literature_review_id": review_id,
+                "paper_key": paper_key,
+                "md_path": str(md_path),
+                "review_path": str(review_path),
+                "review_chars": len(content),
+            },
+        )
+
+    async def _write_final_review(self, *, root: Path, review_id: str, topic: str, requirements: str, target_paper_count: int) -> ToolResult:
+        review_dir = root / "review"
+        review_files = sorted(
+            path for path in review_dir.glob("*.md")
+            if path.is_file() and path.name != "final.md"
+        )
+        if len(review_files) < target_paper_count:
+            return ToolResult(
+                success=False,
+                output=(
+                    f"单篇 review 数量不足：当前 {len(review_files)} 篇，目标 {target_paper_count} 篇。"
+                    "请继续搜索、下载、read_full_pdf 并生成单篇 review，或显式降低 target_paper_count。"
+                ),
+                error="insufficient_reviews",
+                data={
+                    "literature_review_id": review_id,
+                    "review_count": len(review_files),
+                    "target_paper_count": target_paper_count,
+                    "review_dir": str(review_dir),
+                },
+            )
+        combined_reviews: List[str] = []
+        for path in review_files:
+            combined_reviews.append(f"\n\n<!-- source_review: {path.name} -->\n\n{path.read_text(encoding='utf-8')}")
+        fixed_reference_catalog = self._fixed_reference_catalog(root=root, review_files=review_files)
+        system_prompt = (
+            "你是科研综述作者。只能依据用户提供的单篇 review 汇总写最终综述；"
+            "不要补充未在单篇 review 中出现的事实。参考论文的 DOI、链接和引用格式只能使用平台提供的固定参考论文清单；"
+            "缺失字段必须保持“未提供”。必须围绕综述主题重新组织成一篇完整综述，而不是简单拼接摘要。"
+            "正文中的关键事实、方法、结论和比较必须用方括号引用对应 paper_key，例如 [10.1109-access.2020.3048415]。"
+            "文末必须包含“## 参考文献”，且只能使用固定参考论文清单中的论文与引用信息。输出中文 Markdown。"
+        )
+        user_prompt = "\n".join(
+            [
+                f"综述主题：{topic}",
+                f"单篇 review 数量：{len(review_files)}",
+                f"额外要求：{requirements or '无'}",
+                "",
+                "固定参考论文清单如下。最终文末如列参考论文，必须只使用这份清单中的 DOI、链接和引用格式，不得补写：",
+                fixed_reference_catalog,
+                "",
+                "请基于全部单篇 review 生成最终综述 Markdown。要求：",
+                "- 不是简单拼接，必须围绕主题综合归纳研究路线、共识、分歧、证据强弱和未来方向。",
+                "- 正文每个实质性论断、代表性工作比较、方法归纳后都要给出 paper_key 引用。",
+                "- 如果某个结论无法由单篇 review 支撑，必须删除或标记为证据不足，不得补写。",
+                "- 文末必须有“## 参考文献”，每条参考文献只能来自固定参考论文清单，优先采用 GB/T 7714 字段；缺失字段保持“未提供”。",
+                "",
+                "建议结构：",
+                "# 综述标题",
+                "## 摘要",
+                "## 研究背景与问题定义",
+                "## 主要研究路线",
+                "## 代表性工作比较",
+                "## 共识、分歧与证据强度",
+                "## 局限与未来方向",
+                "## 参考文献",
+                "",
+                "下面是全部单篇 review：",
+                "\n".join(combined_reviews),
+            ]
+        )
+        content = await self._call_llm(system_prompt=system_prompt, user_prompt=user_prompt)
+        if not content:
+            return ToolResult(
+                success=False,
+                output="review_writer 未生成最终综述。",
+                error="empty_final_review",
+                data={"literature_review_id": review_id, "review_count": len(review_files)},
+            )
+        content = self._attach_fixed_reference_catalog(content, fixed_reference_catalog)
+        final_path = review_dir / "final.md"
+        final_path.write_text(content, encoding="utf-8")
+        manifest = self._load_manifest(root)
+        manifest["final_review_path"] = str(final_path)
+        manifest["final_review_written_at"] = datetime.utcnow().isoformat()
+        manifest["final_review_source_count"] = len(review_files)
+        self._write_manifest(root, manifest)
+        return ToolResult(
+            success=True,
+            output=content,
+            data={
+                "literature_review_id": review_id,
+                "final_review_path": str(final_path),
+                "review_count": len(review_files),
+                "target_paper_count": target_paper_count,
+                "review_dir": str(review_dir),
+            },
+        )
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        review_id = self._review_id(kwargs.get("literature_review_id"))
+        root = self._review_root_for(review_id)
+        self._ensure_review_dirs(root)
+        topic = str(kwargs.get("topic") or "").strip()
+        requirements = str(kwargs.get("requirements") or "").strip()
+        mode = str(kwargs.get("mode") or "paper").strip().lower()
+        if mode == "final":
+            return await self._write_final_review(
+                root=root,
+                review_id=review_id,
+                topic=topic,
+                requirements=requirements,
+                target_paper_count=int(kwargs.get("target_paper_count") or 12),
+            )
+
+        paper_key = self._safe_slug(kwargs.get("paper_key"), fallback="")
+        md_path = self._resolve_md_for_paper(root, paper_key, str(kwargs.get("md_path") or ""))
+        if md_path is None:
+            return ToolResult(
+                success=False,
+                output="找不到完整论文 Markdown。请先调用 read_full_pdf，或传入综述目录内的 md_path。",
+                error="md_not_found",
+                data={"literature_review_id": review_id, "paper_key": paper_key, "root": str(root)},
+            )
+        if not paper_key:
+            paper_key = self._safe_slug(md_path.stem, fallback=f"paper-{uuid.uuid4().hex[:8]}")
+        return await self._write_paper_review(
+            root=root,
+            review_id=review_id,
+            topic=topic,
+            paper_key=paper_key,
+            md_path=md_path,
+            requirements=requirements,
+        )
+
+
 class DefaultToolProvider:
     """默认工具提供器：负责实例化工具，不负责注册。"""
 
@@ -10615,6 +10370,22 @@ class DefaultToolProvider:
                         conversation_id=int(ctx.conversation_id),
                     )
                 )
+                tools.extend(
+                    [
+                        DocumentArtifactReadTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            conversation_id=int(ctx.conversation_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        DocumentArtifactUpdateBlockTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            conversation_id=int(ctx.conversation_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                    ]
+                )
             tools.append(
                 KnowledgeSearchTool(
                     ctx.db,
@@ -10625,6 +10396,42 @@ class DefaultToolProvider:
             if str(getattr(ctx, "route_profile", "chat") or "chat").strip().lower() == "chat":
                 tools.extend(
                     [
+                        PaperSearchTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        ProjectTreeTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        ProjectReadFileTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        ProjectWriteFileTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        ProjectBashTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        ProjectClaudeTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        DocxGenerateWithClaudeTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                            conversation_id=ctx.conversation_id,
+                        ),
                         PaperResearchPrepareTool(
                             ctx.db,
                             int(ctx.user_id),
@@ -10635,122 +10442,7 @@ class DefaultToolProvider:
                             int(ctx.user_id),
                             db_session_factory=ctx.db_session_factory,
                         ),
-                        PaperResearchCloneRepoTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchArtifactManifestTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchReadArtifactTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchSearchOutputsTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchReadRepoFileTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchSearchRepoTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchGitStatusTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchGitDiffTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchGitLogTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchGitShowTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchRunAiderTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchReadAiderRunTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchTailAiderLogTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchAssessRepoMainpathTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchListOutputsTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchDeleteOutputTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchCleanupScopeTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchWriteGroundingReportTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchReadGroundingReportTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchWriteImplementationSpecTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchReadImplementationSpecTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchWriteRunDraftsTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchReadRunDraftsTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchInspectRuntimeTool(
+                        PaperResearchSearchProjectZoektTool(
                             ctx.db,
                             int(ctx.user_id),
                             db_session_factory=ctx.db_session_factory,
@@ -10761,48 +10453,6 @@ class DefaultToolProvider:
                             db_session_factory=ctx.db_session_factory,
                         ),
                         PaperResearchProbeUrlTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchWriteExecutionSpecTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchWriteExecutionScriptTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchReadExecutionSpecTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchStartExecutionTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                            conversation_id=ctx.conversation_id,
-                            route_profile=ctx.route_profile,
-                        ),
-                        PaperResearchReadExecutionTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchTailExecutionLogTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchCancelExecutionTool(
-                            ctx.db,
-                            int(ctx.user_id),
-                            db_session_factory=ctx.db_session_factory,
-                        ),
-                        PaperResearchCreateRunDraftTool(
                             ctx.db,
                             int(ctx.user_id),
                             db_session_factory=ctx.db_session_factory,
@@ -10819,6 +10469,12 @@ class DefaultToolProvider:
                 TextAnalysisTool(),
                 UnitConverterTool(),
                 LiteratureSearchTool(),
+                LiteratureReviewStartTool(user_id=ctx.user_id),
+                LiteratureReviewDownloadPdfTool(user_id=ctx.user_id),
+                LiteratureReviewJsonReadTool(user_id=ctx.user_id),
+                LiteratureReviewSearchZoektTool(user_id=ctx.user_id),
+                ReadFullPdfTool(user_id=ctx.user_id),
+                ReviewWriterTool(user_id=ctx.user_id),
             ]
         )
         return tools
@@ -10861,6 +10517,7 @@ class ToolRegistry:
             "unit_converter",
         },
         "literature_task": {"literature_search"},
+        "document_generation": {"docx_generate_with_claude"},
         "general_chat": {"datetime", "calculator", "text_analysis"},
     }
     _CODELAB_INTENT_TOOL_MAP: Dict[str, Set[str]] = {
@@ -10911,10 +10568,10 @@ class ToolRegistry:
     _CODELAB_NEGATIVE_KNOWLEDGE_PATTERNS: tuple[str, ...] = (
         r"(不要|别|不用|无需|不必|不能|禁止|先不要|暂时不要)\s*(查|用|走)?\s*(知识库|rag|向量检索|knowledge base|vector store|kb)",
     )
-    
+
     def __init__(
-        self, 
-        db: AsyncSession = None, 
+        self,
+        db: AsyncSession = None,
         db_session_factory: Optional[Callable[[], AsyncSession]] = None,
         user_id: int = None,
         conversation_id: Optional[int] = None,
@@ -10957,19 +10614,19 @@ class ToolRegistry:
         )
         self._mcp_tool_routes: Dict[str, List[str]] = self._load_mcp_tool_routes()
         self._register_default_tools()
-        
+
         # 如果提供了 Notebook 上下文，注册 Notebook 工具
         if notebook_id and kernel_manager:
             self._register_notebook_tools()
 
         if self._initialize_mcp:
             self._init_mcp_client_manager()
-    
+
     def _register_default_tools(self):
         """注册默认工具"""
         for tool in self._tool_provider.build_default_tools(self._tool_context):
             self.register(tool)
-    
+
     def _register_notebook_tools(self):
         """注册 Notebook 专用工具"""
         notebook_tools = self._tool_provider.build_notebook_tools(self._tool_context)
@@ -11521,6 +11178,25 @@ class ToolRegistry:
         if not text.strip():
             return "general_chat"
 
+        if any(
+            token in text
+            for token in [
+                "docx",
+                "word",
+                "生成文档",
+                "文档生成",
+                "生成word",
+                "生成 word",
+                "生成docx",
+                "生成 docx",
+                "写国基",
+                "国基",
+                "项目书",
+                "申请书",
+            ]
+        ):
+            return "document_generation"
+
         if any(token in text for token in ["论文", "文献", "paper", "arxiv", "pubmed", "citation"]):
             return "literature_task"
         if any(
@@ -11874,6 +11550,8 @@ class ToolRegistry:
         fallback_tools = self._fallback_tools()
         if self.route_profile == self._ROUTE_PROFILE_CODELAB:
             selected.update(name for name in fallback_tools if name in self._CODELAB_FALLBACK_ALLOWLIST)
+        elif resolved_intent == "document_generation":
+            pass
         else:
             selected.update(fallback_tools)
 
@@ -11916,15 +11594,15 @@ class ToolRegistry:
             names = set(self.select_tool_names_for_intent(intent, user_text=user_text))
             return [tool for tool in tools if tool.name in names]
         return tools
-    
+
     def register(self, tool: Tool):
         """注册工具"""
         self._tools[tool.name] = tool
-    
+
     def get(self, name: str) -> Optional[Tool]:
         """获取工具"""
         return self._tools.get(name) or self._mcp_tools.get(name)
-    
+
     def list_tools(
         self,
         *,
@@ -11950,7 +11628,7 @@ class ToolRegistry:
             }
             for tool in filtered_tools
         ]
-    
+
     def get_tools_description(
         self,
         *,
@@ -11967,7 +11645,7 @@ class ToolRegistry:
         ):
             params = tool.parameters.get('properties', {})
             required = tool.parameters.get('required', [])
-            
+
             params_desc = []
             for k, v in params.items():
                 param_str = f"{k}: {v.get('type', 'any')}"
@@ -11976,13 +11654,13 @@ class ToolRegistry:
                 if 'description' in v:
                     param_str += f" - {v['description']}"
                 params_desc.append(param_str)
-            
+
             descriptions.append(
                 f"**{tool.name}**: {tool.description}\n"
                 f"  参数: {', '.join(params_desc) if params_desc else '无'}"
             )
         return "\n\n".join(descriptions)
-    
+
     async def execute(self, tool_name: str, **kwargs) -> ToolResult:
         """执行工具"""
         local_tool = self._tools.get(tool_name)

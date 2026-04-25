@@ -156,6 +156,11 @@ class _FakeStreamingResponse:
         self.body_iterator = iterator
 
 
+async def _identity_skill_launch_request(request, *, user_id, db):
+    _ = user_id, db
+    return request
+
+
 @pytest.fixture(autouse=True)
 def _stub_compaction_service(monkeypatch):
     monkeypatch.setattr(chat_api, "get_conversation_context_compaction_service", lambda: _NoopCompactionService())
@@ -288,12 +293,9 @@ class _FakeSkillService:
         return SimpleNamespace(
             name="paper-reproduction",
             display_name="Paper Reproduction",
-            stage_names=("planning", "grounding", "implementation_prep", "run_drafts", "execution", "tuning"),
+            stage_names=("planning", "execution", "tuning"),
             stage_policies=(
                 "planning=manual",
-                "grounding=ask_to_continue",
-                "implementation_prep=ask_to_continue",
-                "run_drafts=ask_to_continue",
                 "execution=auto_continue",
                 "tuning=ask_to_continue",
             ),
@@ -334,9 +336,9 @@ def test_build_tool_event_workflow_control_payload_promotes_probe_stage(monkeypa
     )
 
     assert workflow_control is not None
-    assert workflow_control["stage"] == "grounding"
+    assert workflow_control["stage"] == "planning"
     assert workflow_control["stage_status"] == "running"
-    assert workflow_control["continue_policy"] == "ask_to_continue"
+    assert workflow_control["continue_policy"] == "manual"
     assert workflow_control.get("next_stage") is None
     assert workflow_control.get("action") is None
 
@@ -585,6 +587,7 @@ async def test_send_message_uses_skill_launch_renderer_but_persists_visible_mess
     monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
     monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
     monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(chat_api, "_normalize_skill_launch_request", _identity_skill_launch_request)
     monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: planner)
     monkeypatch.setattr(chat_api, "LLMService", _FakeLLMService)
 
@@ -620,7 +623,7 @@ async def test_send_message_uses_skill_launch_renderer_but_persists_visible_mess
         }
     ]
     assert planner.seen_messages[-1][-1]["content"] == "expanded::planning::111"
-    assert response["workflow_control"]["next_stage"] == "grounding"
+    assert response["workflow_control"]["next_stage"] == "execution"
     turn_store = await runtime_service.get_conversation_turn_store(57)
     assert turn_store["entries"][0]["user_content"] == "继续论文规划阶段（paper_id=111）"
 
@@ -645,6 +648,7 @@ async def test_send_message_stream_emits_workflow_control_for_skill_launch(monke
     monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
     monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
     monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(chat_api, "_normalize_skill_launch_request", _identity_skill_launch_request)
     monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: planner)
     monkeypatch.setattr(chat_api, "LLMService", _FakeStreamingLLMService)
 
@@ -672,8 +676,8 @@ async def test_send_message_stream_emits_workflow_control_for_skill_launch(monke
     joined = "".join(chunks)
     assert '"event": "done"' in joined
     assert '"workflow_control"' in joined
-    assert '"next_stage": "grounding"' in joined
-    assert '继续 证据落地阶段' in joined
+    assert '"next_stage": "execution"' in joined
+    assert '继续 执行阶段' in joined
 
 
 @pytest.mark.asyncio
@@ -734,6 +738,7 @@ async def test_send_message_stream_emits_running_workflow_control_on_probe_tool(
     monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
     monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
     monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(chat_api, "_normalize_skill_launch_request", _identity_skill_launch_request)
     monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: _ToolPlanner(runtime_service))
     monkeypatch.setattr(react_agent_module, "create_react_agent", lambda *args, **kwargs: _ToolAgent(runtime_service))
     monkeypatch.setattr(chat_api, "LLMService", _FakeStreamingLLMService)
@@ -761,9 +766,198 @@ async def test_send_message_stream_emits_running_workflow_control_on_probe_tool(
 
     joined = "".join(chunks)
     assert '"event": "action"' in joined
-    assert '"stage": "grounding"' in joined
+    assert '"stage": "planning"' in joined
     assert '"stage_status": "running"' in joined
     assert '"event": "done"' in joined
+
+
+@pytest.mark.asyncio
+async def test_normalize_skill_launch_request_resolves_project_and_builds_reference(monkeypatch, tmp_path):
+    paper = SimpleNamespace(
+        id=111,
+        title="Attention Is All You Need",
+        year=2017,
+        venue="NeurIPS",
+        arxiv_id="1706.03762",
+    )
+    captured = {}
+
+    async def _fake_get_owned_paper(db, *, user_id, paper_id):
+        _ = db
+        captured["paper_lookup"] = {"user_id": user_id, "paper_id": paper_id}
+        return paper
+
+    async def _fake_resolve_project(db, *, user_id, paper, project_id, goal):
+        _ = db, paper
+        captured["project_resolution"] = {"user_id": user_id, "project_id": project_id, "goal": goal}
+        return {"id": 9, "primary_paper_id": 111}
+
+    class _FakeBuilder:
+        def __init__(self, db):
+            captured["builder_db"] = db
+
+        @classmethod
+        def reference_bundle_ready(cls, project_dir):
+            captured["project_dir"] = str(project_dir)
+            return False
+
+        async def build(self, *, paper, project_id, user_id, refresh=False):
+            captured["builder_call"] = {
+                "paper_id": int(paper.id),
+                "project_id": int(project_id),
+                "user_id": int(user_id),
+                "refresh": bool(refresh),
+            }
+            return {"reference_ready": True}
+
+    monkeypatch.setattr(chat_api, "_get_owned_paper_for_skill_launch", _fake_get_owned_paper)
+    monkeypatch.setattr(chat_api, "_resolve_project_payload_for_skill_launch", _fake_resolve_project)
+    monkeypatch.setattr(chat_api, "ProjectReferenceBuilderService", _FakeBuilder)
+    monkeypatch.setattr(chat_api, "get_project_root_dir", lambda project_id: tmp_path / str(int(project_id)))
+
+    normalized = await chat_api._normalize_skill_launch_request(
+        ChatRequest(
+            skill_launch=ChatSkillLaunch(
+                skill_name="paper-reproduction",
+                stage="planning",
+                paper_id=111,
+                goal="run baseline",
+            ),
+            stream=True,
+        ),
+        user_id=7,
+        db=object(),
+    )
+
+    assert normalized.skill_launch is not None
+    assert normalized.skill_launch.paper_id == 111
+    assert normalized.skill_launch.project_id == 9
+    assert captured["paper_lookup"] == {"user_id": 7, "paper_id": 111}
+    assert captured["project_resolution"] == {"user_id": 7, "project_id": None, "goal": "run baseline"}
+    assert captured["builder_call"] == {
+        "paper_id": 111,
+        "project_id": 9,
+        "user_id": 7,
+        "refresh": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_message_normalizes_paper_skill_launch_before_rendering(monkeypatch):
+    conversation = Conversation(
+        id=61,
+        user_id=7,
+        title="测试对话",
+        llm_provider="aliyun",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    conversation.messages = []
+    runtime_service = _FakeRuntimeService()
+    planner = _FakePlanner(runtime_service)
+    skill_service = _FakeSkillService()
+
+    async def _normalize_request(request, *, user_id, db):
+        _ = user_id, db
+        return request.model_copy(
+            update={
+                "skill_launch": request.skill_launch.model_copy(
+                    update={"project_id": 9}
+                )
+            }
+        )
+
+    import app.services.react_agent as react_agent_module
+
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
+    monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(chat_api, "_normalize_skill_launch_request", _normalize_request)
+    monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: planner)
+    monkeypatch.setattr(chat_api, "LLMService", _FakeLLMService)
+
+    response = await chat_api.send_message(
+        ChatRequest(
+            message="继续论文规划阶段（paper_id=111）",
+            conversation_id=61,
+            stream=False,
+            use_tools=True,
+            skill_launch=ChatSkillLaunch(
+                skill_name="paper-reproduction",
+                stage="planning",
+                paper_id=111,
+            ),
+        ),
+        current_user=_User(),
+        db=_FakeDB(conversation),
+    )
+
+    assert response["message"].content == "direct answer"
+    assert skill_service.calls[-1]["payload"]["project_id"] == 9
+    assert planner.seen_messages[-1][-1]["content"] == "expanded::planning::111"
+
+
+@pytest.mark.asyncio
+async def test_create_chat_background_run_binds_conversation_after_stream_start(monkeypatch):
+    class _FakeBackgroundRuntimeService:
+        def __init__(self):
+            self.bind_calls = []
+            self.complete_calls = []
+            self.turn_entries = []
+            self.call_sequence = []
+
+        async def create_run(self, **kwargs):
+            self.create_kwargs = dict(kwargs)
+            return "bg-run-1"
+
+        async def bind_run_to_conversation(self, run_id, *, conversation_id):
+            self.bind_calls.append({"run_id": run_id, "conversation_id": conversation_id})
+            self.call_sequence.append(("bind", conversation_id))
+
+        async def complete_run(self, run_id, **kwargs):
+            self.complete_calls.append({"run_id": run_id, **dict(kwargs)})
+            self.call_sequence.append(("complete", kwargs.get("metadata", {}).get("conversation_id")))
+
+        async def append_chat_run_event(self, *args, **kwargs):
+            return None
+
+        async def upsert_conversation_turn_entry(self, conversation_id, payload):
+            self.turn_entries.append({"conversation_id": conversation_id, "payload": dict(payload)})
+
+    class _ImmediateBackgroundManager:
+        async def start(self, *, run_id, user_id, execute_fn, persist_event_fn=None):
+            _ = user_id, persist_event_fn
+
+            async def _publish(_event, _data):
+                return None
+
+            await execute_fn(_publish)
+            return {"run_id": run_id, "status": "completed"}
+
+    async def _fake_send_message(request, current_user, db):
+        _ = request, current_user, db
+
+        async def _iterator():
+            yield chat_api._sse_event("start", {"conversation_id": 88, "turn_id": "turn:88"}).encode("utf-8")
+            yield chat_api._sse_event("done", {"answer": "ok", "run_id": "inner-run-1"}).encode("utf-8")
+
+        return chat_api.StreamingResponse(_iterator(), media_type="text/event-stream")
+
+    runtime_service = _FakeBackgroundRuntimeService()
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_chat_background_run_manager", lambda: _ImmediateBackgroundManager())
+    monkeypatch.setattr(chat_api, "send_message", _fake_send_message)
+
+    response = await chat_api.create_chat_background_run(
+        ChatRequest(message="后台继续跑", stream=True),
+        current_user=_User(),
+    )
+
+    assert response["run_id"] == "bg-run-1"
+    assert runtime_service.bind_calls == [{"run_id": "bg-run-1", "conversation_id": 88}]
+    assert runtime_service.complete_calls[0]["run_id"] == "bg-run-1"
+    assert runtime_service.complete_calls[0]["metadata"]["conversation_id"] == 88
+    assert runtime_service.call_sequence == [("bind", 88), ("complete", 88)]
 
 
 @pytest.mark.asyncio

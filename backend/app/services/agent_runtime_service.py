@@ -437,6 +437,25 @@ class AgentRuntimeService:
             await db.commit()
         return run_id
 
+    async def bind_run_to_conversation(
+        self,
+        run_id: str,
+        *,
+        conversation_id: Optional[int],
+    ) -> None:
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id or conversation_id is None:
+            return
+        async with async_session_factory() as db:
+            result = await db.execute(select(AgentRun).where(AgentRun.id == normalized_run_id))
+            record = result.scalar_one_or_none()
+            if not record:
+                return
+            if record.conversation_id == int(conversation_id):
+                return
+            record.conversation_id = int(conversation_id)
+            await db.commit()
+
     async def complete_run(
         self,
         run_id: str,
@@ -530,11 +549,23 @@ class AgentRuntimeService:
             conversations = list(result.scalars().all())
             cleaned: List[Dict[str, Any]] = []
             for row in conversations:
+                run_result = await db.execute(
+                    select(AgentRun).where(AgentRun.conversation_id == int(row.id))
+                )
+                conversation_runs = list(run_result.scalars().all())
+                running_run_ids = {
+                    str(item.id)
+                    for item in conversation_runs
+                    if str(item.status or "").strip().lower() == "running"
+                }
+                non_running_run_ids = {
+                    str(item.id)
+                    for item in conversation_runs
+                    if str(item.status or "").strip().lower() != "running"
+                }
                 metadata = dict(row.metadata_ or {})
                 turn_payload = metadata.get("turn_store")
-                if not isinstance(turn_payload, dict):
-                    continue
-                turn_store = ConversationTurnStore.from_payload(turn_payload)
+                turn_store = ConversationTurnStore.from_payload(turn_payload if isinstance(turn_payload, dict) else None)
                 changed = False
                 for index, entry in enumerate(list(turn_store.entries or [])):
                     if str(entry.status or "").strip().lower() != "running":
@@ -567,9 +598,44 @@ class AgentRuntimeService:
                         }
                     )
                 if not changed:
+                    metadata, closed_tool_calls = self._close_dangling_conversation_tool_calls(
+                        metadata,
+                        running_run_ids=running_run_ids,
+                        non_running_run_ids=non_running_run_ids,
+                        cleanup_at=datetime.utcnow(),
+                    )
+                    if closed_tool_calls:
+                        changed = True
+                        cleaned.extend(
+                            {
+                                "conversation_id": int(row.id),
+                                "turn_id": str(item.get("turn_id") or ""),
+                                "run_id": str(item.get("run_id") or ""),
+                                "tool_call_id": str(item.get("tool_call_id") or ""),
+                            }
+                            for item in closed_tool_calls
+                        )
+                    if not changed:
+                        continue
+                    row.metadata_ = metadata
                     continue
                 turn_store.updated_at = datetime.utcnow().isoformat()
                 metadata["turn_store"] = turn_store.to_payload()
+                metadata, closed_tool_calls = self._close_dangling_conversation_tool_calls(
+                    metadata,
+                    running_run_ids=running_run_ids,
+                    non_running_run_ids=non_running_run_ids,
+                    cleanup_at=datetime.utcnow(),
+                )
+                cleaned.extend(
+                    {
+                        "conversation_id": int(row.id),
+                        "turn_id": str(item.get("turn_id") or ""),
+                        "run_id": str(item.get("run_id") or ""),
+                        "tool_call_id": str(item.get("tool_call_id") or ""),
+                    }
+                    for item in closed_tool_calls
+                )
                 row.metadata_ = metadata
             await db.commit()
         return {
@@ -577,6 +643,161 @@ class AgentRuntimeService:
             "cleaned_count": len(cleaned),
             "cleaned_turns": cleaned,
         }
+
+    def _close_dangling_conversation_tool_calls(
+        self,
+        metadata: Dict[str, Any],
+        *,
+        running_run_ids: set[str],
+        non_running_run_ids: set[str],
+        cleanup_at: datetime,
+    ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Close persisted tool calls that can no longer receive an observation."""
+        item_payload = metadata.get("item_stream") if isinstance(metadata.get("item_stream"), dict) else None
+        ledger_payload = metadata.get("tool_ledger") if isinstance(metadata.get("tool_ledger"), dict) else None
+        if not item_payload:
+            return metadata, []
+
+        item_stream = ConversationItemStreamStore.from_payload(item_payload)
+        tool_ledger = ToolLedgerStore.from_payload(ledger_payload)
+        turn_store = ConversationTurnStore.from_payload(
+            metadata.get("turn_store") if isinstance(metadata.get("turn_store"), dict) else None
+        )
+
+        item_result_keys = {
+            (str(entry.turn_id or ""), str(entry.tool_call_id or ""))
+            for entry in item_stream.entries
+            if str(entry.kind or "").strip().lower() == "tool_result"
+        }
+        ledger_result_keys = {
+            (str(entry.turn_id or ""), str(entry.tool_call_id or ""))
+            for entry in tool_ledger.entries
+            if str(entry.kind or "").strip().lower() == "tool_result"
+        }
+        turn_status_by_id = {
+            str(entry.turn_id or ""): str(entry.status or "").strip().lower()
+            for entry in turn_store.entries
+        }
+
+        closed: List[Dict[str, Any]] = []
+        created_at = cleanup_at.isoformat()
+        for entry in list(item_stream.entries or []):
+            if str(entry.kind or "").strip().lower() != "tool_call":
+                continue
+            if str(entry.status or "").strip().lower() not in {"started", "running", "pending"}:
+                continue
+            turn_id = str(entry.turn_id or "").strip()
+            tool_call_id = str(entry.tool_call_id or "").strip()
+            if not turn_id or not tool_call_id:
+                continue
+            key = (turn_id, tool_call_id)
+            if key in item_result_keys:
+                continue
+
+            run_id = str(entry.run_id or "").strip()
+            if run_id and run_id in running_run_ids:
+                continue
+            if run_id and non_running_run_ids and run_id not in non_running_run_ids:
+                continue
+            if not run_id and turn_status_by_id.get(turn_id) == "running":
+                continue
+
+            tool_name = str(entry.tool_name or "tool").strip() or "tool"
+            summary = f"tool={tool_name} failed, detail: run_stopped_before_result"
+            item_stream.append(
+                ConversationItemEntry(
+                    item_id=uuid.uuid4().hex,
+                    kind="tool_result",
+                    turn_id=entry.turn_id,
+                    role="tool",
+                    run_id=entry.run_id,
+                    iteration=entry.iteration,
+                    tool_name=entry.tool_name,
+                    tool_call_id=entry.tool_call_id,
+                    status="failed",
+                    arguments=dict(entry.arguments or {}) if isinstance(entry.arguments, dict) else None,
+                    summary=summary,
+                    success=False,
+                    error="run_stopped_before_result",
+                    permission_required=False,
+                    output_tokens_estimate=6,
+                    truncated=False,
+                    metadata={"source_kind": tool_name, "cleanup_reason": "dangling_tool_call"},
+                    created_at=created_at,
+                )
+            )
+            item_result_keys.add(key)
+            if key not in ledger_result_keys:
+                tool_ledger.append(
+                    ToolLedgerEntry(
+                        entry_id=uuid.uuid4().hex,
+                        kind="tool_result",
+                        tool_name=tool_name,
+                        turn_id=entry.turn_id,
+                        tool_call_id=entry.tool_call_id,
+                        run_id=entry.run_id,
+                        iteration=entry.iteration,
+                        status="failed",
+                        arguments=dict(entry.arguments or {}) if isinstance(entry.arguments, dict) else None,
+                        summary=summary,
+                        success=False,
+                        error="run_stopped_before_result",
+                        permission_required=False,
+                        output_tokens_estimate=6,
+                        truncated=False,
+                        metadata={"source_kind": tool_name, "cleanup_reason": "dangling_tool_call"},
+                        created_at=created_at,
+                    )
+                )
+                ledger_result_keys.add(key)
+            closed.append(
+                {
+                    "turn_id": turn_id,
+                    "run_id": run_id,
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                }
+            )
+
+        if not closed:
+            return metadata, []
+
+        call_counts_by_turn: Dict[str, int] = {}
+        result_counts_by_turn: Dict[str, int] = {}
+        for entry in item_stream.entries:
+            turn_id = str(entry.turn_id or "").strip()
+            if not turn_id:
+                continue
+            kind = str(entry.kind or "").strip().lower()
+            if kind == "tool_call":
+                call_counts_by_turn[turn_id] = call_counts_by_turn.get(turn_id, 0) + 1
+            elif kind == "tool_result":
+                result_counts_by_turn[turn_id] = result_counts_by_turn.get(turn_id, 0) + 1
+
+        for index, entry in enumerate(list(turn_store.entries or [])):
+            turn_id = str(entry.turn_id or "").strip()
+            turn_store.entries[index] = ConversationTurnEntry(
+                turn_id=entry.turn_id,
+                status="error" if str(entry.status or "").strip().lower() == "running" else entry.status,
+                user_message_id=entry.user_message_id,
+                assistant_message_id=entry.assistant_message_id,
+                run_id=entry.run_id,
+                user_content=entry.user_content,
+                assistant_summary=entry.assistant_summary,
+                iteration_count=entry.iteration_count,
+                tool_call_count=max(entry.tool_call_count, call_counts_by_turn.get(turn_id, 0)),
+                tool_result_count=max(entry.tool_result_count, result_counts_by_turn.get(turn_id, 0)),
+                error_message=entry.error_message
+                or ("dangling_tool_call_cleanup" if str(entry.status or "").strip().lower() == "running" else None),
+                started_at=entry.started_at,
+                completed_at=entry.completed_at
+                or (created_at if str(entry.status or "").strip().lower() == "running" else None),
+            )
+        turn_store.updated_at = created_at
+        metadata["item_stream"] = item_stream.to_payload()
+        metadata["tool_ledger"] = tool_ledger.to_payload()
+        metadata["turn_store"] = turn_store.to_payload()
+        return metadata, closed
 
     async def append_steps(self, run_id: str, steps: Iterable[Dict[str, Any]]) -> None:
         payload = list(steps)

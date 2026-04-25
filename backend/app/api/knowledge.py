@@ -766,6 +766,27 @@ async def _schedule_document_task(doc_id: int, chunk_size: int, chunk_overlap: i
         return True
 
 
+async def schedule_document_processing_task(doc_id: int, chunk_size: int, chunk_overlap: int) -> bool:
+    """Queue a document processing task behind the global ingestion semaphore."""
+    return await _schedule_document_task(
+        doc_id=int(doc_id),
+        chunk_size=int(chunk_size),
+        chunk_overlap=int(chunk_overlap),
+    )
+
+
+async def wait_for_document_processing_task(doc_id: int) -> bool:
+    """Wait for a queued/running document task in this process, if one exists."""
+    normalized_doc_id = int(doc_id)
+    lock = _get_active_document_tasks_lock()
+    async with lock:
+        task = _DOCUMENT_TASK_HANDLES.get(normalized_doc_id)
+    if task is None:
+        return False
+    await asyncio.shield(task)
+    return True
+
+
 async def _cancel_document_task(doc_id: int, *, wait_timeout_seconds: float = 5.0) -> bool:
     normalized_doc_id = int(doc_id)
     task: Optional[asyncio.Task] = None

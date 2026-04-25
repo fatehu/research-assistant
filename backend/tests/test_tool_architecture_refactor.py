@@ -91,7 +91,7 @@ async def test_tool_base_truncates_long_output_and_keeps_head_tail():
 
 
 @pytest.mark.asyncio
-async def test_web_search_prefers_serper_when_available(monkeypatch):
+async def test_web_search_prefers_tavily_when_available(monkeypatch):
     tool = agent_tools.WebSearchTool()
     tool.serper_api_key = "x"
     tool.tavily_api_key = "y"
@@ -115,8 +115,8 @@ async def test_web_search_prefers_serper_when_available(monkeypatch):
 
     result = await tool._execute("q", max_results=3)
     assert result.success is True
-    assert result.output == "serper ok"
-    assert calls == ["serper"]
+    assert result.output == "tavily ok"
+    assert calls == ["tavily"]
 
 
 @pytest.mark.asyncio
@@ -126,13 +126,13 @@ async def test_web_search_fallback_chain(monkeypatch):
     tool.tavily_api_key = "y"
     calls = []
 
-    async def _serper(*args, **kwargs):
-        calls.append("serper")
-        return _tool_result(False, "serper failed", error="serper_down")
-
     async def _tavily(*args, **kwargs):
         calls.append("tavily")
         return _tool_result(False, "tavily failed", error="tavily_down")
+
+    async def _serper(*args, **kwargs):
+        calls.append("serper")
+        return _tool_result(False, "serper failed", error="serper_down")
 
     async def _ddgs(*args, **kwargs):
         calls.append("ddgs")
@@ -145,7 +145,7 @@ async def test_web_search_fallback_chain(monkeypatch):
     result = await tool._execute("q", max_results=3)
     assert result.success is True
     assert result.output == "ddgs ok"
-    assert calls == ["serper", "tavily", "ddgs"]
+    assert calls == ["tavily", "serper", "ddgs"]
 
 
 @pytest.mark.asyncio
@@ -155,16 +155,16 @@ async def test_web_search_fallback_chain_when_provider_raises_request_error(monk
     tool.tavily_api_key = "y"
     calls = []
 
-    async def _serper(*args, **kwargs):
-        calls.append("serper")
-        raise httpx.ConnectError(
-            "dns failed",
-            request=httpx.Request("POST", "https://google.serper.dev/search"),
-        )
-
     async def _tavily(*args, **kwargs):
         calls.append("tavily")
-        return _tool_result(False, "tavily failed", error="tavily_down")
+        raise httpx.ConnectError(
+            "dns failed",
+            request=httpx.Request("POST", "https://api.tavily.com/search"),
+        )
+
+    async def _serper(*args, **kwargs):
+        calls.append("serper")
+        return _tool_result(False, "serper failed", error="serper_down")
 
     async def _ddgs(*args, **kwargs):
         calls.append("ddgs")
@@ -177,7 +177,7 @@ async def test_web_search_fallback_chain_when_provider_raises_request_error(monk
     result = await tool._execute("q", max_results=3)
     assert result.success is True
     assert result.output == "ddgs ok"
-    assert calls == ["serper", "tavily", "ddgs"]
+    assert calls == ["tavily", "serper", "ddgs"]
 
 
 @pytest.mark.asyncio

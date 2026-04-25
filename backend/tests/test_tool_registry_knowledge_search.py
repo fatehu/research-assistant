@@ -39,32 +39,17 @@ def test_tool_registry_registers_knowledge_search_only_when_db_available(monkeyp
     codelab = agent_tools.ToolRegistry(db=object(), user_id=1, route_profile="codelab")
 
     paper_tool_names = {
-        "paper_research_get_artifact_manifest",
+        "paper_search",
+        "project_tree",
+        "project_read_file",
+        "project_write_file",
+        "project_bash",
+        "project_claude",
         "paper_research_prepare",
-        "paper_research_assess_repo_mainpath",
-        "paper_research_list_outputs",
-        "paper_research_delete_output",
-        "paper_research_cleanup_scope",
-        "paper_research_search_outputs",
+        "paper_research_search_project_zoekt",
         "paper_research_probe_repo",
         "paper_research_probe_url",
-        "paper_research_git_status",
-        "paper_research_git_diff",
-        "paper_research_git_log",
-        "paper_research_git_show",
-        "paper_research_read_artifact",
-        "paper_research_read_grounding_report",
-        "paper_research_read_implementation_spec",
-        "paper_research_read_run_drafts",
-        "paper_research_read_repo_file",
-        "paper_research_search_repo",
         "paper_research_status",
-        "paper_research_tail_execution_log",
-        "paper_research_write_grounding_report",
-        "paper_research_write_execution_script",
-        "paper_research_write_implementation_spec",
-        "paper_research_write_run_drafts",
-        "paper_research_create_run_draft",
     }
 
     assert "knowledge_search" in with_db._tools
@@ -76,83 +61,6 @@ def test_tool_registry_registers_knowledge_search_only_when_db_available(monkeyp
     assert "knowledge_search" in codelab._tools
     assert paper_tool_names.isdisjoint(set(codelab._tools))
 
-
-def test_paper_research_workspace_missing_required_archives(tmp_path):
-    tool = agent_tools.PaperResearchStatusTool(db=None, user_id=1)
-    workspace_dir = tmp_path / "workspace"
-    workspace_dir.mkdir(parents=True)
-    assert tool._workspace_missing_required_archives(workspace_dir) is True
-    (workspace_dir / "paper_intake_result.json").write_text("{}", encoding="utf-8")
-    (workspace_dir / "paper_summary.json").write_text("{}", encoding="utf-8")
-    (workspace_dir / "experiment_spec.json").write_text("{}", encoding="utf-8")
-    (workspace_dir / "workspace_adapter_manifest.json").write_text("{}", encoding="utf-8")
-    assert tool._workspace_missing_required_archives(workspace_dir) is False
-    assert tool._workspace_missing_required_archives(workspace_dir, include_grounding=True) is True
-    (workspace_dir / "specs").mkdir(parents=True, exist_ok=True)
-    (workspace_dir / "specs" / "grounding_report.json").write_text("{}", encoding="utf-8")
-    assert tool._workspace_missing_required_archives(workspace_dir, include_grounding=True) is False
-
-
-def test_paper_research_grounding_report_is_canonical_artifact():
-    tool = agent_tools.PaperResearchStatusTool(db=None, user_id=1)
-    spec = tool._artifact_spec_for_path("specs/grounding_report.json")
-
-    assert spec is not None
-    assert spec["name"] == "grounding_report"
-    assert spec["content_type"] == "json"
-
-
-def test_paper_research_search_repo_python_fallback_finds_matches(tmp_path):
-    repo_dir = tmp_path / "paper_repo"
-    repo_dir.mkdir(parents=True)
-    (repo_dir / "train.py").write_text(
-        "parser.add_argument('--lr', type=float, default=1e-3)\n"
-        "parser.add_argument('--epochs', type=int, default=5)\n",
-        encoding="utf-8",
-    )
-    (repo_dir / "README.md").write_text("learning rate is configured in train.py\n", encoding="utf-8")
-
-    payload = agent_tools.PaperResearchSearchRepoTool._search_with_python_fallback(
-        repo_dir=repo_dir,
-        repo_files=["README.md", "train.py"],
-        query="lr",
-        max_results=10,
-        case_sensitive=False,
-        is_regex=False,
-        glob="*.py",
-    )
-
-    assert payload["engine"] == "python_fallback"
-    assert payload["returned_matches"] == 1
-    assert payload["matches"][0]["relative_path"] == "repo/source/train.py"
-    assert payload["matches"][0]["line_number"] == 1
-
-
-def test_paper_research_search_repo_schema_exposes_context_line_bounds():
-    schema = agent_tools.PaperResearchSearchRepoTool.parameters["properties"]["context_lines"]
-
-    assert schema["minimum"] == 0
-    assert schema["maximum"] == 20
-    assert "0-20" in schema["description"]
-
-
-@pytest.mark.asyncio
-async def test_paper_research_search_repo_validation_error_mentions_context_line_limit():
-    tool = agent_tools.PaperResearchSearchRepoTool(db=None, user_id=1)
-
-    result = await tool.execute(project_id=1, query="classification-results.sh", context_lines=30)
-
-    assert result.success is False
-    assert result.error == "validation_error"
-    assert "context_lines" in result.output
-    assert "20" in result.output
-
-
-def test_paper_research_read_repo_file_schema_mentions_search_first_when_path_uncertain():
-    schema = agent_tools.PaperResearchReadRepoFileTool.parameters["properties"]["repo_relative_path"]
-
-    assert "paper_research_search_repo" in schema["description"]
-    assert "不要臆测 `scripts/`" in schema["description"]
 
 
 def test_paper_research_tool_parameters_expose_input_model_constraints():

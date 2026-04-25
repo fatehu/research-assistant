@@ -231,7 +231,7 @@ stages:
     continue_policy: auto_continue
 artifacts:
   - path: planning/paper_intake_result.json
-  - path: drafts/run_drafts.json
+  - path: reference/paper/paper_interpretation.json
 """,
         encoding="utf-8",
     )
@@ -255,7 +255,7 @@ policy:
     assert resolution.blocked_tool_names == ("knowledge_search",)
     assert "Stages: planning -> execution" in resolution.active_prompt
     assert "Stage policies: planning=manual, execution=auto_continue" in resolution.active_prompt
-    assert "Key artifacts: planning/paper_intake_result.json, drafts/run_drafts.json" in resolution.active_prompt
+    assert "Key artifacts: planning/paper_intake_result.json, reference/paper/paper_interpretation.json" in resolution.active_prompt
     assert "Helper scripts: scripts/render_stage_prompt.py" in resolution.active_prompt
     assert "Continue policy: default=ask_to_continue; modes=manual, ask_to_continue, auto_continue" in resolution.active_prompt
     assert resolution.active_skills[0].config_path == "paper-reproduction/skill.yaml"

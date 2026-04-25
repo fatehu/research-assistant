@@ -175,6 +175,43 @@ class _PaperWorkflowTools:
         return ToolResult(success=True, output=f"ok:{tool_name}", data={})
 
 
+class _PaperSelfWorkTools:
+    def __init__(self):
+        self.executed = []
+
+    def get_tools_description(self, **kwargs) -> str:
+        include = kwargs.get("include_tool_names")
+        names = sorted(include) if include else [
+            "activate_skill",
+            "paper_research_status",
+            "paper_research_prepare",
+            "project_claude",
+            "project_bash",
+            "project_write_file",
+            "paper_research_start_execution",
+        ]
+        return "\n".join(f"- {name}: {name}" for name in names)
+
+    def list_tools(self, **kwargs):
+        include = kwargs.get("include_tool_names")
+        names = sorted(include) if include else [
+            "activate_skill",
+            "paper_research_status",
+            "paper_research_prepare",
+            "project_claude",
+            "project_bash",
+            "project_write_file",
+            "paper_research_start_execution",
+        ]
+        return _tool_defs(*names)
+
+    async def execute(self, tool_name: str, **kwargs):
+        self.executed.append((tool_name, dict(kwargs)))
+        if tool_name == "project_claude":
+            return ToolResult(success=False, output="Project Claude 调用 runtime-worker 失败。", error="project_claude_worker_failed", data={})
+        return ToolResult(success=True, output=f"ok:{tool_name}", data={})
+
+
 class _RouterAwareCodelabTools:
     route_profile = "codelab"
     notebook_id = "nb-route"
@@ -383,242 +420,6 @@ def test_system_prompt_uses_available_tools_without_intent_filtering(monkeypatch
     assert agent._last_tool_selection["intent"] == "general_chat"
     assert agent._last_tool_selection["selected_tools"] == ["web_search", "datetime", "calculator"]
     assert agent._last_tool_selection["tool_choice"] == "auto"
-
-
-@pytest.mark.asyncio
-async def test_paper_skill_blocks_final_answer_without_required_artifact_tool_call():
-    agent = ReActAgent(_DummyLLM(), _DummyTools(), max_iterations=3)
-    agent._last_tool_selection = {
-        "active_skill_names": ["paper-reproduction"],
-        "selected_tools": ["paper_research_write_run_drafts", "paper_research_read_run_drafts"],
-    }
-    context = AgentContext(
-        messages=[
-            {
-                "role": "user",
-                "content": "使用 paper-reproduction 修订 drafts/run_drafts.json，写入并读回。",
-            }
-        ]
-    )
-
-    events, done = await agent._finalize_function_calling_iteration(
-        context,
-        content="已完成 run_drafts 写入并读回。",
-        reasoning="",
-        parsed_calls=[],
-    )
-
-    assert done is False
-    assert context.final_answer == ""
-    assert events[-1]["type"] == "thought"
-    assert "paper_research_write_run_drafts" in context.messages[-1]["content"]
-
-
-@pytest.mark.asyncio
-async def test_paper_skill_execution_readback_does_not_require_run_drafts_write():
-    agent = ReActAgent(_DummyLLM(), _DummyTools(), max_iterations=3)
-    agent._last_tool_selection = {
-        "active_skill_names": ["paper-reproduction"],
-        "selected_tools": [
-            "paper_research_read_run_drafts",
-            "paper_research_read_execution_spec",
-            "paper_research_read_execution",
-        ],
-    }
-    context = AgentContext(
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "使用 paper-reproduction 继续 execution 阶段，"
-                    "读取 run_drafts 和 baseline_repro execution 结果，不要新建或重跑。"
-                ),
-            }
-        ],
-        steps=[
-            AgentStep(
-                step_type="action",
-                content="{}",
-                tool_name="paper_research_read_run_drafts",
-                tool_input={},
-            ),
-            AgentStep(
-                step_type="observation",
-                content="ok",
-                tool_name="paper_research_read_run_drafts",
-                tool_output="ok",
-                success=True,
-            ),
-            AgentStep(
-                step_type="action",
-                content="{}",
-                tool_name="paper_research_read_execution",
-                tool_input={},
-            ),
-            AgentStep(
-                step_type="observation",
-                content="failed",
-                tool_name="paper_research_read_execution",
-                tool_output="failed",
-                success=True,
-            ),
-        ],
-    )
-
-    events, done = await agent._finalize_function_calling_iteration(
-        context,
-        content="baseline_repro 已读回，状态 failed。",
-        reasoning="",
-        parsed_calls=[],
-    )
-
-    assert done is True
-    assert context.final_answer == "baseline_repro 已读回，状态 failed。"
-    assert events[-1] == {"type": "answer", "data": "baseline_repro 已读回，状态 failed。"}
-
-
-@pytest.mark.asyncio
-async def test_paper_skill_allows_failure_answer_after_write_attempt():
-    agent = ReActAgent(_DummyLLM(), _DummyTools(), max_iterations=3)
-    agent._last_tool_selection = {
-        "active_skill_names": ["paper-reproduction"],
-        "selected_tools": ["paper_research_write_run_drafts", "paper_research_read_run_drafts"],
-    }
-    context = AgentContext(
-        messages=[
-            {
-                "role": "user",
-                "content": "使用 paper-reproduction 修订 drafts/run_drafts.json，写入并读回。",
-            }
-        ],
-        steps=[
-            AgentStep(
-                step_type="action",
-                content="{}",
-                tool_name="paper_research_write_run_drafts",
-                tool_input={},
-            ),
-            AgentStep(
-                step_type="observation",
-                content="schema invalid",
-                tool_name="paper_research_write_run_drafts",
-                tool_output="schema invalid",
-                success=False,
-            ),
-        ],
-    )
-
-    events, done = await agent._finalize_function_calling_iteration(
-        context,
-        content="写入失败：schema invalid。",
-        reasoning="",
-        parsed_calls=[],
-    )
-
-    assert done is True
-    assert context.final_answer == "写入失败：schema invalid。"
-    assert events[-1] == {"type": "answer", "data": "写入失败：schema invalid。"}
-
-
-@pytest.mark.asyncio
-async def test_paper_skill_requires_readback_after_successful_run_drafts_write():
-    agent = ReActAgent(_DummyLLM(), _DummyTools(), max_iterations=3)
-    agent._last_tool_selection = {
-        "active_skill_names": ["paper-reproduction"],
-        "selected_tools": ["paper_research_write_run_drafts", "paper_research_read_run_drafts"],
-    }
-    context = AgentContext(
-        messages=[
-            {
-                "role": "user",
-                "content": "使用 paper-reproduction 修订 drafts/run_drafts.json，写入并读回。",
-            }
-        ],
-        steps=[
-            AgentStep(
-                step_type="action",
-                content="{}",
-                tool_name="paper_research_write_run_drafts",
-                tool_input={},
-            ),
-            AgentStep(
-                step_type="observation",
-                content="ok",
-                tool_name="paper_research_write_run_drafts",
-                tool_output="ok",
-                success=True,
-            ),
-        ],
-    )
-
-    events, done = await agent._finalize_function_calling_iteration(
-        context,
-        content="已写入并读回。",
-        reasoning="",
-        parsed_calls=[],
-    )
-
-    assert done is False
-    assert "paper_research_read_run_drafts" in context.messages[-1]["content"]
-
-
-@pytest.mark.asyncio
-async def test_paper_skill_run_drafts_request_does_not_require_implementation_spec_write():
-    agent = ReActAgent(_DummyLLM(), _DummyTools(), max_iterations=3)
-    agent._last_tool_selection = {
-        "active_skill_names": ["paper-reproduction"],
-        "selected_tools": ["paper_research_write_run_drafts", "paper_research_read_run_drafts"],
-    }
-    context = AgentContext(
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "修订 drafts/run_drafts.json，必须读取 specs/implementation_spec.json，"
-                    "写入 run_drafts 后读回确认。"
-                ),
-            }
-        ],
-        steps=[
-            AgentStep(
-                step_type="action",
-                content="{}",
-                tool_name="paper_research_write_run_drafts",
-                tool_input={},
-            ),
-            AgentStep(
-                step_type="observation",
-                content="ok",
-                tool_name="paper_research_write_run_drafts",
-                tool_output="ok",
-                success=True,
-            ),
-            AgentStep(
-                step_type="action",
-                content="{}",
-                tool_name="paper_research_read_run_drafts",
-                tool_input={},
-            ),
-            AgentStep(
-                step_type="observation",
-                content="ok",
-                tool_name="paper_research_read_run_drafts",
-                tool_output="ok",
-                success=True,
-            ),
-        ],
-    )
-
-    events, done = await agent._finalize_function_calling_iteration(
-        context,
-        content="已完成 run_drafts 写入和读回。",
-        reasoning="",
-        parsed_calls=[],
-    )
-
-    assert done is True
-    assert context.final_answer == "已完成 run_drafts 写入和读回。"
-    assert events[-1] == {"type": "answer", "data": "已完成 run_drafts 写入和读回。"}
 
 
 def test_context_debug_keeps_assembled_messages_and_provider_messages_separate():
@@ -1025,6 +826,140 @@ async def test_execute_single_tool_call_does_not_duplicate_pinned_paper_skill():
     assert state["decision_state"]["repo_edit_allowed"] is False
 
 
+def test_paper_reproduction_active_skill_hides_self_work_tools():
+    tools = _PaperSelfWorkTools()
+    agent = ReActAgent(
+        _DummyLLM(),
+        tools,
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(
+            user_id=1,
+            channel="chat",
+            conversation_id=321,
+            active_skill_names=["paper-reproduction"],
+        ),
+    )
+
+    agent._build_system_prompt(messages=[{"role": "user", "content": "继续真实数据集复现"}])
+
+    selected_tools = set(agent._last_tool_selection["selected_tools"])
+    assert "project_claude" in selected_tools
+    assert "paper_research_status" in selected_tools
+    assert "project_bash" not in selected_tools
+    assert "project_write_file" not in selected_tools
+    assert "paper_research_start_execution" not in selected_tools
+
+
+def test_paper_reproduction_active_skill_injects_session_system_prompt():
+    tools = _PaperSelfWorkTools()
+    agent = ReActAgent(
+        _DummyLLM(),
+        tools,
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(
+            user_id=1,
+            channel="chat",
+            conversation_id=321,
+            active_skill_names=["paper-reproduction"],
+        ),
+    )
+
+    prompt = agent._build_system_prompt(messages=[{"role": "user", "content": "继续论文复现"}])
+
+    assert "## Skill Session System Prompt" in prompt
+    assert "你是策划者和决策者，不是实施 worker" in prompt
+    assert "通过 `project_claude`" in prompt
+    assert "不能作为 Claude Code 不可用或失败后的实施 fallback" in prompt
+    assert "skill_system_prompt_tokens_estimate" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_paper_reproduction_blocks_stale_project_bash_selection():
+    tools = _PaperSelfWorkTools()
+    agent = ReActAgent(
+        _DummyLLM(),
+        tools,
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(
+            user_id=1,
+            channel="chat",
+            conversation_id=321,
+            active_skill_names=["paper-reproduction"],
+        ),
+    )
+    agent._last_tool_selection = {
+        "selected_tools": ["project_bash", "project_claude", "activate_skill"],
+        "active_skill_names": ["paper-reproduction"],
+    }
+    context = AgentContext(
+        messages=[],
+        conversation_state={
+            "active_skill_names": ["paper-reproduction"],
+            "workflow_binding": {"skill": "paper-reproduction", "project_id": 9, "paper_id": 113},
+        },
+    )
+
+    executed = await agent._execute_single_tool_call(
+        context,
+        ParsedToolCall(
+            call_id="call-project-bash",
+            name="project_bash",
+            arguments={"project_id": 9, "command": "python3 download_datasets.py --output-dir data"},
+            arguments_raw='{"project_id":9}',
+        ),
+        parallel_group="test",
+    )
+
+    assert executed.success is False
+    assert executed.error == "paper_reproduction_requires_claude_worker"
+    assert "project_claude" in executed.observation_output
+    assert "适用范围提示" in executed.observation_output
+    assert tools.executed == []
+
+
+@pytest.mark.asyncio
+async def test_project_claude_failure_observation_mentions_no_bash_fallback():
+    tools = _PaperSelfWorkTools()
+    agent = ReActAgent(
+        _DummyLLM(),
+        tools,
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(
+            user_id=1,
+            channel="chat",
+            conversation_id=321,
+            active_skill_names=["paper-reproduction"],
+        ),
+    )
+    agent._last_tool_selection = {
+        "selected_tools": ["project_claude", "activate_skill"],
+        "active_skill_names": ["paper-reproduction"],
+    }
+    context = AgentContext(
+        messages=[],
+        conversation_state={
+            "active_skill_names": ["paper-reproduction"],
+            "workflow_binding": {"skill": "paper-reproduction", "project_id": 9, "paper_id": 113},
+        },
+    )
+
+    executed = await agent._execute_single_tool_call(
+        context,
+        ParsedToolCall(
+            call_id="call-project-claude",
+            name="project_claude",
+            arguments={"project_id": 9, "prompt": "run real dataset reproduction"},
+            arguments_raw='{"project_id":9}',
+        ),
+        parallel_group="test",
+    )
+
+    assert executed.success is False
+    assert executed.error == "project_claude_worker_failed"
+    assert "唯一项目执行 worker" in executed.observation_output
+    assert "不能改用 `project_bash`" in executed.observation_output
+
+
 def test_chat_prompt_uses_default_routing_without_router(monkeypatch):
     monkeypatch.setattr(settings, "tool_selection_enabled", True)
     tools = _KnowledgeFollowupTools()
@@ -1041,6 +976,32 @@ def test_chat_prompt_uses_default_routing_without_router(monkeypatch):
     assert "优先调用 `knowledge_search`" not in prompt
     assert agent._last_tool_selection["intent"] == "general_chat"
     assert agent._last_tool_selection["routing_source"] == "default_agent"
+
+
+def test_apply_tool_call_overrides_backfills_paper_binding_for_paper_skill():
+    agent = ReActAgent(_DummyLLM(), _PaperWorkflowTools(), max_iterations=1)
+
+    effective_prepare = agent._apply_tool_call_overrides(
+        "paper_research_prepare",
+        {},
+        workflow_binding={"skill": "paper-reproduction", "paper_id": 113, "project_id": 8},
+    )
+    effective_project_read = agent._apply_tool_call_overrides(
+        "project_read_file",
+        {"relative_path": "reference/paper/paper_interpretation.md"},
+        workflow_binding={"skill": "paper-reproduction", "paper_id": 113, "project_id": 8},
+    )
+    explicit_args = agent._apply_tool_call_overrides(
+        "paper_research_prepare",
+        {"paper_id": 999, "project_id": 77},
+        workflow_binding={"skill": "paper-reproduction", "paper_id": 113, "project_id": 8},
+    )
+
+    assert effective_prepare["paper_id"] == 113
+    assert effective_prepare["project_id"] == 8
+    assert effective_project_read["project_id"] == 8
+    assert explicit_args["paper_id"] == 999
+    assert explicit_args["project_id"] == 77
 
 
 def test_system_prompt_includes_one_turn_rag_injection():

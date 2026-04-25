@@ -209,3 +209,85 @@ async def test_cleanup_stale_runs_marks_old_running_runs_as_error(monkeypatch):
     assert old_running.finished_at is not None
     assert old_running.metadata_["error"] == "stale_run_cleanup"
     assert recent_running.status == "running"
+
+
+def test_close_dangling_conversation_tool_calls_adds_failed_result():
+    service = AgentRuntimeService()
+    metadata = {
+        "turn_store": {
+            "version": "conversation_turn_store.v1",
+            "entries": [
+                {
+                    "turn_id": "turn:1",
+                    "status": "stopped",
+                    "tool_call_count": 1,
+                    "tool_result_count": 0,
+                }
+            ],
+        },
+        "tool_ledger": {
+            "version": "conversation_tool_ledger.v1",
+            "entries": [
+                {
+                    "entry_id": "call-entry",
+                    "kind": "tool_call",
+                    "tool_name": "knowledge_search",
+                    "turn_id": "turn:1",
+                    "tool_call_id": "call-1",
+                    "run_id": "run-1",
+                    "iteration": 1,
+                    "status": "started",
+                    "arguments": {"query": "classification"},
+                }
+            ],
+        },
+        "item_stream": {
+            "version": "conversation_item_stream.v1",
+            "entries": [
+                {
+                    "item_id": "item-call",
+                    "kind": "tool_call",
+                    "role": "tool",
+                    "tool_name": "knowledge_search",
+                    "turn_id": "turn:1",
+                    "tool_call_id": "call-1",
+                    "run_id": "run-1",
+                    "iteration": 1,
+                    "status": "started",
+                    "arguments": {"query": "classification"},
+                }
+            ],
+        },
+    }
+
+    updated, closed = service._close_dangling_conversation_tool_calls(
+        metadata,
+        running_run_ids=set(),
+        non_running_run_ids={"run-1"},
+        cleanup_at=datetime(2026, 4, 24, 8, 0, 0),
+    )
+
+    assert closed == [
+        {
+            "turn_id": "turn:1",
+            "run_id": "run-1",
+            "tool_call_id": "call-1",
+            "tool_name": "knowledge_search",
+        }
+    ]
+    item_results = [
+        item
+        for item in updated["item_stream"]["entries"]
+        if item["kind"] == "tool_result" and item["tool_call_id"] == "call-1"
+    ]
+    ledger_results = [
+        item
+        for item in updated["tool_ledger"]["entries"]
+        if item["kind"] == "tool_result" and item["tool_call_id"] == "call-1"
+    ]
+    assert item_results[0]["status"] == "failed"
+    assert item_results[0]["success"] is False
+    assert item_results[0]["error"] == "run_stopped_before_result"
+    assert ledger_results[0]["status"] == "failed"
+    assert updated["turn_store"]["entries"][0]["tool_call_count"] == 1
+    assert updated["turn_store"]["entries"][0]["tool_result_count"] == 1

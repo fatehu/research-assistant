@@ -325,54 +325,6 @@ class _RedundantKnowledgeSearchFCLLM:
 
 
 @pytest.mark.asyncio
-async def test_tool_result_ledger_summary_surfaces_structured_grounding_errors():
-    executed = ExecutedToolCall(
-        action_event={},
-        observation_event={},
-        tool_message={},
-        tool_name="paper_research_write_grounding_report",
-        observation_output="grounding_report JSON 未通过归档校验",
-        result_data={
-            "relative_path": "specs/grounding_report.json",
-            "structured_validation_errors": [
-                {
-                    "path": "dataset.sources",
-                    "code": "missing_probe_or_local_evidence",
-                    "message": "sogou_news 写成 grounded，但没有本轮 probe 证据。",
-                    "evidence_needed": "successful probe for dataset source url or local_presence.available=true",
-                    "suggested_tool_calls": [
-                        {
-                            "tool": "paper_research_probe_url",
-                            "args": {
-                                "project_id": 6,
-                                "url": "https://example.com/sogou",
-                                "resolve_download_gate": True,
-                            },
-                        }
-                    ],
-                }
-            ],
-        },
-        tool_call_id="call-1",
-        arguments={},
-        success=False,
-        error="grounding_report_invalid",
-        permission_required=False,
-        execution_time_ms=12.0,
-        output_tokens_estimate=0,
-        truncated=False,
-        metadata={},
-    )
-
-    summary = await ReActAgent._tool_result_ledger_summary_text(executed)
-
-    assert "paper_research_write_grounding_report" in summary
-    assert "dataset.sources" in summary
-    assert "missing_probe_or_local_evidence" in summary
-    assert "paper_research_probe_url" in summary
-
-
-@pytest.mark.asyncio
 async def test_budget_compression_times_out_instead_of_hanging(monkeypatch):
     class _HangingCompressionLLM:
         def __init__(self, provider):
@@ -397,43 +349,6 @@ async def test_budget_compression_times_out_instead_of_hanging(monkeypatch):
     assert "需要被压缩的长文本" in compressed
 
 
-class _RepeatedPaperRepoReadFCLLM:
-    provider = "test"
-    config = {"model": "test-model"}
-
-    def __init__(self):
-        self.calls = 0
-
-    def supports_function_calling(self):
-        return True
-
-    async def chat_with_tools(self, *args, **kwargs):
-        self.calls += 1
-        if self.calls in {1, 2}:
-            return {
-                "content": "",
-                "reasoning": "继续确认 classification-results.sh 的循环范围",
-                "tool_calls": [
-                    {
-                        "id": f"call_{self.calls}",
-                        "type": "function",
-                        "name": "paper_research_read_repo_file",
-                        "arguments": "{\"repo_relative_path\":\"scripts/classification-results.sh\",\"line_start\":80,\"line_end\":96}",
-                    }
-                ],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
-            }
-        return {
-            "content": "已确认脚本会遍历 8 个数据集；当前应直接报告 blocker，而不是继续读取同一脚本。",
-            "reasoning": "",
-            "tool_calls": [],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
-        }
-
-    async def chat(self, *args, **kwargs):
-        return {"content": "<answer>fallback</answer>"}
-
-
 class _NoopTools:
     def get_tools_description(self, **kwargs):
         return "- datetime: 时间"
@@ -448,27 +363,6 @@ class _NoopTools:
 class _ForbiddenRunDraftTools:
     async def execute(self, tool_name: str, **kwargs):
         raise AssertionError(f"tool should have been blocked before execution: {tool_name}")
-
-
-class _GroundingRefreshTools:
-    async def execute(self, tool_name: str, **kwargs):
-        assert tool_name in {
-            "paper_research_read_grounding_report",
-            "paper_research_write_grounding_report",
-        }
-        return ToolResult(success=True, output="ok", data={"tool_name": tool_name, "kwargs": kwargs})
-
-
-class _PassThroughPaperTools:
-    async def execute(self, tool_name: str, **kwargs):
-        assert tool_name.startswith("paper_research_")
-        return ToolResult(success=True, output="ok", data={"tool_name": tool_name, "kwargs": kwargs})
-
-
-class _PassThroughWebTools:
-    async def execute(self, tool_name: str, **kwargs):
-        assert tool_name in {"web_search", "web_scrape"}
-        return ToolResult(success=True, output="ok", data={"tool_name": tool_name, "kwargs": kwargs})
 
 
 class _KnowledgeIntentTools:
@@ -577,73 +471,6 @@ class _RepeatedExecutionSpecFailureTools:
         )
 
 
-class _RepeatedRunDraftFailureLLM:
-    provider = "test"
-    config = {"model": "test-model"}
-
-    def supports_function_calling(self):
-        return False
-
-    async def chat(self, *args, **kwargs):
-        return {
-            "content": """<think>继续修正 run_drafts</think><action>{"tool":"paper_research_write_run_drafts","input":{"project_id":4,"run_drafts":{"drafts":[{"id":"baseline_ag_news_fixed","kind":"baseline_repro","objective":"baseline","entrypoint":{"type":"repo_script","path_or_hint":"bash -c './classification-results-ag-news-only.sh'"},"evidence_files":["repo/source/classification-results.sh"]}]}}}</action>""",
-            "usage": {"prompt_tokens": 8, "completion_tokens": 8, "total_tokens": 16},
-        }
-
-
-class _RepeatedRunDraftFailureTools:
-    def get_tools_description(self, **kwargs):
-        return "- paper_research_write_run_drafts: 写入 run drafts"
-
-    async def execute(self, tool_name: str, **kwargs):
-        assert tool_name == "paper_research_write_run_drafts"
-        return ToolResult(
-            success=False,
-            output=(
-                "run_drafts JSON 未通过归档校验，未写入文件。\n"
-                "- drafts[0].entrypoint.path_or_hint references missing repo file `classification-results-ag-news-only.sh`. "
-                "Use readme_command/dataset_step/manual_step for README-only actions."
-            ),
-            error="run_drafts_schema_invalid",
-        )
-
-
-class _RepeatedRepoReadFailureLLM:
-    provider = "test"
-    config = {"model": "test-model"}
-
-    def supports_function_calling(self):
-        return False
-
-    async def chat(self, *args, **kwargs):
-        return {
-            "content": (
-                '<think>继续确认 classification-results.sh 的真实位置</think>'
-                '<action>{"tool":"paper_research_read_repo_file","input":{"project_id":142,'
-                '"repo_relative_path":"scripts/classification-results.sh","line_start":80,"line_end":96}}</action>'
-            ),
-            "usage": {"prompt_tokens": 8, "completion_tokens": 8, "total_tokens": 16},
-        }
-
-
-class _RepeatedRepoReadFailureTools:
-    def get_tools_description(self, **kwargs):
-        return "- paper_research_read_repo_file: 读取 repo 文件"
-
-    async def execute(self, tool_name: str, **kwargs):
-        assert tool_name == "paper_research_read_repo_file"
-        return ToolResult(
-            success=False,
-            output=(
-                "仓库文件不存在: `repo/source/scripts/classification-results.sh`。"
-                "这通常不是文件不可读，而是 repo_relative_path 猜错了。"
-                "如果不确定真实路径，请先调用 `paper_research_search_repo` 用文件名或关键字定位，"
-                "不要继续假设它在 `scripts/` 等目录下。"
-            ),
-            error="repo_file_not_found",
-        )
-
-
 class _SimpleExecuteTools:
     def get_tools_description(self, **kwargs):
         return "- datetime: 时间计算"
@@ -660,43 +487,6 @@ class _SimpleExecuteTools:
             data={"result": "12 年"},
             execution_time_ms=12.5,
             output_tokens_estimate=18,
-        )
-
-
-class _PaperRepoReadOnlyTools:
-    def get_tools_description(self, **kwargs):
-        return "- paper_research_read_repo_file: 读取 repo 文件"
-
-    def list_tools(self, **kwargs):
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": "paper_research_read_repo_file",
-                    "description": "read repo file",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "repo_relative_path": {"type": "string"},
-                            "line_start": {"type": "integer"},
-                            "line_end": {"type": "integer"},
-                        },
-                        "required": ["repo_relative_path"],
-                    },
-                },
-            }
-        ]
-
-    def get(self, _name: str):
-        return None
-
-    async def execute(self, tool_name: str, **kwargs):
-        assert tool_name == "paper_research_read_repo_file"
-        assert kwargs["repo_relative_path"] == "scripts/classification-results.sh"
-        return ToolResult(
-            success=True,
-            output="第 86 行是 for i in {0..7}，脚本会继续处理 8 个数据集。",
-            data={"relative_path": "scripts/classification-results.sh", "line_start": 86, "line_end": 86},
         )
 
 
@@ -865,307 +655,18 @@ async def test_function_calling_blocks_redundant_knowledge_search_after_success(
     assert done_events and "[来源1]" in str(done_events[0]["data"]["answer"])
 
 
-@pytest.mark.asyncio
-async def test_function_calling_interrupts_repeated_repo_reads_after_success():
-    agent = ReActAgent(_RepeatedPaperRepoReadFCLLM(), _PaperRepoReadOnlyTools(), max_iterations=4)
-
-    events = []
-    async for event in agent.run([{"role": "user", "content": "确认 classification-results.sh 的问题"}], stream=False):
-        events.append(event)
-
-    action_events = [event for event in events if event.get("type") == "action"]
-    thought_events = [event for event in events if event.get("type") == "thought"]
-    done_event = next(event for event in events if event.get("type") == "done")
-
-    assert len(action_events) == 2
-    assert any("重复读取同一 repo 目标" in str(event.get("data", "")) for event in thought_events)
-    assert "直接报告 blocker" in str(done_event["data"]["answer"])
-
-
-@pytest.mark.asyncio
-async def test_paper_grounding_requires_grounding_report_before_direct_answer():
-    agent = ReActAgent(_DirectAnswerFCLLM(), _NoopTools(), max_iterations=1)
-    agent._last_tool_selection = {"active_skill_names": ["paper-reproduction"]}
-
-    context = AgentContext(
-        messages=[{"role": "user", "content": "继续 grounding"}],
-        conversation_state={"workflow_binding": {"skill": "paper-reproduction", "current_stage": "grounding"}},
-        steps=[
-            AgentStep(
-                step_type="action",
-                content="probe url",
-                tool_name="paper_research_probe_url",
-                tool_input={"url": "https://example.com/ag_news.csv"},
-            ),
-            AgentStep(
-                step_type="observation",
-                content="probe ok",
-                tool_name="paper_research_probe_url",
-                success=True,
-            ),
-        ],
-    )
-
-    missing = agent._missing_required_paper_skill_tool_calls(context)
-    assert "paper_research_write_grounding_report" in missing
-
-    events, done = await agent._finalize_function_calling_iteration(
-        context,
-        content="grounding 已完成，可以进入下一阶段。",
-        reasoning="",
-        parsed_calls=[],
-    )
-
-    assert done is False
-    assert any("真实 paper_research 工具调用" in str(event.get("data", "")) for event in events if event.get("type") == "thought")
-    assert context.messages[-1]["role"] == "user"
-    assert "paper_research_write_grounding_report" in str(context.messages[-1]["content"])
-
-
-@pytest.mark.asyncio
-async def test_paper_read_only_grounding_summary_can_answer_without_rewriting_report():
-    agent = ReActAgent(_DirectAnswerFCLLM(), _NoopTools(), max_iterations=1)
-    agent._last_tool_selection = {"active_skill_names": ["paper-reproduction"]}
-
-    context = AgentContext(
-        messages=[{"role": "user", "content": "读取并总结当前 grounding_report"}],
-        conversation_state={"workflow_binding": {"skill": "paper-reproduction", "current_stage": "grounding"}},
-        steps=[
-            AgentStep(
-                step_type="action",
-                content="read grounding report",
-                tool_name="paper_research_read_grounding_report",
-            ),
-            AgentStep(
-                step_type="observation",
-                content="overall_status=blocked",
-                tool_name="paper_research_read_grounding_report",
-                success=True,
-            ),
-        ],
-    )
-
-    missing = agent._missing_required_paper_skill_tool_calls(context)
-    assert "paper_research_write_grounding_report" not in missing
-
-
-@pytest.mark.asyncio
-async def test_paper_workflow_binding_still_requires_real_tool_call_for_followup_request():
-    agent = ReActAgent(_DirectAnswerFCLLM(), _NoopTools(), max_iterations=1)
-    agent._last_tool_selection = {"active_skill_names": ["paper-reproduction"]}
-
-    context = AgentContext(
-        messages=[{"role": "user", "content": "重新跑一次"}],
-        conversation_state={
-            "workflow_binding": {
-                "skill": "paper-reproduction",
-                "current_stage": "grounding",
-                "paper_id": 113,
-                "project_id": 6,
-                "workspace_id": 6,
-            }
-        },
-        steps=[],
-    )
-
-    missing = agent._missing_required_paper_skill_tool_calls(context)
-    assert "any paper_research_* tool call" in missing
-
-    events, done = await agent._finalize_function_calling_iteration(
-        context,
-        content="Grounding 已重新完成，可以继续。",
-        reasoning="",
-        parsed_calls=[],
-    )
-
-    assert done is False
-    assert any(
-        "真实 paper_research 工具调用" in str(event.get("data", ""))
-        for event in events
-        if event.get("type") == "thought"
-    )
-
-
-def test_grounding_blocked_without_alternative_candidates_prefers_alternative_source_search():
-    row = ExecutedToolCall(
-        action_event={},
-        observation_event={},
-        tool_message={},
-        tool_name="paper_research_write_grounding_report",
-        observation_output="ok",
-        result_data={
-            "grounding_ready": False,
-            "content": {
-                "dataset": {"status": "blocked", "alternative_source_candidates": []},
-                "external_dependencies": {"status": "blocked", "alternative_source_candidates": []},
-                "summary": {
-                    "repo_grounded": True,
-                    "entrypoint_grounded": True,
-                    "dataset_grounded": False,
-                    "runtime_grounded": False,
-                    "external_dependencies_grounded": False,
-                    "overall_status": "blocked",
-                },
-            },
-        },
-        tool_call_id="call-1",
-        arguments={},
-        success=True,
-        error=None,
-        permission_required=False,
-        execution_time_ms=1.0,
-        output_tokens_estimate=10,
-        truncated=False,
-    )
-
-    message, decision = ReActAgent._tool_workflow_next_action(
-        [row],
-        paper_skill_active=True,
-        repo_edit_allowed=True,
-        workflow_binding={"current_stage": "grounding"},
-    )
-
-    assert "替代源搜索" in message
-    assert decision["next_action"] == "search_alternative_sources"
-    assert "web_search" in decision["allowed_actions"]
-
-
-@pytest.mark.asyncio
-async def test_paper_tools_are_not_hard_blocked_by_decision_state_allowed_actions():
-    agent = ReActAgent(_DirectAnswerFCLLM(), _PassThroughPaperTools(), max_iterations=1)
-    context = AgentContext(
-        messages=[{"role": "user", "content": "继续复现"}],
-        conversation_state={
-            "workflow_binding": {"skill": "paper-reproduction", "current_stage": "grounding"},
-            "decision_state": {
-                "status": "blocked",
-                "next_action": "report_blocker",
-                "allowed_actions": ["report_blocker", "read_grounding_report"],
-            },
-        },
-    )
-    call = ParsedToolCall(
-        name="paper_research_write_run_drafts",
-        arguments={"project_id": 6, "run_drafts": {"drafts": []}},
-        call_id="call_1",
-        arguments_raw='{"project_id":6,"run_drafts":{"drafts":[]}}',
-    )
-
-    executed = await agent._execute_single_tool_call(context, call, parallel_group="iter-1-test")
-
-    assert executed.success is True
-    assert executed.error is None
-    assert executed.result_data["tool_name"] == "paper_research_write_run_drafts"
-
-
-@pytest.mark.asyncio
-async def test_paper_web_search_is_not_blocked_by_decision_state_allowed_actions():
-    agent = ReActAgent(_DirectAnswerFCLLM(), _PassThroughWebTools(), max_iterations=1)
-    context = AgentContext(
-        messages=[{"role": "user", "content": "搜索 AG News 官方数据集来源"}],
-        conversation_state={
-            "workflow_binding": {"skill": "paper-reproduction", "current_stage": "grounding"},
-            "decision_state": {
-                "status": "blocked",
-                "next_action": "report_blocker",
-                "allowed_actions": ["report_blocker"],
-            },
-        },
-    )
-    call = ParsedToolCall(
-        name="web_search",
-        arguments={"query": "AG News dataset official source", "max_results": 5},
-        call_id="call_web_1",
-        arguments_raw='{"query":"AG News dataset official source","max_results":5}',
-    )
-
-    executed = await agent._execute_single_tool_call(context, call, parallel_group="iter-1-test")
-
-    assert executed.success is True
-    assert executed.error is None
-    assert executed.result_data["tool_name"] == "web_search"
-
-
-@pytest.mark.asyncio
-async def test_grounding_rerun_request_can_bypass_blocked_decision_state_for_read_grounding_report():
-    agent = ReActAgent(_DirectAnswerFCLLM(), _GroundingRefreshTools(), max_iterations=1)
-    context = AgentContext(
-        messages=[{"role": "user", "content": "再做一次grounding"}],
-        conversation_state={
-            "workflow_binding": {
-                "skill": "paper-reproduction",
-                "current_stage": "grounding",
-                "paper_id": 113,
-                "project_id": 6,
-                "workspace_id": 6,
-            },
-            "decision_state": {
-                "status": "blocked",
-                "next_action": "report_blocker",
-                "allowed_actions": ["report_blocker"],
-            },
-        },
-    )
-    call = ParsedToolCall(
-        name="paper_research_read_grounding_report",
-        arguments={"project_id": 6, "mode": "full"},
-        call_id="call_refresh_read",
-        arguments_raw='{"project_id":6,"mode":"full"}',
-    )
-
-    executed = await agent._execute_single_tool_call(context, call, parallel_group="iter-1-test")
-
-    assert executed.success is True
-    assert executed.error is None
-    assert executed.result_data["tool_name"] == "paper_research_read_grounding_report"
-
-
-@pytest.mark.asyncio
-async def test_grounding_rerun_request_can_bypass_blocked_decision_state_for_write_grounding_report():
-    agent = ReActAgent(_DirectAnswerFCLLM(), _GroundingRefreshTools(), max_iterations=1)
-    context = AgentContext(
-        messages=[{"role": "user", "content": "重新跑一次 grounding"}],
-        conversation_state={
-            "workflow_binding": {
-                "skill": "paper-reproduction",
-                "current_stage": "grounding",
-                "paper_id": 113,
-                "project_id": 6,
-                "workspace_id": 6,
-            },
-            "decision_state": {
-                "status": "blocked",
-                "next_action": "report_blocker",
-                "allowed_actions": ["report_blocker"],
-            },
-        },
-    )
-    call = ParsedToolCall(
-        name="paper_research_write_grounding_report",
-        arguments={"project_id": 6, "grounding_report": {"summary": {}}},
-        call_id="call_refresh_write",
-        arguments_raw='{"project_id":6,"grounding_report":{"summary":{}}}',
-    )
-
-    executed = await agent._execute_single_tool_call(context, call, parallel_group="iter-1-test")
-
-    assert executed.success is True
-    assert executed.error is None
-    assert executed.result_data["tool_name"] == "paper_research_write_grounding_report"
-
-
-def test_tool_workflow_next_action_prefers_execution_after_repo_evidence():
+def test_tool_workflow_next_action_keeps_project_exploration_after_repo_evidence():
     message, decision = ReActAgent._tool_workflow_next_action(
         [
             ExecutedToolCall(
                 action_event={},
                 observation_event={},
                 tool_message={},
-                tool_name="paper_research_read_repo_file",
-                observation_output="README and script read",
-                result_data={},
-                tool_call_id="call_repo_1",
-                arguments={"project_id": 6, "repo_relative_path": "classification-results.sh"},
+                tool_name="paper_research_search_project_zoekt",
+                observation_output="matched key files",
+                result_data={"matched_file_count": 4, "returned_matches": 20, "query": "supervised"},
+                tool_call_id="call_repo_search_1",
+                arguments={"project_id": 6, "query": "supervised"},
                 success=True,
                 error=None,
                 permission_required=False,
@@ -1176,40 +677,31 @@ def test_tool_workflow_next_action_prefers_execution_after_repo_evidence():
         ],
         paper_skill_active=True,
         repo_edit_allowed=False,
-        workflow_binding={"current_stage": "grounding"},
+        workflow_binding={"current_stage": "planning"},
     )
 
-    assert "repo-first execution" in message
-    assert decision["next_action"] == "write_execution_spec"
-    assert "write_execution_spec" in decision["allowed_actions"]
-    assert "start_execution" in decision["allowed_actions"]
-    assert "write_grounding_report" in decision["allowed_actions"]
+    assert "继续用 `project_tree`" in message
+    assert decision["next_action"] == "inspect_project"
+    assert "inspect_project" in decision["allowed_actions"]
+    assert "search_repo" in decision["allowed_actions"]
+    assert "synthesize" in decision["allowed_actions"]
+    assert "write_execution_spec" not in decision["allowed_actions"]
+    assert "launch_claude_code" not in decision["allowed_actions"]
+    assert "run_aider" not in decision["allowed_actions"]
 
 
-def test_tool_workflow_next_action_does_not_force_implementation_after_grounding_report():
+def test_tool_workflow_next_action_does_not_suggest_execution_after_search():
     message, decision = ReActAgent._tool_workflow_next_action(
         [
             ExecutedToolCall(
                 action_event={},
                 observation_event={},
                 tool_message={},
-                tool_name="paper_research_write_grounding_report",
-                observation_output="saved grounding report",
-                result_data={
-                    "grounding_ready": True,
-                    "content": {
-                        "summary": {
-                            "repo_grounded": True,
-                            "entrypoint_grounded": True,
-                            "dataset_grounded": True,
-                            "runtime_grounded": True,
-                            "external_dependencies_grounded": True,
-                            "overall_status": "grounded",
-                        }
-                    },
-                },
-                tool_call_id="call_grounding_1",
-                arguments={"project_id": 6},
+                tool_name="paper_research_search_project_zoekt",
+                observation_output="dictionary.cc matched",
+                result_data={"matched_file_count": 1, "returned_matches": 2, "query": "file:dictionary.cc getLine"},
+                tool_call_id="call_repo_search_2",
+                arguments={"project_id": 6, "query": "file:dictionary.cc getLine"},
                 success=True,
                 error=None,
                 permission_required=False,
@@ -1220,13 +712,14 @@ def test_tool_workflow_next_action_does_not_force_implementation_after_grounding
         ],
         paper_skill_active=True,
         repo_edit_allowed=True,
-        workflow_binding={"current_stage": "grounding"},
+        workflow_binding={"current_stage": "planning"},
     )
 
-    assert "repo-first execution" in message
-    assert decision["next_action"] == "write_execution_spec"
-    assert "start_execution" in decision["allowed_actions"]
-    assert "write_implementation_spec" in decision["allowed_actions"]
+    assert "reference / repo / runtime 证据已更新" in message
+    assert decision["next_action"] == "inspect_project"
+    assert "inspect_project" in decision["allowed_actions"]
+    assert "synthesize" in decision["allowed_actions"]
+    assert "write_execution_spec" not in decision["allowed_actions"]
 
 
 @pytest.mark.asyncio
@@ -1247,62 +740,6 @@ async def test_agent_stops_after_repeated_same_tool_failures(monkeypatch):
     assert "已停止自动重试" in str(done_events[0]["data"]["answer"])
 
 
-def test_grounding_probe_failures_do_not_trigger_generic_failure_streak():
-    agent = ReActAgent(_DirectAnswerFCLLM(), _NoopTools(), max_iterations=1)
-    context = AgentContext(
-        messages=[{"role": "user", "content": "继续 grounding"}],
-        conversation_state={"workflow_binding": {"skill": "paper-reproduction", "current_stage": "grounding"}},
-    )
-    events = [
-        {
-            "type": "observation",
-            "data": {
-                "tool": "paper_research_probe_url",
-                "success": False,
-                "error": "url_probe_failed",
-                "output": "HTTP 403",
-                "data": {"status_code": 403, "diagnosis": "http_403"},
-            },
-        },
-        {
-            "type": "observation",
-            "data": {
-                "tool": "paper_research_probe_url",
-                "success": False,
-                "error": "url_probe_failed",
-                "output": "HTTP 404",
-                "data": {"status_code": 404, "diagnosis": "http_404"},
-            },
-        },
-        {
-            "type": "observation",
-            "data": {
-                "tool": "paper_research_probe_url",
-                "success": False,
-                "error": "url_probe_failed",
-                "output": "license gate",
-                "data": {"diagnosis": "license_gate"},
-            },
-        },
-        {
-            "type": "observation",
-            "data": {
-                "tool": "paper_research_probe_url",
-                "success": False,
-                "error": "url_probe_failed",
-                "output": "drive confirm gate",
-                "data": {"status_code": 200, "diagnosis": "gdrive_confirm_required", "page_kind": "download_gate"},
-            },
-        },
-    ]
-
-    message = agent._maybe_stop_after_repeated_tool_failures(context, events)
-
-    assert message is None
-    assert context.state.name == "IDLE"
-    assert context.tool_failure_streaks.get("paper_research_probe_url", 0) == 0
-
-
 @pytest.mark.asyncio
 async def test_agent_stops_repeated_execution_spec_failures_with_script_guidance(monkeypatch):
     monkeypatch.setattr(settings, "agent_tool_failure_streak_limit", 3, raising=False)
@@ -1321,48 +758,6 @@ async def test_agent_stops_repeated_execution_spec_failures_with_script_guidance
     assert done_events
     assert "execution_intent.entrypoint_type=\"repo_script\"" in str(done_events[0]["data"]["answer"])
     assert "command=[\"./classification-results.sh\"]" in str(done_events[0]["data"]["answer"])
-    assert done_events[0]["data"]["iterations"] == 3
-
-
-@pytest.mark.asyncio
-async def test_agent_stops_repeated_run_drafts_failures_with_schema_guidance(monkeypatch):
-    monkeypatch.setattr(settings, "agent_tool_failure_streak_limit", 3, raising=False)
-    agent = ReActAgent(_RepeatedRunDraftFailureLLM(), _RepeatedRunDraftFailureTools(), max_iterations=8)
-
-    events = []
-    async for event in agent.run([{"role": "user", "content": "继续修正 AG News run_drafts"}], stream=False):
-        events.append(event)
-
-    action_events = [event for event in events if event.get("type") == "action"]
-    thought_events = [event for event in events if event.get("type") == "thought"]
-    done_events = [event for event in events if event.get("type") == "done"]
-
-    assert len(action_events) == 3
-    assert any("entrypoint schema" in str(event.get("data", "")) for event in thought_events)
-    assert done_events
-    assert "不能写 shell wrapper" in str(done_events[0]["data"]["answer"])
-    assert "paper_research_write_execution_script" in str(done_events[0]["data"]["answer"])
-    assert done_events[0]["data"]["iterations"] == 3
-
-
-@pytest.mark.asyncio
-async def test_agent_stops_repeated_repo_read_failures_with_search_guidance(monkeypatch):
-    monkeypatch.setattr(settings, "agent_tool_failure_streak_limit", 3, raising=False)
-    agent = ReActAgent(_RepeatedRepoReadFailureLLM(), _RepeatedRepoReadFailureTools(), max_iterations=8)
-
-    events = []
-    async for event in agent.run([{"role": "user", "content": "继续定位 classification-results.sh"}], stream=False):
-        events.append(event)
-
-    action_events = [event for event in events if event.get("type") == "action"]
-    thought_events = [event for event in events if event.get("type") == "thought"]
-    done_events = [event for event in events if event.get("type") == "done"]
-
-    assert len(action_events) == 3
-    assert any("先 search_repo" in str(event.get("data", "")) or "真实路径" in str(event.get("data", "")) for event in thought_events)
-    assert done_events
-    assert "paper_research_search_repo" in str(done_events[0]["data"]["answer"])
-    assert "repo_relative_path 猜错了" in str(done_events[0]["data"]["answer"])
     assert done_events[0]["data"]["iterations"] == 3
 
 
@@ -1407,6 +802,53 @@ async def test_execute_tool_calls_persists_tool_ledger_entries():
     assert "datetime" in str(runtime_service.item_entries[0]["summary"])
     assert runtime_service.item_entries[0]["metadata"]["workflow_summary"]["decision_state"]["next_action"] == "synthesize"
     assert runtime_service.context_states[0]["decision_state"]["next_action"] == "synthesize"
+
+
+@pytest.mark.asyncio
+async def test_finalize_function_calling_iteration_appends_internal_work_log(monkeypatch):
+    runtime_service = _ToolLedgerRuntimeService()
+    agent = ReActAgent(
+        llm_service=_DirectAnswerFCLLM(),
+        tool_registry=_SimpleExecuteTools(),
+        runtime_context=AgentRuntimeContext(user_id=7, channel="chat", conversation_id=54),
+        runtime_service=runtime_service,
+    )
+    context = AgentContext(
+        messages=[{"role": "user", "content": "调研注意力机制最早的论文"}],
+        iteration=1,
+        run_id="run-1",
+    )
+
+    async def _fake_work_log(_context, _executed):
+        return "已做: 读取时间线线索\n发现: Bahdanau 2014 引入注意力机制\n下一步: 继续定位对应论文与仓库材料"
+
+    monkeypatch.setattr(agent, "_generate_internal_tool_work_log", _fake_work_log)
+
+    events, done = await agent._finalize_function_calling_iteration(
+        context,
+        content="",
+        reasoning="",
+        parsed_calls=[
+            ParsedToolCall(
+                call_id="call_1",
+                name="datetime",
+                arguments={"query": "2014 到现在多少年"},
+                arguments_raw='{"query":"2014 到现在多少年"}',
+            )
+        ],
+    )
+
+    assert done is False
+    assert any(event.get("type") == "action" for event in events)
+    assert any(event.get("type") == "observation" for event in events)
+    assert context.messages[-1]["role"] == "assistant"
+    assert "<work_log>" in str(context.messages[-1]["content"])
+    assert "Bahdanau 2014" in str(context.messages[-1]["content"])
+    assert any(
+        str(item.get("kind") or "") == "assistant_message"
+        and bool((item.get("metadata") or {}).get("internal_work_log"))
+        for item in runtime_service.item_entries
+    )
 
 
 @pytest.mark.asyncio
