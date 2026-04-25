@@ -32,12 +32,10 @@ class AiderCliService:
     RUNS_DIRNAME = "aider_runs"
     MAX_ARTIFACT_CHARS = 120_000
     _ARTIFACT_ALIAS_MAP = {
-        "paper_summary": "planning/paper_summary.json",
-        "grounding_report": "specs/grounding_report.json",
-        "implementation_spec": "specs/implementation_spec.json",
-        "run_drafts": "drafts/run_drafts.json",
-        "paper_intake_result": "planning/paper_intake_result.json",
-        "experiment_spec": "planning/experiment_spec.json",
+        "paper_pdf2md": "reference/paper/paper_pdf2md.md",
+        "paper_interpretation": "reference/paper/paper_interpretation.md",
+        "paper_interpretation_json": "reference/paper/paper_interpretation.json",
+        "readme_intake": "reference/repo/readme_intake.json",
     }
 
     @classmethod

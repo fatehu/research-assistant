@@ -1,17 +1,23 @@
 name: paper-reproduction
 description: >-
-  Saved-paper control-plane skill. Continue a Project from PDF/intake through
-  structured fact extraction, reusable paper summary, reproduction-readiness
-  investigation of repo/resources/runtime evidence, explicit blocker
-  reporting, run qualification, and execution only when qualification and
-  preflight conditions are satisfied.
+  Project-first paper reproduction skill. Use when the user wants to reproduce
+  a saved paper, continue an existing paper reproduction project, or inspect a
+  paper implementation repository for reproduction work.
 when_to_use: >-
-  Use when the user wants to understand or explain a saved paper, extract
-  structured facts, summarize it for reuse, gather supporting material,
-  investigate whether a reproduction path is viable, qualify run drafts, run
-  or debug grounded experiments, tune parameters or models, compare results,
-  design verification steps, or continue an existing paper Project.
-category: paper
+  Use this skill for project-based paper reproduction tasks. Resolve the paper
+  and project first. If no project exists, create it through
+  paper_research_prepare. If a project exists, check it with
+  paper_research_status. If prepare is not finished, run
+  paper_research_prepare. As soon as prepare is finished, use project_claude as
+  the worker for the actual reproduction work until Claude reports a result.
+session_system_prompt: |-
+  Paper reproduction session contract:
+  - 你是策划者和决策者，不是实施 worker。
+  - 你负责论文解读、复现准备、Project/reference readiness 检查、实验策略、调优方向、风险判断，以及确定下一条给 worker 的具体指令。
+  - 代码修改、命令执行、调试、训练运行和复现交付都交给 Claude Code，通过 `project_claude` 在当前 Project 内完成。
+  - bash/命令类工具只用于了解情况、探测环境、检查路径和状态、收集准备信息；不能作为 Claude Code 不可用或失败后的实施 fallback。
+  - 如果 Claude Code 不可用，直接报告实施被 Claude Code/runtime-worker 阻塞，并等待用户重试或修复运行时；不要自行改文件、跑训练或写执行脚本。
+category: generic
 family: paper-reproduction
 allowed_channels:
   - chat
@@ -19,188 +25,39 @@ interface_metadata_path: agents/openai.yaml
 user_invocable: true
 execution_context: inline
 agent: primary
-effort: high
-aliases:
-  - paper reproduction
-  - paper repro
-  - paper research
-  - reproduce paper
-  - reproduce this paper
-  - run paper code
-  - paper execution plan
-  - paper intake
-  - 论文复现
-  - 复现论文
-  - 论文代码复现
-  - 论文调优
-  - 论文研究
-  - 论文执行规划
-trigger_keywords:
-  - paper-reproduction
-  - paper reproduction
-  - paper repro
-  - paper research
-  - reproduce paper
-  - run draft
-  - run 草案
-  - pdf2markdown
-  - pdf to markdown
-  - intake
-  - refresh intake
-  - paper_research_prepare
-  - paper_research_status
-  - execution plan
-  - full_paper_markdown
-  - local_pdf_markdown
-  - abstract_fallback
-enforced_tool_names:
-  - paper_research_status
-  - paper_research_prepare
-  - paper_research_clone_repo
-  - paper_research_probe_repo
-  - paper_research_probe_url
-  - paper_research_get_artifact_manifest
-  - paper_research_read_artifact
-  - paper_research_search_outputs
-  - paper_research_read_repo_file
-  - paper_research_search_repo
-  - paper_research_git_status
-  - paper_research_git_diff
-  - paper_research_git_log
-  - paper_research_git_show
-  - paper_research_assess_repo_mainpath
-  - paper_research_list_outputs
-  - paper_research_delete_output
-  - paper_research_cleanup_scope
-  - paper_research_write_grounding_report
-  - paper_research_read_grounding_report
-  - paper_research_write_implementation_spec
-  - paper_research_read_implementation_spec
-  - paper_research_write_run_drafts
-  - paper_research_read_run_drafts
-  - paper_research_inspect_runtime
+effort: low
+aliases: []
+trigger_keywords: []
+blocked_tool_names:
+  - project_bash
+  - project_write_file
   - paper_research_write_execution_script
   - paper_research_write_execution_spec
-  - paper_research_read_execution_spec
   - paper_research_start_execution
-  - paper_research_read_execution
-  - paper_research_tail_execution_log
-  - paper_research_cancel_execution
-  - web_search
-  - web_scrape
-blocked_tool_names:
-  - knowledge_search
-  - literature_search
-  - paper_research_create_run_draft
 continue_policies:
   - manual
-  - ask_to_continue
-  - auto_continue
-default_continue_policy: ask_to_continue
+default_continue_policy: manual
 scripts:
   - path: scripts/render_stage_prompt.py
-    purpose: Render a concise launch prompt for the requested paper reproduction stage.
-  - path: scripts/check_artifact_contract.py
-    purpose: Validate archived skill artifacts against the declared top-level contract.
-  - path: scripts/check_runtime_environment.py
-    purpose: Check runtime-worker ML package and command availability without importing heavy modules.
-  - path: scripts/render_execution_spec.py
-    purpose: Render a deterministic execution_spec JSON skeleton from explicit draft/runtime inputs.
+    purpose: Render the stage launch prompt with project/reference-first guidance.
 stages:
   - id: planning
-    title: Planning / Intake Summary
+    title: Planning
     continue_policy: manual
     reads: []
-    writes:
-      - planning/paper_intake_result.json
-      - planning/paper_summary.json
-      - planning/experiment_spec.json
-  - id: grounding
-    title: Grounding / Reproduction Readiness
-    continue_policy: ask_to_continue
-    reads:
-      - planning/paper_intake_result.json
-      - planning/paper_summary.json
-      - planning/experiment_spec.json
-      - repo/repo_reference.json
-      - repo/repo_file_index.json
-      - runtime_worker.environment
-    writes:
-      - specs/grounding_report.json
-  - id: implementation_prep
-    title: Implementation Prep
-    continue_policy: ask_to_continue
-    reads:
-      - planning/paper_intake_result.json
-      - planning/paper_summary.json
-      - planning/experiment_spec.json
-      - specs/grounding_report.json
-      - repo/repo_reference.json
-      - repo/repo_file_index.json
-      - runtime_worker.environment
-    writes:
-      - specs/implementation_spec.json
-  - id: run_drafts
-    title: Run Drafts
-    continue_policy: ask_to_continue
-    reads:
-      - specs/implementation_spec.json
-    writes:
-      - drafts/run_drafts.json
+    writes: []
   - id: execution
-    title: Baseline Execution
-    continue_policy: auto_continue
-    reads:
-      - drafts/run_drafts.json
-      - runtime_worker.environment
-      - executions/{execution_id}/execution_spec.json
-      - executions/{execution_id}/execution_result.json
-    writes:
-      - executions/{execution_id}/execution_spec.json
-      - executions/{execution_id}/execution_result.json
+    title: Execution
+    continue_policy: manual
+    reads: []
+    writes: []
   - id: tuning
-    title: First Tuning / Compare
-    continue_policy: ask_to_continue
-    reads:
-      - specs/implementation_spec.json
-      - executions/{execution_id}/execution_result.json
-    writes:
-      - executions/{execution_id}/execution_spec.json
-      - executions/{execution_id}/execution_result.json
-      - reports/compare_report.json
+    title: Tuning
+    continue_policy: manual
+    reads: []
+    writes: []
 artifacts:
-  - name: intake_result
-    path: planning/paper_intake_result.json
-  - name: paper_summary
-    path: planning/paper_summary.json
-  - name: experiment_spec
-    path: planning/experiment_spec.json
-  - name: grounding_report
-    path: specs/grounding_report.json
-  - name: implementation_spec
-    path: specs/implementation_spec.json
-  - name: run_drafts
-    path: drafts/run_drafts.json
-  - name: execution_spec
-    path: executions/{execution_id}/execution_spec.json
-  - name: execution_result
-    path: executions/{execution_id}/execution_result.json
-  - name: compare_report
-    path: reports/compare_report.json
-references:
-  - path: references/intake-contract.md
-    when: Prepare or explain PDF/markdown/intake JSON.
-  - path: references/grounding-contract.md
-    when: Write or revise grounding_report as a reproduction-readiness checklist for repo/dataset/runtime/external URL evidence.
-  - path: references/implementation-planning.md
-    when: Generate or revise implementation_spec and run_drafts.
-  - path: references/execution-and-tuning.md
-    when: Run baseline, recover failed official sources, tune, compare, or inspect long tasks.
-  - path: references/pipeline.md
-    when: Explain PDF/markdown/intake fallback behavior.
-  - path: references/output-fields.md
-    when: Explain archived workspace/result fields.
-  - path: references/run-draft-heuristics.md
-    when: Generate or revise run_drafts from repo evidence.
-  - path: references/runtime-environment.md
-    when: Run, reproduce, tune, debug runtime, or configure runtime-worker.
+  - path: reference/paper/paper_pdf2md.md
+  - path: reference/paper/paper_interpretation.md
+  - path: reference/paper/paper_interpretation.json
+  - path: reference/repo/readme_intake.json

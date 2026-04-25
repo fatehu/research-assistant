@@ -263,7 +263,7 @@ def test_resolve_paper_context_char_budget_uses_current_model_windows():
 
 
 @pytest.mark.asyncio
-async def test_build_paper_intake_payload_reports_store_and_llm_truncation(monkeypatch, tmp_path: Path):
+async def test_build_paper_intake_payload_keeps_full_markdown_for_storage_and_llm(monkeypatch, tmp_path: Path):
     service = PaperExperimentService(db=None)
     pdf_path = tmp_path / "paper.pdf"
     pdf_path.write_bytes(b"%PDF-1.4 fake")
@@ -309,13 +309,13 @@ async def test_build_paper_intake_payload_reports_store_and_llm_truncation(monke
     payload = await service._build_paper_intake_payload(paper, user_id=1)
 
     assert payload["total_chars"] == 1_300_000
-    assert payload["stored_chars"] == 1_200_000
-    assert payload["sent_chars"] == 398847
-    assert payload["store_truncated"] is True
-    assert payload["llm_truncated"] is True
-    assert payload["truncated"] is True
-    assert len(payload["stored_paper_markdown"]) == 1_200_000
-    assert len(payload["paper_markdown"]) == 398847
+    assert payload["stored_chars"] == 1_300_000
+    assert payload["sent_chars"] == 1_300_000
+    assert payload["store_truncated"] is False
+    assert payload["llm_truncated"] is False
+    assert payload["truncated"] is False
+    assert len(payload["stored_paper_markdown"]) == 1_300_000
+    assert len(payload["paper_markdown"]) == 1_300_000
 
 
 def test_paper_experiment_repo_index_builds_workspace_assets(tmp_path: Path):

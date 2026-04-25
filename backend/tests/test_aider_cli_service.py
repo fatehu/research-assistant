@@ -101,7 +101,7 @@ async def test_run_workspace_mode_requires_explicit_editable_files(tmp_path, mon
 
     payload = await AiderCliService.run(
         workspace_dir=workspace_dir,
-        instruction="Update implementation spec.",
+        instruction="Update readme intake.",
         target_root="workspace",
         editable_files=[],
         provider="openai",
@@ -114,9 +114,9 @@ async def test_run_workspace_mode_requires_explicit_editable_files(tmp_path, mon
 @pytest.mark.asyncio
 async def test_run_workspace_mode_tracks_local_json_diff(tmp_path, monkeypatch):
     workspace_dir = tmp_path / "workspace"
-    specs_dir = workspace_dir / "specs"
-    specs_dir.mkdir(parents=True)
-    target_file = specs_dir / "implementation_spec.json"
+    reference_dir = workspace_dir / "reference" / "repo"
+    reference_dir.mkdir(parents=True)
+    target_file = reference_dir / "readme_intake.json"
     target_file.write_text('{"status":"before"}\n', encoding="utf-8")
 
     monkeypatch.setattr(AiderCliService, "_resolve_binary", classmethod(lambda cls: "/usr/local/bin/aider"))
@@ -132,11 +132,11 @@ async def test_run_workspace_mode_tracks_local_json_diff(tmp_path, monkeypatch):
 
     async def _fake_run_subprocess(cls, *, command, cwd, env, timeout_seconds):
         assert env["AIDER_OPENAI_API_KEY"] == "test-key"
-        (cwd / "specs" / "implementation_spec.json").write_text('{"status":"after"}\n', encoding="utf-8")
+        (cwd / "reference" / "repo" / "readme_intake.json").write_text('{"status":"after"}\n', encoding="utf-8")
         return {
             "timeout": False,
             "returncode": 0,
-            "stdout": "updated implementation_spec.json\n",
+            "stdout": "updated readme_intake.json\n",
             "command": list(command),
         }
 
@@ -146,12 +146,12 @@ async def test_run_workspace_mode_tracks_local_json_diff(tmp_path, monkeypatch):
         workspace_dir=workspace_dir,
         instruction="Change status to after.",
         target_root="workspace",
-        editable_files=["specs/implementation_spec.json"],
+        editable_files=["reference/repo/readme_intake.json"],
         provider="openai",
     )
 
     assert payload["success"] is True
-    assert payload["changed_files"] == ["specs/implementation_spec.json"]
+    assert payload["changed_files"] == ["reference/repo/readme_intake.json"]
     diff_text = Path(payload["diff_path"]).read_text(encoding="utf-8")
     assert '"status":"after"' in diff_text
 
@@ -163,7 +163,7 @@ async def test_run_workspace_mode_tracks_local_json_diff(tmp_path, monkeypatch):
         max_chars=20000,
     )
     assert read_back["success"] is True
-    assert "updated implementation_spec.json" in read_back["stdout"]
+    assert "updated readme_intake.json" in read_back["stdout"]
     assert '"status":"after"' in read_back["diff"]
 
     tail = AiderCliService.tail_log(
@@ -172,4 +172,4 @@ async def test_run_workspace_mode_tracks_local_json_diff(tmp_path, monkeypatch):
         max_chars=20000,
     )
     assert tail["success"] is True
-    assert "updated implementation_spec.json" in tail["tail"]
+    assert "updated readme_intake.json" in tail["tail"]

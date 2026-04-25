@@ -27,6 +27,7 @@ _GENERATED_REPO_IMPORT_SHIM_MARKER = "# project-runtime: repo-import-shim"
 
 
 RUNTIME_TYPES = {
+    "claude_code",
     "devcontainer",
     "docker_compose",
     "dockerfile",
@@ -421,6 +422,89 @@ class ProjectRuntimeWorkerClient:
             response.raise_for_status()
             return dict(response.json() or {})
 
+    async def bash(
+        self,
+        *,
+        project_id: int,
+        workspace_dir: Path,
+        command: str,
+    ) -> Dict[str, Any]:
+        if not self.base_url:
+            raise RuntimeError("project runtime worker url is empty")
+        payload = {
+            "project_id": int(project_id),
+            "workspace_dir": str(Path(workspace_dir)),
+            "command": str(command or ""),
+        }
+        timeout_seconds = max(self.timeout_seconds, 125.0)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds, connect=3.0)) as client:
+            response = await client.post(
+                f"{self.base_url}/bash/run",
+                json=payload,
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+            return dict(response.json() or {})
+
+    async def claude(
+        self,
+        *,
+        project_id: int,
+        workspace_dir: Path,
+        prompt: str,
+        continue_session: bool,
+    ) -> Dict[str, Any]:
+        if not self.base_url:
+            raise RuntimeError("project runtime worker url is empty")
+        payload = {
+            "project_id": int(project_id),
+            "workspace_dir": str(Path(workspace_dir)),
+            "prompt": str(prompt or ""),
+            "continue_session": bool(continue_session),
+        }
+        async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=3.0)) as client:
+            response = await client.post(
+                f"{self.base_url}/claude/run",
+                json=payload,
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+            return dict(response.json() or {})
+
+    async def claude_stream(
+        self,
+        *,
+        project_id: int,
+        workspace_dir: Path,
+        prompt: str,
+        continue_session: bool,
+    ):
+        if not self.base_url:
+            raise RuntimeError("project runtime worker url is empty")
+        payload = {
+            "project_id": int(project_id),
+            "workspace_dir": str(Path(workspace_dir)),
+            "prompt": str(prompt or ""),
+            "continue_session": bool(continue_session),
+        }
+        async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=3.0)) as client:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/claude/run_stream",
+                json=payload,
+                headers=self._headers(),
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(payload, dict):
+                        yield payload
+
 
 class ProjectRuntimeService:
     """Runtime adapter primitives for paper reproduction projects.
@@ -537,7 +621,12 @@ class ProjectRuntimeService:
     @staticmethod
     def tool_availability() -> Dict[str, Any]:
         docker_path = shutil.which("docker")
+        claude_binary = getattr(settings, "claude_code_binary", "claude")
         return {
+            "claude": {
+                "available": bool(shutil.which(claude_binary)),
+                "command": shutil.which(claude_binary),
+            },
             "docker": {"available": bool(docker_path), "command": docker_path},
             "docker_compose": {
                 "available": bool(docker_path),
@@ -1542,6 +1631,32 @@ class ProjectRuntimeService:
                 executable = str(command[0] or "").strip().lower()
                 if executable in {"bash", "sh", "zsh", "fish", "powershell", "pwsh", "cmd", "cmd.exe"}:
                     errors.append("shell wrapper commands are not allowed; use direct argv or execution_intent")
+        elif runtime_type == "claude_code":
+            task_brief_relative_path = _normalize_relative_path(spec.get("task_brief_relative_path") or "")
+            task_prompt = str(spec.get("task_prompt") or "").strip()
+            if not task_brief_relative_path and not task_prompt:
+                errors.append("claude_code runtime requires task_brief_relative_path or task_prompt")
+            if task_brief_relative_path and self.resolve_workspace_path(
+                workspace_dir,
+                task_brief_relative_path,
+                require_exists=True,
+            ) is None:
+                errors.append(
+                    f"task_brief_relative_path is outside workspace, invalid, or missing: {task_brief_relative_path}"
+                )
+            max_turns = spec.get("max_turns")
+            if max_turns is not None:
+                try:
+                    if int(max_turns) < 1:
+                        errors.append("max_turns must be >= 1 when provided")
+                except (TypeError, ValueError):
+                    errors.append("max_turns must be an integer when provided")
+            for key in ("allowed_tools", "disallowed_tools", "add_dirs"):
+                value = spec.get(key)
+                if value is not None and not isinstance(value, list):
+                    errors.append(f"{key} must be a string array when provided")
+            if spec.get("command") not in (None, []):
+                errors.append("claude_code runtime must not provide raw command; use task brief fields instead")
 
         if runtime_type == "papermill":
             input_notebook = _normalize_relative_path(spec.get("input_notebook"))
@@ -1642,6 +1757,7 @@ class ProjectRuntimeService:
 
         availability = self.tool_availability()
         tool_key = {
+            "claude_code": "claude",
             "devcontainer": "devcontainer",
             "docker_compose": "docker_compose",
             "dockerfile": "docker",
@@ -1649,7 +1765,11 @@ class ProjectRuntimeService:
             "papermill": "papermill",
             "plain-python": "python",
         }.get(runtime_type)
-        if tool_key and not bool(dict(availability.get(tool_key) or {}).get("available")):
+        if (
+            tool_key
+            and not bool(dict(availability.get(tool_key) or {}).get("available"))
+            and not (runtime_type == "claude_code" and ProjectRuntimeWorkerClient.enabled())
+        ):
             warnings.append(f"runtime tool `{tool_key}` is not available in the current backend container")
 
         return {
@@ -2071,6 +2191,17 @@ class ProjectRuntimeService:
             )
 
         has = set(files)
+        if files:
+            add(
+                "claude_code",
+                priority=5,
+                evidence_files=list(files[: min(8, len(files))]),
+                tool_key="claude",
+                reason="Dedicated Claude Code runtime can operate directly on the repository from a task brief.",
+                requires_runtime_worker=True,
+                requires_explicit_user_confirm=True,
+            )
+
         devcontainer_files = [item for item in files if item == ".devcontainer/devcontainer.json"]
         if devcontainer_files:
             add(

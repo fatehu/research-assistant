@@ -2,6 +2,8 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +11,8 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.services.agent_tools_impl import registry as agent_tools
+from app.services import project_reference_builder_service as project_reference_builder_service
+from app.services.docx_template_service import DocxTemplateService
 from app.services.project_runtime_service import ProjectRuntimeService
 from app.services.project_service import ProjectService
 
@@ -21,134 +25,738 @@ def _workspace() -> SimpleNamespace:
     return SimpleNamespace(id=21, notebook_id="nb-1", status="ready", title="workspace")
 
 
+class _FakeScalarResult:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def all(self):
+        return list(self._rows)
+
+
+class _FakeExecuteResult:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def scalars(self):
+        return _FakeScalarResult(self._rows)
+
+
 def _init_git_repo(repo_dir):
     subprocess.run(["git", "init"], cwd=repo_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True)
     subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_dir, check=True)
 
 
-def _complete_grounding_payload() -> dict:
-    return {
-        "repo": {
-            "status": "grounded",
-            "url": "https://github.com/facebookresearch/fastText.git",
-            "resolved_ref": "refs/heads/main",
-            "default_branch": "main",
-            "commit_sha": "abc123",
-            "blockers": [],
-        },
-        "entrypoint": {
-            "status": "grounded",
-            "candidates": [{"path": "main.py"}],
-            "selected_candidate": {"path": "main.py"},
-            "evidence_files": ["repo/source/main.py"],
-            "blockers": [],
-        },
-        "dataset": {
-            "status": "grounded",
-            "sources": ["https://example.com/ag_news.csv"],
-            "access_mode": "local_or_download",
-            "local_presence": {"available": True},
-            "blockers": [],
-        },
-        "runtime": {
-            "status": "grounded",
-            "inspection_summary": "plain-python available",
-            "candidate_runtimes": [{"runtime_type": "plain-python", "status": "ready"}],
-            "tool_availability": {"python": {"available": True}},
-            "blockers": [],
-        },
-        "external_dependencies": {
-            "status": "grounded",
-            "urls": ["https://example.com/ag_news.csv"],
-            "probe_results": [{"url": "https://example.com/ag_news.csv", "ok": True}],
-            "blockers": [],
-        },
-        "summary": {
-            "repo_grounded": True,
-            "entrypoint_grounded": True,
-            "dataset_grounded": True,
-            "runtime_grounded": True,
-            "external_dependencies_grounded": True,
-            "overall_status": "grounded",
-            "next_actions": ["继续 implementation_spec。"],
-        },
-    }
-
-
-def _blocked_grounding_payload() -> dict:
-    payload = _complete_grounding_payload()
-    payload["dataset"] = {
-        "status": "blocked",
-        "sources": ["https://example.com/imdb.bin"],
-        "access_mode": "download_only",
-        "local_presence": {"available": False},
-        "blockers": ["IMDB source blocked (HTTP 403)"],
-    }
-    payload["external_dependencies"] = {
-        "status": "blocked",
-        "urls": ["https://example.com/imdb.bin"],
-        "probe_results": [{"url": "https://example.com/imdb.bin", "ok": False, "status": 403, "diagnosis": "http_403"}],
-        "blockers": ["Official external dependency blocked: https://example.com/imdb.bin (HTTP 403, http_403)"],
-    }
-    payload["summary"] = {
-        "repo_grounded": True,
-        "entrypoint_grounded": True,
-        "dataset_grounded": False,
-        "runtime_grounded": True,
-        "external_dependencies_grounded": False,
-        "overall_status": "blocked",
-        "run_decision": "blocked",
-        "blockers": ["IMDB official source unavailable"],
-        "next_actions": ["记录 blocker，并等待用户决定是否寻找替代源。"],
-    }
-    return payload
+def _write_minimal_docx(path: Path) -> None:
+    document_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>一、立项依据</w:t></w:r></w:p>
+    <w:p><w:r><w:t>正文使用小四宋体，说明研究背景。</w:t></w:r></w:p>
+    <w:tbl><w:tr><w:tc><w:p><w:r><w:t>指标</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>说明</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+    <w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>
+  </w:body>
+</w:document>"""
+    styles_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="标题 1"/></w:style>
+</w:styles>"""
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("word/document.xml", document_xml)
+        archive.writestr("word/styles.xml", styles_xml)
 
 
 @pytest.mark.asyncio
-async def test_grounding_report_write_and_read(tmp_path, monkeypatch):
-    write_tool = agent_tools.PaperResearchWriteGroundingReportTool(db=object(), user_id=1)
+async def test_paper_search_tool_returns_ranked_candidates():
+    rows = [
+        SimpleNamespace(
+            id=5,
+            title="Attention Is All You Need",
+            abstract="The Transformer architecture is introduced for sequence modeling.",
+            authors=[{"name": "Ashish Vaswani"}, {"name": "Noam Shazeer"}],
+            year=2017,
+            venue="NeurIPS",
+            journal=None,
+            arxiv_id="1706.03762",
+        ),
+        SimpleNamespace(
+            id=8,
+            title="Transformers for Vision",
+            abstract="A vision transformer variant.",
+            authors=[{"name": "Alex Example"}],
+            year=2021,
+            venue="ICCV",
+            journal=None,
+            arxiv_id=None,
+        ),
+    ]
 
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return _project_payload(), _workspace()
+    class _FakeDb:
+        def __init__(self, responses):
+            self._responses = list(responses)
 
-    monkeypatch.setattr(write_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(write_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
+        async def execute(self, _stmt):
+            return _FakeExecuteResult(self._responses.pop(0))
 
-    result = await write_tool._execute(project_id=7, grounding_report=_complete_grounding_payload())
+    tool = agent_tools.PaperSearchTool(db=_FakeDb([rows, rows]), user_id=1)
+
+    result = await tool._execute(query="attention is all you need", max_results=5)
 
     assert result.success is True
-    assert (tmp_path / "specs" / "grounding_report.json").is_file()
-    assert result.data["relative_path"] == "specs/grounding_report.json"
-    assert result.data["grounding_ready"] is True
-    assert result.data["content"]["summary"]["run_decision"] == "ready"
+    assert result.data["query"] == "attention is all you need"
+    assert result.data["candidates"][0]["paper_id"] == 5
+    assert result.data["candidates"][0]["title"] == "Attention Is All You Need"
+    assert result.data["candidates"][0]["authors"] == ["Ashish Vaswani", "Noam Shazeer"]
+    assert result.data["candidates"][0]["year"] == 2017
+    assert result.data["candidates"][0]["venue"] == "NeurIPS"
+    assert "paper_id=5" in result.output
+    assert "Attention Is All You Need" in result.output
 
-    async def _resolve_for_read(self, _db, *, project_id: int):
+
+@pytest.mark.asyncio
+async def test_project_tree_tool_returns_project_directory_tree(tmp_path, monkeypatch):
+    tool = agent_tools.ProjectTreeTool(db=object(), user_id=1)
+
+    async def _resolve_project_payload_only(_db, *, project_id: int):
         assert project_id == 7
-        return _project_payload(), _workspace()
+        return _project_payload()
 
-    monkeypatch.setattr(agent_tools.PaperResearchReadArtifactTool, "_resolve_project_workspace", _resolve_for_read)
-    monkeypatch.setattr(agent_tools.PaperResearchReadArtifactTool, "_workspace_dir_for", lambda self, _workspace_obj: tmp_path)
+    (tmp_path / "reference" / "paper").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "reference" / "paper" / "paper_interpretation.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "notes.md").write_text("# notes\n", encoding="utf-8")
 
-    read_tool = agent_tools.PaperResearchReadGroundingReportTool(db=object(), user_id=1)
-    read_result = await read_tool._execute(project_id=7)
+    monkeypatch.setattr(tool, "_resolve_project_payload_only", _resolve_project_payload_only)
+    monkeypatch.setattr(tool, "_project_dir_for", lambda _project_id: tmp_path)
+    async def _load_project_tree_focus_context(_db, *, project_payload):
+        return {"project_goal": "inspect repo structure", "recent_tool_calls": [{"tool_name": "paper_research_status"}]}
+
+    async def _summarize_project_tree_for_agent(*, tree: str, focus_context):
+        assert "reference/" in tree
+        assert focus_context["project_goal"] == "inspect repo structure"
+        return ".\n├── reference/\n│   └── paper/\n│       └── paper_interpretation.json\n└── notes.md", [
+            "reference/paper/paper_interpretation.json",
+            "notes.md",
+        ]
+
+    monkeypatch.setattr(tool, "_load_project_tree_focus_context", _load_project_tree_focus_context)
+    monkeypatch.setattr(tool, "_summarize_project_tree_for_agent", _summarize_project_tree_for_agent)
+
+    result = await tool._execute(project_id=7)
+
+    assert result.success is True
+    assert result.data == {
+        "project_id": 7,
+        "tree": result.data["tree"],
+        "focused_tree": ".\n├── reference/\n│   └── paper/\n│       └── paper_interpretation.json\n└── notes.md",
+        "important_paths": ["reference/paper/paper_interpretation.json", "notes.md"],
+    }
+    assert "." in result.data["tree"]
+    assert "reference/" in result.data["tree"]
+    assert "paper_interpretation.json" in result.data["tree"]
+    assert "notes.md" in result.data["tree"]
+    assert "Focused tree:" in result.output
+    assert "Important paths:" in result.output
+
+
+@pytest.mark.asyncio
+async def test_project_read_and_write_file_tools_roundtrip(tmp_path, monkeypatch):
+    write_tool = agent_tools.ProjectWriteFileTool(db=object(), user_id=1)
+    read_tool = agent_tools.ProjectReadFileTool(db=object(), user_id=1)
+
+    async def _resolve_project_payload_only(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload()
+
+    monkeypatch.setattr(write_tool, "_resolve_project_payload_only", _resolve_project_payload_only)
+    monkeypatch.setattr(write_tool, "_project_dir_for", lambda _project_id: tmp_path)
+    monkeypatch.setattr(read_tool, "_resolve_project_payload_only", _resolve_project_payload_only)
+    monkeypatch.setattr(read_tool, "_project_dir_for", lambda _project_id: tmp_path)
+
+    write_result = await write_tool._execute(
+        project_id=7,
+        relative_path="reference/repo/readme_intake.json",
+        content='{"status":"draft"}\n',
+    )
+
+    assert write_result.success is True
+    assert write_result.data == {
+        "project_id": 7,
+        "relative_path": "reference/repo/readme_intake.json",
+        "written": True,
+    }
+    assert (tmp_path / "reference" / "repo" / "readme_intake.json").read_text(encoding="utf-8") == '{"status":"draft"}\n'
+
+    read_result = await read_tool._execute(project_id=7, relative_path="reference/repo/readme_intake.json")
 
     assert read_result.success is True
-    assert read_result.data["relative_path"] == "specs/grounding_report.json"
-    content = read_result.data["content"]
-    if isinstance(content, str):
-        content = json.loads(content)
-    assert content["summary"]["overall_status"] == "grounded"
+    assert read_result.data == {
+        "project_id": 7,
+        "relative_path": "reference/repo/readme_intake.json",
+        "content": '{"status":"draft"}\n',
+    }
+    assert "Content:" in read_result.output
+    assert '{"status":"draft"}' in read_result.output
+
+
+@pytest.mark.asyncio
+async def test_project_bash_tool_executes_in_project_root(tmp_path, monkeypatch):
+    tool = agent_tools.ProjectBashTool(db=object(), user_id=1)
+
+    async def _resolve_project_payload_only(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload()
+
+    monkeypatch.setattr(tool, "_resolve_project_payload_only", _resolve_project_payload_only)
+    monkeypatch.setattr(tool, "_project_dir_for", lambda _project_id: tmp_path)
+
+    result = await tool._execute(
+        project_id=7,
+        command="pwd && printf 'hello-from-project-bash'",
+    )
+
+    assert result.success is True
+    assert result.data["project_id"] == 7
+    assert result.data["command"] == "pwd && printf 'hello-from-project-bash'"
+    assert result.data["exit_code"] == 0
+    assert str(tmp_path) in result.data["stdout"]
+    assert "hello-from-project-bash" in result.data["stdout"]
+    assert result.data["stderr"] == ""
+    assert "已执行 Project bash 命令。" in result.output
+    assert f"- Project: /projects/7" in result.output
+    assert "- Exit code: 0" in result.output
+
+
+@pytest.mark.asyncio
+async def test_project_bash_tool_uses_runtime_worker_when_enabled(tmp_path, monkeypatch):
+    tool = agent_tools.ProjectBashTool(db=object(), user_id=1)
+
+    async def _resolve_project_payload_only(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload()
+
+    class _FakeWorkerClient:
+        @staticmethod
+        def enabled():
+            return True
+
+        async def bash(self, *, project_id: int, workspace_dir, command: str):
+            assert project_id == 7
+            assert workspace_dir == tmp_path
+            assert command == "pwd"
+            return {
+                "project_id": 7,
+                "workspace_dir": str(tmp_path),
+                "command": "pwd",
+                "exit_code": 0,
+                "stdout": "/app/uploads/projects/7\n",
+                "stderr": "",
+                "success": True,
+                "error": None,
+                "worker": "runtime-worker",
+            }
+
+    monkeypatch.setattr(tool, "_resolve_project_payload_only", _resolve_project_payload_only)
+    monkeypatch.setattr(tool, "_project_dir_for", lambda _project_id: tmp_path)
+    monkeypatch.setattr("app.services.project_runtime_service.ProjectRuntimeWorkerClient", _FakeWorkerClient)
+
+    result = await tool._execute(project_id=7, command="pwd")
+
+    assert result.success is True
+    assert result.data["worker"] == "runtime-worker"
+    assert result.data["exit_code"] == 0
+    assert result.data["stdout"] == "/app/uploads/projects/7\n"
+    assert "已通过 runtime-worker 执行 Project bash 命令。" in result.output
+
+
+@pytest.mark.asyncio
+async def test_project_claude_tool_uses_runtime_worker(tmp_path, monkeypatch):
+    tool = agent_tools.ProjectClaudeTool(db=object(), user_id=1)
+
+    async def _resolve_project_payload_only(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload()
+
+    class _FakeWorkerClient:
+        @staticmethod
+        def enabled():
+            return True
+
+        async def claude(self, *, project_id: int, workspace_dir, prompt: str, continue_session: bool):
+            assert project_id == 7
+            assert workspace_dir == tmp_path
+            assert prompt == "inspect the repo"
+            assert continue_session is False
+            return {
+                "project_id": 7,
+                "workspace_dir": str(tmp_path),
+                "prompt": prompt,
+                "continue_session": continue_session,
+                "session_id": "test-session-id",
+                "assistant_text": "I will inspect the repo.",
+                "result_text": "I will inspect the repo.",
+                "is_error": False,
+                "exit_code": 0,
+                "stdout": '{"type":"result"}',
+                "stderr": "",
+                "error": None,
+                "worker": "runtime-worker",
+            }
+
+    monkeypatch.setattr(tool, "_resolve_project_payload_only", _resolve_project_payload_only)
+    monkeypatch.setattr(tool, "_project_dir_for", lambda _project_id: tmp_path)
+    monkeypatch.setattr("app.services.project_runtime_service.ProjectRuntimeWorkerClient", _FakeWorkerClient)
+
+    result = await tool._execute(project_id=7, prompt="inspect the repo", continue_session=False)
+
+    assert result.success is True
+    assert result.data["worker"] == "runtime-worker"
+    assert result.data["session_id"] == "test-session-id"
+    assert result.data["result_text"] == "I will inspect the repo."
+    assert "已通过 runtime-worker 调用 Claude Code。" in result.output
+    assert "- Session: test-session-id" in result.output
+    assert "Claude result:" in result.output
+
+
+def test_project_claude_tool_has_no_tool_timeout():
+    tool = agent_tools.ProjectClaudeTool(db=object(), user_id=1)
+
+    assert tool._resolve_timeout_seconds() is None
+
+
+def test_docx_generate_tool_has_no_timeout_or_input_length_caps():
+    tool = agent_tools.DocxGenerateWithClaudeTool()
+    schema = agent_tools.DocxGenerateWithClaudeInput.model_json_schema()
+
+    assert tool._resolve_timeout_seconds() is None
+    assert "maxLength" not in schema["properties"]["markdown"]
+    assert "maxLength" not in schema["properties"]["requirements"]
+    assert "maxLength" not in schema["properties"]["source_path"]
+
+
+def test_docx_template_service_saves_constraints_files_and_lists_workspaces(tmp_path, monkeypatch):
+    monkeypatch.setenv("UPLOAD_DIR", str(tmp_path))
+    service = DocxTemplateService()
+    workspace = tmp_path / "docx" / "demo-docx"
+    workspace.mkdir(parents=True)
+    (workspace / "review.docx").write_bytes(b"docx")
+
+    template = service.upsert_template(
+        template_id=None,
+        name="国自然模板",
+        description="项目申请书",
+        md_constraints="# MD",
+        docx_constraints="# DOCX",
+        user_id=3,
+    )
+    uploaded = service.save_template_file(
+        template_id=template["template_id"],
+        filename="../sample.docx",
+        content=b"sample",
+        file_role="sample_template",
+    )
+    overview = service.list_overview()
+
+    assert template["md_constraints"] == "# MD"
+    assert template["docx_constraints"] == "# DOCX"
+    assert uploaded["relative_path"].startswith(f"templates/{template['template_id']}/files/")
+    assert uploaded["file_role"] == "sample_template"
+    assert overview["docx_root"] == str(tmp_path / "docx")
+    assert overview["templates"][0]["template_id"] == template["template_id"]
+    assert overview["templates"][0]["files"][0]["file_role"] == "sample_template"
+    assert overview["workspaces"][0]["docx_id"] == "demo-docx"
+    assert service.resolve_download_path("demo-docx/review.docx") == workspace / "review.docx"
+
+
+@pytest.mark.asyncio
+async def test_docx_template_service_analyzes_files_and_generates_constraints(tmp_path, monkeypatch):
+    monkeypatch.setenv("UPLOAD_DIR", str(tmp_path))
+    source_docx = tmp_path / "sample.docx"
+    _write_minimal_docx(source_docx)
+    service = DocxTemplateService()
+    template = service.upsert_template(
+        template_id="grant-template",
+        name="国自然模板",
+        description="项目申请书",
+        user_id=3,
+    )
+    service.save_template_file(
+        template_id=template["template_id"],
+        filename="sample.docx",
+        content=source_docx.read_bytes(),
+        file_role="sample_template",
+    )
+    service.save_template_file(
+        template_id=template["template_id"],
+        filename="guide.md",
+        content="申请书必须包含立项依据、研究内容、创新点。".encode("utf-8"),
+        file_role="writing_guide",
+    )
+
+    class _FakeLLMService:
+        async def chat(self, **kwargs):
+            assert "文件分析结果 JSON" in kwargs["messages"][0]["content"]
+            return {
+                "content": json.dumps(
+                    {
+                        "md_constraints": "必须包含立项依据、研究内容、创新点。",
+                        "docx_constraints": "一级标题采用标题 1 样式。",
+                        "notes": "已分析 DOCX 和撰写说明。",
+                    },
+                    ensure_ascii=False,
+                )
+            }
+
+    monkeypatch.setattr("app.services.llm_service.LLMService", lambda: _FakeLLMService())
+
+    analysis = service.build_template_analysis(template["template_id"])
+    result = await service.generate_constraints_with_llm(template["template_id"])
+
+    assert any(item.get("kind") == "docx_ooxml" for item in analysis["files"])
+    assert "立项依据" in json.dumps(analysis, ensure_ascii=False)
+    assert result["md_constraints"] == "必须包含立项依据、研究内容、创新点。"
+    assert result["docx_constraints"] == "一级标题采用标题 1 样式。"
+
+
+def test_tool_registry_registers_docx_tool_and_resolves_generation_intent():
+    registry = agent_tools.ToolRegistry(db=object(), user_id=1, initialize_mcp=False)
+    user_text = "根据这篇 Markdown 生成 docx 文档"
+
+    assert registry.resolve_intent(user_text) == "document_generation"
+    assert "docx_generate_with_claude" in registry._tools
+
+
+@pytest.mark.asyncio
+async def test_literature_search_tool_passes_extended_parameters():
+    paper = SimpleNamespace(
+        source="openalex",
+        external_id="W1",
+        title="Graph RAG Survey",
+        abstract="abstract",
+        authors=[{"name": "Ada"}],
+        year=2024,
+        venue="TestConf",
+        citation_count=7,
+        reference_count=3,
+        url="https://example.test/paper",
+        pdf_url="https://example.test/paper.pdf",
+        arxiv_id=None,
+        doi="10.1234/example",
+        fields_of_study=["Computer Science"],
+    )
+
+    class _FakeService:
+        def __init__(self):
+            self.search_kwargs = None
+
+        async def search(self, **kwargs):
+            self.search_kwargs = dict(kwargs)
+            return {
+                "total": 99,
+                "offset": kwargs.get("offset"),
+                "has_more": True,
+                "next_token": "next-token",
+                "resolved_source": "openalex",
+                "attempted_sources": ["openalex"],
+                "papers": [paper],
+            }
+
+    service = _FakeService()
+    tool = agent_tools.LiteratureSearchTool()
+    tool.service = service
+
+    result = await tool.execute(
+        query="graph rag",
+        source="auto",
+        max_results=25,
+        offset=50,
+        page_token="cursor",
+        year_start=2020,
+        year_end=2025,
+        fields=["Computer Science"],
+        open_access=True,
+        sort_by="latest",
+        sort_order="desc",
+        abstract_max_chars=1200,
+    )
+
+    assert result.success is True
+    assert service.search_kwargs["source"] == "auto"
+    assert service.search_kwargs["limit"] == 25
+    assert service.search_kwargs["offset"] == 50
+    assert service.search_kwargs["page_token"] == "cursor"
+    assert service.search_kwargs["year_range"] == (2020, 2025)
+    assert service.search_kwargs["fields_of_study"] == ["Computer Science"]
+    assert service.search_kwargs["open_access_only"] is True
+    assert service.search_kwargs["sort_by"] == "latest"
+    assert result.data["next_token"] == "next-token"
+    assert result.data["papers"][0]["pdf_url"] == "https://example.test/paper.pdf"
+    assert "PDF: https://example.test/paper.pdf" in result.output
+    assert "DOI: 10.1234/example" in result.output
+
+
+@pytest.mark.asyncio
+async def test_literature_review_workspace_tools_generate_review_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("UPLOAD_DIR", str(tmp_path))
+
+    start_result = await agent_tools.LiteratureReviewStartTool(user_id=1).execute(
+        topic="Graph RAG for scientific literature",
+        target_paper_count=1,
+    )
+    review_id = start_result.data["literature_review_id"]
+    root = Path(start_result.data["root"])
+
+    class _FakeLiteratureService:
+        async def download_pdf(self, pdf_url: str, save_path: str):
+            assert pdf_url == "https://example.test/paper.pdf"
+            Path(save_path).write_bytes(b"%PDF-1.4\nfake\n")
+            return True, ""
+
+    monkeypatch.setattr(
+        "app.services.literature_service.get_literature_service",
+        lambda: _FakeLiteratureService(),
+    )
+
+    download_result = await agent_tools.LiteratureReviewDownloadPdfTool(user_id=1).execute(
+        literature_review_id=review_id,
+        pdf_url="https://example.test/paper.pdf",
+        title="Graph RAG Survey",
+        paper_key="graph-rag-survey",
+    )
+
+    assert download_result.success is True
+    assert (root / "pdf" / "graph-rag-survey.pdf").is_file()
+
+    class _FakePdfIngestService:
+        async def ingest_pdf(self, *, file_path: str, document_name: str = "", mode: str = "fast"):
+            assert file_path == str(root / "pdf" / "graph-rag-survey.pdf")
+            assert mode == "fast"
+            return {
+                "document_text": "# Graph RAG Survey\n\nFull paper body.",
+                "extractor": "fake_pdf2md",
+                "report": {"page_count": 2},
+                "document_source_spans": [],
+            }
+
+    monkeypatch.setattr(
+        "app.services.pdf_rag_ingest_service.get_pdf_rag_ingest_service",
+        lambda: _FakePdfIngestService(),
+    )
+
+    read_result = await agent_tools.ReadFullPdfTool(user_id=1).execute(
+        literature_review_id=review_id,
+        paper_key="graph-rag-survey",
+    )
+
+    assert read_result.success is True
+    assert read_result.data["md_path"] == str(root / "md" / "graph-rag-survey.md")
+    assert "Full paper body" not in read_result.output
+    assert (root / "md" / "graph-rag-survey.md").read_text(encoding="utf-8").endswith("Full paper body.")
+
+    async def _fake_call_llm(self, *, system_prompt: str, user_prompt: str):
+        if "完整论文 Markdown" in user_prompt:
+            return "# 单篇 Review\n\n- 可纳入最终综述。"
+        return "# 最终综述\n\n这是汇总后的综述。"
+
+    monkeypatch.setattr(agent_tools.ReviewWriterTool, "_call_llm", _fake_call_llm)
+    writer = agent_tools.ReviewWriterTool(user_id=1)
+
+    paper_review = await writer.execute(
+        literature_review_id=review_id,
+        topic="Graph RAG for scientific literature",
+        mode="paper",
+        paper_key="graph-rag-survey",
+    )
+    final_review = await writer.execute(
+        literature_review_id=review_id,
+        topic="Graph RAG for scientific literature",
+        mode="final",
+        target_paper_count=1,
+    )
+
+    assert paper_review.success is True
+    assert (root / "review" / "graph-rag-survey.md").read_text(encoding="utf-8").startswith("# 单篇 Review")
+    assert final_review.success is True
+    assert final_review.data["final_review_path"] == str(root / "review" / "final.md")
+    assert final_review.output.startswith("# 最终综述")
+
+
+def test_tool_registry_registers_literature_review_tools():
+    registry = agent_tools.ToolRegistry(db=object(), user_id=1, conversation_id=1, initialize_mcp=False)
+
+    assert "literature_review_start" in registry._tools
+    assert "literature_review_download_pdf" in registry._tools
+    assert "read_full_pdf" in registry._tools
+    assert "review_writer" in registry._tools
+
+
+def test_literature_review_skill_injects_session_prompt():
+    from app.services.agent_skill_service import AgentSkillService
+
+    service = AgentSkillService(Path(os.getcwd()) / ".agents" / "skills")
+    resolution = service.resolve(
+        "继续文献综述",
+        channel="chat",
+        active_skill_names=["literature-review"],
+    )
+
+    assert resolution.active_skills[0].name == "literature-review"
+    assert "默认目标是 12 篇" in resolution.active_system_prompt
+    assert "read_full_pdf" in resolution.active_system_prompt
+
+
+def test_tool_output_truncation_defaults_enabled_for_long_outputs():
+    from app.config import settings
+
+    class _EchoTool(agent_tools.ToolBase):
+        name = "echo_for_truncation_test"
+        parameters = {"type": "object", "properties": {}}
+
+        async def _execute(self, **kwargs):
+            return agent_tools.ToolResult(success=True, output="x " * 5000)
+
+    assert settings.tool_output_truncation_enabled is True
+    assert agent_tools.ReadFullPdfTool(user_id=1)._resolve_output_max_tokens() == 9000
+    assert agent_tools.ReviewWriterTool(user_id=1)._resolve_output_max_tokens() == 12000
+
+    result = _EchoTool()._with_finalized_result(
+        agent_tools.ToolResult(success=True, output="x " * 5000),
+        started_at=0.0,
+        retry_attempt=1,
+    )
+
+    assert result.truncated is True
+    assert result.data["output_truncated"] is True
+    assert "[TRUNCATED]" in result.output
+
+
+@pytest.mark.asyncio
+async def test_docx_generate_tool_writes_inputs_and_uses_docx_worker(tmp_path, monkeypatch):
+    monkeypatch.setenv("UPLOAD_DIR", str(tmp_path))
+    tool = agent_tools.DocxGenerateWithClaudeTool()
+
+    class _FakeDocxRuntimeWorkerClient:
+        @staticmethod
+        def enabled():
+            return True
+
+        async def claude(self, *, docx_id: str, workspace_dir, prompt: str, continue_session: bool):
+            assert docx_id == "test-doc"
+            assert workspace_dir == tmp_path / "docx" / "test-doc"
+            assert "source.md" in prompt
+            assert "requirements.md" in prompt
+            assert "Project/论文复现" in prompt
+            assert continue_session is False
+            (workspace_dir / "review.docx").write_bytes(b"fake-docx")
+            (workspace_dir / "review.pdf").write_bytes(b"fake-pdf")
+            return {
+                "docx_id": docx_id,
+                "workspace_dir": str(workspace_dir),
+                "prompt": prompt,
+                "continue_session": continue_session,
+                "session_id": "docx-session-id",
+                "assistant_text": "created",
+                "result_text": "All validations PASSED!",
+                "is_error": False,
+                "exit_code": 0,
+                "stdout": '{"type":"result"}',
+                "stderr": "",
+                "error": None,
+                "worker": "runtime-worker",
+            }
+
+    monkeypatch.setattr(
+        "app.services.docx_runtime_service.DocxRuntimeWorkerClient",
+        _FakeDocxRuntimeWorkerClient,
+    )
+
+    result = await tool._execute(
+        docx_id="test doc",
+        markdown="# Title\n\nBody",
+        requirements="生成论文综述模板。",
+        output_basename="review",
+        continue_session=False,
+    )
+
+    workspace_dir = tmp_path / "docx" / "test-doc"
+    assert (workspace_dir / "source.md").read_text(encoding="utf-8") == "# Title\n\nBody"
+    assert (workspace_dir / "requirements.md").read_text(encoding="utf-8") == "生成论文综述模板。"
+    assert result.success is True
+    assert result.data["docx_id"] == "test-doc"
+    assert result.data["docx_path"] == str(workspace_dir / "review.docx")
+    assert result.data["pdf_path"] == str(workspace_dir / "review.pdf")
+    assert result.data["validation_status"] == "passed"
+    assert "已通过 runtime-worker 调用 Claude Code 生成 DOCX。" in result.output
+
+
+@pytest.mark.asyncio
+async def test_docx_generate_tool_applies_docx_template_constraints(tmp_path, monkeypatch):
+    monkeypatch.setenv("UPLOAD_DIR", str(tmp_path))
+    template = DocxTemplateService().upsert_template(
+        template_id="grant-template",
+        name="Grant Template",
+        md_constraints="必须输出固定 Markdown 章节。",
+        docx_constraints="一级标题使用三号黑体。",
+        user_id=1,
+    )
+    DocxTemplateService().save_template_file(
+        template_id=template["template_id"],
+        filename="reference.docx",
+        content=b"template",
+    )
+    tool = agent_tools.DocxGenerateWithClaudeTool()
+
+    class _FakeDocxRuntimeWorkerClient:
+        @staticmethod
+        def enabled():
+            return True
+
+        async def claude(self, *, docx_id: str, workspace_dir, prompt: str, continue_session: bool):
+            assert docx_id == "templated-doc"
+            assert (workspace_dir / "template_files" / "reference.docx").is_file()
+            assert "一级标题使用三号黑体。" in (workspace_dir / "requirements.md").read_text(encoding="utf-8")
+            assert "必须输出固定 Markdown 章节。" in (workspace_dir / "template_md_constraints.md").read_text(encoding="utf-8")
+            (workspace_dir / "generated_document.docx").write_bytes(b"fake-docx")
+            return {
+                "docx_id": docx_id,
+                "workspace_dir": str(workspace_dir),
+                "prompt": prompt,
+                "continue_session": continue_session,
+                "session_id": "docx-session-id",
+                "assistant_text": "created",
+                "result_text": "All validations PASSED!",
+                "is_error": False,
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "error": None,
+                "worker": "runtime-worker",
+            }
+
+    monkeypatch.setattr(
+        "app.services.docx_runtime_service.DocxRuntimeWorkerClient",
+        _FakeDocxRuntimeWorkerClient,
+    )
+
+    result = await tool._execute(
+        docx_id="templated doc",
+        template_id=template["template_id"],
+        markdown="# Title",
+        requirements="生成项目申请书。",
+    )
+
+    assert result.success is True
+    assert result.data["template_id"] == template["template_id"]
+    assert result.data["template_files"]
+    assert result.data["md_constraints_path"].endswith("template_md_constraints.md")
 
 
 @pytest.mark.asyncio
 async def test_probe_url_requires_explicit_resolve_download_gate_for_google_drive(monkeypatch):
     tool = agent_tools.PaperResearchProbeUrlTool(db=object(), user_id=1)
 
-    async def _resolve_project_workspace(_db, *, project_id: int):
+    async def _resolve_project_payload_only(_db, *, project_id: int):
         assert project_id == 7
-        return _project_payload(), _workspace()
+        return _project_payload()
 
     class _Response:
         def __init__(self, *, status_code, url, headers, text=""):
@@ -241,7 +849,7 @@ async def test_probe_url_requires_explicit_resolve_download_gate_for_google_driv
             "page_semantics": kwargs.get("semantics") or {},
         }
 
-    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
+    monkeypatch.setattr(tool, "_resolve_project_payload_only", _resolve_project_payload_only)
     monkeypatch.setattr(agent_tools.httpx, "AsyncClient", _Client)
     monkeypatch.setattr(agent_tools, "analyze_html_page_semantics", _fake_page_semantics)
     monkeypatch.setattr(agent_tools, "probe_google_drive_confirm_download", _fake_confirm_download)
@@ -277,9 +885,9 @@ async def test_probe_url_requires_explicit_resolve_download_gate_for_google_driv
 async def test_probe_url_accepts_reference_page_after_html_resolution(monkeypatch):
     tool = agent_tools.PaperResearchProbeUrlTool(db=object(), user_id=1)
 
-    async def _resolve_project_workspace(_db, *, project_id: int):
+    async def _resolve_project_payload_only(_db, *, project_id: int):
         assert project_id == 7
-        return _project_payload(), _workspace()
+        return _project_payload()
 
     class _Response:
         def __init__(self, *, status_code, url, headers, text=""):
@@ -365,7 +973,7 @@ async def test_probe_url_accepts_reference_page_after_html_resolution(monkeypatc
             "page_semantics": kwargs.get("semantics") or {},
         }
 
-    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
+    monkeypatch.setattr(tool, "_resolve_project_payload_only", _resolve_project_payload_only)
     monkeypatch.setattr(agent_tools.httpx, "AsyncClient", _Client)
     monkeypatch.setattr(agent_tools, "analyze_html_page_semantics", _fake_page_semantics)
     monkeypatch.setattr(agent_tools, "resolve_html_probe_plan_with_llm", _fake_resolver)
@@ -389,9 +997,9 @@ async def test_probe_url_accepts_reference_page_after_html_resolution(monkeypatc
 async def test_probe_url_can_follow_html_page_link_until_file_resolves(monkeypatch):
     tool = agent_tools.PaperResearchProbeUrlTool(db=object(), user_id=1)
 
-    async def _resolve_project_workspace(_db, *, project_id: int):
+    async def _resolve_project_payload_only(_db, *, project_id: int):
         assert project_id == 7
-        return _project_payload(), _workspace()
+        return _project_payload()
 
     docs_url = "https://fasttext.cc/docs/en/dataset.html"
     file_url = "https://fasttext.cc/data/wiki-news-300d-1M.vec.zip"
@@ -496,7 +1104,7 @@ async def test_probe_url_can_follow_html_page_link_until_file_resolves(monkeypat
             "page_semantics": kwargs.get("semantics") or {},
         }
 
-    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
+    monkeypatch.setattr(tool, "_resolve_project_payload_only", _resolve_project_payload_only)
     monkeypatch.setattr(agent_tools.httpx, "AsyncClient", _Client)
     monkeypatch.setattr(agent_tools, "analyze_html_page_semantics", _fake_page_semantics)
     monkeypatch.setattr(agent_tools, "resolve_html_probe_plan_with_llm", _fake_resolver)
@@ -558,118 +1166,6 @@ async def test_paper_research_git_tools_surface_repo_state(tmp_path, monkeypatch
     assert show_result.success is True
     assert "print('v1')" in show_result.data["content"]
     assert show_result.data["repo_relative_path"] == "train.py"
-
-
-@pytest.mark.asyncio
-async def test_repo_first_tools_do_not_require_grounding_report(tmp_path, monkeypatch):
-    project_payload = _project_payload()
-    workspace = _workspace()
-
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return project_payload, workspace
-
-    implementation_tool = agent_tools.PaperResearchWriteImplementationSpecTool(db=object(), user_id=1)
-    monkeypatch.setattr(implementation_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(implementation_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-    repo_dir = tmp_path / "repo" / "source"
-    repo_dir.mkdir(parents=True, exist_ok=True)
-    (repo_dir / "main.py").write_text("print('ok')\n", encoding="utf-8")
-    implementation_result = await implementation_tool._execute(
-        project_id=7,
-        implementation_spec={"source_summary": {}, "baseline": {}, "repo_plan": {}, "runtime_snapshot": {}, "data_plan": {}, "tuning_plan": {}, "readiness": {}},
-    )
-    assert implementation_result.success is True
-
-    execution_spec_tool = agent_tools.PaperResearchWriteExecutionSpecTool(db=object(), user_id=1)
-    monkeypatch.setattr(execution_spec_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(execution_spec_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-    execution_spec_result = await execution_spec_tool._execute(
-        project_id=7,
-        execution_spec={"execution_id": "baseline", "runtime_type": "plain-python", "command": [sys.executable, "main.py"], "cwd": "repo/source"},
-    )
-    assert execution_spec_result.success is True
-
-    execution_script_tool = agent_tools.PaperResearchWriteExecutionScriptTool(db=object(), user_id=1)
-    monkeypatch.setattr(execution_script_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(execution_script_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-    execution_script_result = await execution_script_tool._execute(
-        project_id=7,
-        execution_id="baseline",
-        relative_path="variant.py",
-        content="print('hi')\n",
-    )
-    assert execution_script_result.success is True
-
-    ProjectRuntimeService().write_execution_spec(
-        workspace_dir=tmp_path,
-        project_id=7,
-        workspace_id=int(workspace.id),
-        notebook_id=str(workspace.notebook_id or ""),
-        execution_spec={
-            "execution_id": "baseline-start",
-            "runtime_type": "plain-python",
-            "command": [sys.executable, "main.py"],
-            "cwd": "repo/source",
-        },
-    )
-
-    async def _fake_start_execution(self, *, project_id: int, workspace_id: int, workspace_dir, execution_id: str):
-        assert project_id == 7
-        assert workspace_id == int(workspace.id)
-        assert execution_id == "baseline-start"
-        return {
-            "execution_id": execution_id,
-            "status": "running",
-            "runtime_type": "plain-python",
-            "background_execution": {"execution_id": execution_id, "stage": "baseline_repro"},
-        }
-
-    monkeypatch.setattr(ProjectRuntimeService, "start_execution", _fake_start_execution)
-
-    start_tool = agent_tools.PaperResearchStartExecutionTool(db=object(), user_id=1)
-    monkeypatch.setattr(start_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(start_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-    start_result = await start_tool._execute(project_id=7, execution_id="baseline-start")
-    assert start_result.success is True
-
-
-@pytest.mark.asyncio
-async def test_repo_first_tools_do_not_stop_at_blocked_grounding_report(tmp_path, monkeypatch):
-    project_payload = _project_payload()
-    workspace = _workspace()
-
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return project_payload, workspace
-
-    specs_dir = tmp_path / "specs"
-    specs_dir.mkdir(parents=True, exist_ok=True)
-    (specs_dir / "grounding_report.json").write_text(
-        json.dumps(_blocked_grounding_payload(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    implementation_tool = agent_tools.PaperResearchWriteImplementationSpecTool(db=object(), user_id=1)
-    monkeypatch.setattr(implementation_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(implementation_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-    repo_dir = tmp_path / "repo" / "source"
-    repo_dir.mkdir(parents=True, exist_ok=True)
-    (repo_dir / "main.py").write_text("print('ok')\n", encoding="utf-8")
-    implementation_result = await implementation_tool._execute(
-        project_id=7,
-        implementation_spec={"source_summary": {}, "baseline": {}, "repo_plan": {}, "runtime_snapshot": {}, "data_plan": {}, "tuning_plan": {}, "readiness": {}},
-    )
-    assert implementation_result.success is True
-
-    execution_spec_tool = agent_tools.PaperResearchWriteExecutionSpecTool(db=object(), user_id=1)
-    monkeypatch.setattr(execution_spec_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(execution_spec_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-    execution_spec_result = await execution_spec_tool._execute(
-        project_id=7,
-        execution_spec={"execution_id": "blocked-grounding-baseline", "runtime_type": "plain-python", "command": [sys.executable, "main.py"], "cwd": "repo/source"},
-    )
-    assert execution_spec_result.success is True
 
 
 @pytest.mark.asyncio
@@ -791,75 +1287,41 @@ async def test_assess_repo_mainpath_uses_readme_reproduction_intake_when_availab
 
 
 @pytest.mark.asyncio
-async def test_build_zoekt_index_tool_returns_manifest_payload(tmp_path, monkeypatch):
-    tool = agent_tools.PaperResearchBuildZoektIndexTool(db=object(), user_id=1)
+async def test_search_project_zoekt_tool_returns_project_relative_matches(tmp_path, monkeypatch):
+    tool = agent_tools.PaperResearchSearchProjectZoektTool(db=object(), user_id=1)
 
-    async def _resolve_project_workspace(_db, *, project_id: int):
+    async def _resolve_project_payload_only(_db, *, project_id: int):
         assert project_id == 7
-        return _project_payload(), _workspace()
+        return _project_payload()
 
-    repo_dir = tmp_path / "paper_repo"
-    repo_dir.mkdir(parents=True, exist_ok=True)
-
-    async def _fake_build_index(*, repo_dir, workspace_dir, force_reindex=False):
-        assert repo_dir == tmp_path / "paper_repo"
-        assert workspace_dir == tmp_path
-        return {
-            "success": True,
-            "available": True,
-            "status": "created",
-            "engine": "zoekt-git-index",
-            "repo_head": "abc123",
-            "repo_dirty": False,
-            "index_dir": str(tmp_path / ".zoekt" / "index"),
-            "manifest_path": str(tmp_path / ".zoekt" / "manifest.json"),
-            "index_file_count": 1,
-            "search_binary": "/usr/local/bin/zoekt",
-            "git_index_binary": "/usr/local/bin/zoekt-git-index",
-            "plain_index_binary": "/usr/local/bin/zoekt-index",
-        }
-
-    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-    monkeypatch.setattr(agent_tools.ZoektCliService, "build_index", _fake_build_index)
-
-    result = await tool._execute(project_id=7, force_reindex=False)
-
-    assert result.success is True
-    assert result.data["status"] == "created"
-    assert result.data["index_file_count"] == 1
-    assert "Zoekt 索引已就绪" in result.output
-
-
-@pytest.mark.asyncio
-async def test_search_repo_zoekt_tool_enriches_context_from_repo_files(tmp_path, monkeypatch):
-    tool = agent_tools.PaperResearchSearchRepoZoektTool(db=object(), user_id=1)
-
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return _project_payload(), _workspace()
-
-    repo_dir = tmp_path / "paper_repo"
-    repo_dir.mkdir(parents=True, exist_ok=True)
-    (repo_dir / "classification-results.sh").write_text(
-        "#!/usr/bin/env bash\nset -e\nbash classification-results.sh --dry-run\n",
+    reference_dir = tmp_path / "reference" / "paper"
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    (reference_dir / "paper_interpretation.md").write_text(
+        json.dumps(
+            {
+                "status": "grounded",
+                "summary": "classification-results entrypoint confirmed",
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
-    async def _fake_build_index(*, repo_dir, workspace_dir, force_reindex=False):
-        assert repo_dir == tmp_path / "paper_repo"
+    async def _fake_build_project_index(*, project_dir, workspace_dir, force_reindex=False):
+        assert project_dir == tmp_path
         assert workspace_dir == tmp_path
         return {
             "success": True,
             "available": True,
             "status": "created",
-            "index_dir": str(tmp_path / ".zoekt" / "index"),
+            "index_dir": str(tmp_path / ".zoekt_project" / "index"),
             "search_binary": "/usr/local/bin/zoekt",
             "git_index_binary": "/usr/local/bin/zoekt-git-index",
             "plain_index_binary": "/usr/local/bin/zoekt-index",
         }
 
-    async def _fake_search(*, workspace_dir, query, max_results):
+    async def _fake_search_project(*, workspace_dir, query, max_results):
         assert workspace_dir == tmp_path
         assert query == "classification-results"
         assert max_results == 5
@@ -868,678 +1330,163 @@ async def test_search_repo_zoekt_tool_enriches_context_from_repo_files(tmp_path,
             "available": True,
             "engine": "zoekt",
             "query": query,
-            "index_dir": str(tmp_path / ".zoekt" / "index"),
-            "manifest_path": str(tmp_path / ".zoekt" / "manifest.json"),
-            "matched_files": ["classification-results.sh"],
+            "index_dir": str(tmp_path / ".zoekt_project" / "index"),
+            "manifest_path": str(tmp_path / ".zoekt_project" / "manifest.json"),
+            "matched_files": ["reference/paper/paper_interpretation.md"],
+            "matched_relative_paths": ["reference/paper/paper_interpretation.md"],
             "truncated": False,
             "matches": [
                 {
-                    "repo_relative_path": "classification-results.sh",
-                    "relative_path": "repo/source/classification-results.sh",
+                    "source_relative_path": "reference/paper/paper_interpretation.md",
+                    "relative_path": "reference/paper/paper_interpretation.md",
                     "line_number": 3,
-                    "line_text": "bash classification-results.sh --dry-run",
-                    "line_fragments": [{"line_offset": 5, "match_length": 22, "text": "classification-results"}],
+                    "line_text": '  "summary": "classification-results entrypoint confirmed"',
+                    "line_fragments": [{"line_offset": 14, "match_length": 22, "text": "classification-results"}],
                     "match_source": "content",
-                    "score": 12.5,
+                    "score": 8.0,
                 }
             ],
         }
 
-    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-    monkeypatch.setattr(agent_tools.ZoektCliService, "build_index", _fake_build_index)
-    monkeypatch.setattr(agent_tools.ZoektCliService, "search", _fake_search)
+    monkeypatch.setattr(tool, "_resolve_project_payload_only", _resolve_project_payload_only)
+    monkeypatch.setattr(tool, "_project_dir_for", lambda _project_id: tmp_path)
+    monkeypatch.setattr(agent_tools.ZoektCliService, "build_project_index", _fake_build_project_index)
+    monkeypatch.setattr(agent_tools.ZoektCliService, "search_project", _fake_search_project)
 
     result = await tool._execute(project_id=7, query="classification-results", max_results=5, context_lines=1)
 
     assert result.success is True
     assert result.data["engine"] == "zoekt"
-    assert result.data["matches"][0]["repo_relative_path"] == "classification-results.sh"
-    assert "context 2-3" in result.output
-    assert "classification-results.sh --dry-run" in result.output
+    assert result.data["matches"][0]["project_relative_path"] == "reference/paper/paper_interpretation.md"
+    assert "已使用 Zoekt 搜索 Project 根目录" in result.output
+    assert "context 2-4" in result.output
+    assert "classification-results entrypoint confirmed" in result.output
 
 
 @pytest.mark.asyncio
-async def test_run_aider_tool_repo_mode_delegates_to_service(tmp_path, monkeypatch):
-    tool = agent_tools.PaperResearchRunAiderTool(db=object(), user_id=1)
+async def test_prepare_tool_runs_project_reference_builder(monkeypatch):
+    tool = agent_tools.PaperResearchPrepareTool(db=object(), user_id=1)
+    paper = SimpleNamespace(
+        id=113,
+        title="Example Paper",
+        year=2024,
+        venue="ICML",
+        arxiv_id="2401.00001",
+    )
 
-    async def _resolve_repo_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return _project_payload(), _workspace(), tmp_path / "paper_repo", None
+    async def _resolve_paper(_db, *, paper_id=None, paper_title=None):
+        assert paper_id == 113
+        assert paper_title is None
+        return paper
 
-    monkeypatch.setattr(tool, "_resolve_repo_workspace", _resolve_repo_workspace)
-    monkeypatch.setattr(tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-
-    captured = {}
-
-    async def _fake_run(**kwargs):
-        captured.update(kwargs)
+    async def _resolve_project_payload(_service, *, paper, project_id, project_title=None, user_goal=None, create_project=False):
+        assert paper.id == 113
+        assert project_id is None
+        assert create_project is True
         return {
-            "success": True,
-            "run_id": "run123",
-            "run_dir": str(tmp_path / "aider_runs" / "run123"),
-            "target_root": "repo",
-            "mode": "architect",
-            "dry_run": False,
-            "changed_file_count": 1,
-            "changed_files": ["foo.py"],
-            "stdout_path": str(tmp_path / "aider_runs" / "run123" / "stdout.log"),
-            "stdout_excerpt": "updated foo.py",
-            "diff_path": str(tmp_path / "aider_runs" / "run123" / "changes.patch"),
+            "id": 7,
+            "title": "Example Project",
+            "status": "draft",
+            "goal": None,
+            "paper_count": 1,
+            "workspace_count": 0,
         }
 
-    monkeypatch.setattr(agent_tools.AiderCliService, "run", _fake_run)
-
-    result = await tool._execute(
-        project_id=7,
-        instruction="Update foo.py.",
-        target_root="repo",
-        mode="architect",
-        editable_files=["foo.py"],
-        read_only_files=["README.md"],
-        context_artifacts=["paper_summary"],
-        llm_provider="openai",
-        model_name="gpt-4o-mini",
-        auto_test=True,
-        test_cmd="pytest -q",
-    )
-
-    assert result.success is True
-    assert captured["workspace_dir"] == tmp_path
-    assert captured["target_root"] == "repo"
-    assert captured["editable_files"] == ["foo.py"]
-    assert captured["read_only_files"] == ["README.md"]
-    assert captured["context_artifacts"] == ["paper_summary"]
-    assert result.data["aider_run"]["run_id"] == "run123"
-    assert result.data["aider_run"]["changed_files"] == ["foo.py"]
-    assert "updated foo.py" in result.output
-
-
-@pytest.mark.asyncio
-async def test_read_aider_run_tool_returns_archived_payload(tmp_path, monkeypatch):
-    tool = agent_tools.PaperResearchReadAiderRunTool(db=object(), user_id=1)
-
-    async def _resolve_project_workspace(_db, *, project_id: int):
+    async def _fake_build(self, *, paper, project_id, user_id, refresh=False):
+        assert paper.id == 113
         assert project_id == 7
-        return _project_payload(), _workspace()
-
-    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-    monkeypatch.setattr(
-        agent_tools.AiderCliService,
-        "read_run",
-        lambda **kwargs: {
-            "success": True,
-            "run_id": kwargs["run_id"],
-            "stdout": "aider stdout",
-            "diff": "--- a/foo.py\n+++ b/foo.py\n",
-            "prompt": "fix foo",
-        },
-    )
-
-    result = await tool._execute(
-        project_id=7,
-        run_id="run123",
-        include_stdout=True,
-        include_prompt=True,
-        include_diff=True,
-    )
-
-    assert result.success is True
-    assert result.data["run_id"] == "run123"
-    assert "aider stdout" in result.output
-    assert "+++ b/foo.py" in result.output
-    assert "fix foo" in result.output
-
-
-@pytest.mark.asyncio
-async def test_tail_aider_log_tool_returns_tail(tmp_path, monkeypatch):
-    tool = agent_tools.PaperResearchTailAiderLogTool(db=object(), user_id=1)
-
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return _project_payload(), _workspace()
-
-    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-    monkeypatch.setattr(
-        agent_tools.AiderCliService,
-        "tail_log",
-        lambda **kwargs: {
-            "success": True,
-            "run_id": kwargs["run_id"],
-            "tail": "recent aider output",
-            "stdout_path": str(tmp_path / "aider_runs" / kwargs["run_id"] / "stdout.log"),
-        },
-    )
-
-    result = await tool._execute(project_id=7, run_id="run123", max_chars=8000)
-
-    assert result.success is True
-    assert result.data["run_id"] == "run123"
-    assert "recent aider output" in result.output
-
-
-@pytest.mark.asyncio
-async def test_grounding_report_requires_successful_probe_results_for_grounded_urls(tmp_path, monkeypatch):
-    write_tool = agent_tools.PaperResearchWriteGroundingReportTool(db=object(), user_id=1)
-
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return _project_payload(), _workspace()
-
-    monkeypatch.setattr(write_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(write_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-
-    payload = _complete_grounding_payload()
-    payload["dataset"]["sources"] = [
-        "https://example.com/ag_news.csv",
-        "https://example.com/dbpedia.csv",
-    ]
-    payload["dataset"]["local_presence"] = {"available": False}
-    payload["external_dependencies"]["urls"] = [
-        "https://example.com/ag_news.csv",
-        "https://example.com/dbpedia.csv",
-    ]
-    payload["external_dependencies"]["probe_results"] = [
-        {"url": "https://example.com/ag_news.csv", "ok": True},
-    ]
-
-    result = await write_tool._execute(project_id=7, grounding_report=payload)
-
-    assert result.success is False
-    assert result.error == "grounding_report_invalid"
-    assert any("external_dependencies.status" in str(item) for item in result.data["validation_errors"])
-    assert any("dataset.status" in str(item) for item in result.data["validation_errors"])
-    assert any(item.get("path") == "external_dependencies.urls" for item in result.data["structured_validation_errors"])
-    assert any(item.get("path") == "dataset.sources" for item in result.data["structured_validation_errors"])
-
-
-@pytest.mark.asyncio
-async def test_grounding_report_rejects_failed_probe_for_grounded_external_urls(tmp_path, monkeypatch):
-    write_tool = agent_tools.PaperResearchWriteGroundingReportTool(db=object(), user_id=1)
-
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return _project_payload(), _workspace()
-
-    monkeypatch.setattr(write_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(write_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-
-    payload = _complete_grounding_payload()
-    payload["external_dependencies"]["urls"] = ["https://example.com/ag_news.csv"]
-    payload["external_dependencies"]["probe_results"] = [
-        {"url": "https://example.com/ag_news.csv", "ok": False},
-    ]
-
-    result = await write_tool._execute(project_id=7, grounding_report=payload)
-
-    assert result.success is False
-    assert result.error == "grounding_report_invalid"
-    assert result.data["validation_errors"]
-
-
-@pytest.mark.asyncio
-async def test_grounding_report_normalizes_nested_url_probe_results_and_dataset_aliases(tmp_path, monkeypatch):
-    write_tool = agent_tools.PaperResearchWriteGroundingReportTool(db=object(), user_id=1)
-
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return _project_payload(), _workspace()
-
-    monkeypatch.setattr(write_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(write_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-
-    payload = _complete_grounding_payload()
-    payload["dataset"] = {
-        "status": "grounded",
-        "datasets": [
-            {"name": "AG News", "source_url": "https://example.com/ag_news.csv"},
-            {"name": "DBPedia", "source_url": "https://example.com/dbpedia.csv"},
-        ],
-        "local_presence": {"available": False},
-        "blockers": [],
-    }
-    payload["external_dependencies"] = {
-        "status": "grounded",
-        "urls": [
-            {
-                "url": "https://example.com/ag_news.csv",
-                "probe_results": [{"ok": True, "status_code": 206}],
-            },
-            {
-                "url": "https://example.com/dbpedia.csv",
-                "probe_results": [{"ok": True, "status_code": 206}],
-            },
-        ],
-        "blockers": [],
-    }
-
-    result = await write_tool._execute(project_id=7, grounding_report=payload)
-
-    assert result.success is True
-    content = result.data["content"]
-    assert content["dataset"]["sources"] == [
-        {"name": "AG News", "source_url": "https://example.com/ag_news.csv"},
-        {"name": "DBPedia", "source_url": "https://example.com/dbpedia.csv"},
-    ]
-    assert content["external_dependencies"]["urls"] == [
-        "https://example.com/ag_news.csv",
-        "https://example.com/dbpedia.csv",
-    ]
-    assert [item["url"] for item in content["external_dependencies"]["probe_results"]] == [
-        "https://example.com/ag_news.csv",
-        "https://example.com/dbpedia.csv",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_grounding_report_inferrs_ok_from_probe_status_fields(tmp_path, monkeypatch):
-    write_tool = agent_tools.PaperResearchWriteGroundingReportTool(db=object(), user_id=1)
-
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return _project_payload(), _workspace()
-
-    monkeypatch.setattr(write_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(write_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-
-    payload = _complete_grounding_payload()
-    payload["dataset"] = {
-        "status": "grounded",
-        "sources": [
-            "https://dl.fbaipublicfiles.com/fasttext/supervised-models/ag_news.bin",
-            "https://dl.fbaipublicfiles.com/fasttext/supervised-models/dbpedia.bin",
-        ],
-        "local_presence": {"available": False},
-        "blockers": [],
-    }
-    payload["external_dependencies"] = {
-        "status": "grounded",
-        "urls": [
-            {
-                "url": "https://dl.fbaipublicfiles.com/fasttext/supervised-models/ag_news.bin",
-                "probe_results": [
-                    {
-                        "status": 206,
-                        "content_type": "application/octet-stream",
-                        "kind": "binary",
-                        "diagnosis": "valid_binary",
-                    }
-                ],
-            },
-            {
-                "url": "https://dl.fbaipublicfiles.com/fasttext/supervised-models/dbpedia.bin",
-                "probe_results": [
-                    {
-                        "status_code": 206,
-                        "content_type": "application/octet-stream",
-                        "detected_kind": "file",
-                        "diagnosis": "valid_binary",
-                    }
-                ],
-            },
-        ],
-        "blockers": [],
-    }
-
-    result = await write_tool._execute(project_id=7, grounding_report=payload)
-
-    assert result.success is True
-    content = result.data["content"]
-    assert [item["ok"] for item in content["external_dependencies"]["probe_results"]] == [True, True]
-
-
-@pytest.mark.asyncio
-async def test_grounding_report_rejects_html_landing_page_probe_for_grounded_url(tmp_path, monkeypatch):
-    write_tool = agent_tools.PaperResearchWriteGroundingReportTool(db=object(), user_id=1)
-
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return _project_payload(), _workspace()
-
-    monkeypatch.setattr(write_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(write_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-
-    payload = _complete_grounding_payload()
-    payload["dataset"] = {
-        "status": "grounded",
-        "sources": ["https://drive.google.com/file/d/demo/view"],
-        "local_presence": {"available": False},
-        "blockers": [],
-    }
-    payload["external_dependencies"] = {
-        "status": "grounded",
-        "urls": ["https://drive.google.com/file/d/demo/view"],
-        "probe_results": [
-            {
-                "url": "https://drive.google.com/file/d/demo/view",
-                "status_code": 200,
-                "content_type": "text/html; charset=utf-8",
-                "detected_kind": "html",
-                "diagnosis": "html_page",
-            }
-        ],
-        "blockers": [],
-    }
-
-    result = await write_tool._execute(project_id=7, grounding_report=payload)
-
-    assert result.success is False
-    assert result.error == "grounding_report_invalid"
-    assert result.data["validation_errors"]
-
-
-@pytest.mark.asyncio
-async def test_implementation_spec_returns_grounding_conflicts(tmp_path, monkeypatch):
-    write_tool = agent_tools.PaperResearchWriteImplementationSpecTool(db=object(), user_id=1)
-
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return _project_payload(), _workspace()
-
-    monkeypatch.setattr(write_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(write_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-
-    specs_dir = tmp_path / "specs"
-    specs_dir.mkdir(parents=True, exist_ok=True)
-    grounding_payload = _complete_grounding_payload()
-    grounding_payload["entrypoint"]["selected_candidate"] = {"path": "classification-results.sh"}
-    (specs_dir / "grounding_report.json").write_text(
-        json.dumps(grounding_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    repo_dir = tmp_path / "paper_repo"
-    repo_dir.mkdir(parents=True, exist_ok=True)
-    (repo_dir / "train.py").write_text("print('train')\n", encoding="utf-8")
-
-    from app.services.project_runtime_service import ProjectRuntimeService
-
-    async def _fake_inspect_runtime(self, **kwargs):
+        assert user_id == 1
+        assert refresh is False
         return {
-            "repo": {"detected_root_relative_path": "repo/source"},
-            "runtime_worker": {"available": True, "environment": {"packages": {}, "commands": {}}},
-            "runtime_candidates": [{"runtime_type": "plain-python", "status": "ready", "reason": "ok"}],
+            "project_id": 7,
+            "project_root": "/app/uploads/projects/7",
+            "reference_root": "/app/uploads/projects/7/reference",
+            "reference_ready": True,
+            "reference_files": [
+                "reference/paper/paper_pdf2md.md",
+                "reference/paper/paper_interpretation.md",
+                "reference/paper/paper_interpretation.json",
+                "reference/repo/readme_intake.json",
+            ],
+            "repo_reference": {
+                "repo_materialization": {
+                    "status": "reused",
+                    "repo_source_dir": "/app/uploads/projects/7/repo/source",
+                }
+            },
         }
 
-    monkeypatch.setattr(ProjectRuntimeService, "inspect_runtime", _fake_inspect_runtime)
+    monkeypatch.setattr(tool, "_resolve_paper", _resolve_paper)
+    monkeypatch.setattr(tool, "_resolve_project_payload", _resolve_project_payload)
+    monkeypatch.setattr(project_reference_builder_service.ProjectReferenceBuilderService, "build", _fake_build)
 
-    payload = {
-        "source_summary": {},
-        "baseline": {
-            "entrypoint_type": "repo_script",
-            "entrypoint_path_or_hint": "train.py",
-        },
-        "repo_plan": {"repo_status": "grounded"},
-        "runtime_snapshot": {},
-        "data_plan": {},
-        "tuning_plan": {},
-        "readiness": {
-            "can_create_run_draft": False,
-            "can_execute": False,
-            "external_dependencies_grounded": False,
-        },
-    }
-
-    result = await write_tool._execute(project_id=7, implementation_spec=payload)
-
-    assert result.success is False
-    assert result.error == "implementation_spec_invalid"
-    conflicts = list(result.data.get("grounding_conflicts") or [])
-    assert any(item.get("path") == "baseline.entrypoint_path_or_hint" for item in conflicts)
-    assert any(item.get("path") == "readiness.external_dependencies_grounded" for item in conflicts)
-
-
-@pytest.mark.asyncio
-async def test_run_drafts_returns_draft_level_errors(tmp_path, monkeypatch):
-    write_tool = agent_tools.PaperResearchWriteRunDraftsTool(db=object(), user_id=1)
-
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return _project_payload(), _workspace()
-
-    monkeypatch.setattr(write_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(write_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-
-    specs_dir = tmp_path / "specs"
-    specs_dir.mkdir(parents=True, exist_ok=True)
-    (specs_dir / "grounding_report.json").write_text(
-        json.dumps(_complete_grounding_payload(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    payload = {
-        "drafts": [
-            {
-                "id": "baseline_ag_news",
-                "kind": "baseline_repro",
-                "title": "Baseline AG News",
-                "objective": "Run baseline",
-                "entrypoint": {"type": "repo_script", "path_or_hint": "missing.py"},
-                "depends_on": [],
-                "data_requirements": [],
-                "env_requirements": [],
-                "params": {},
-                "expected_outputs": [],
-                "blockers": [],
-                "evidence_files": ["specs/implementation_spec.json"],
-                "grounding_notes": [],
-            }
-        ]
-    }
-
-    result = await write_tool._execute(project_id=7, run_drafts=payload)
-
-    assert result.success is False
-    assert result.error == "run_drafts_schema_invalid"
-    draft_errors = list(result.data.get("draft_errors") or [])
-    assert draft_errors
-    assert draft_errors[0]["draft_id"] == "baseline_ag_news"
-    assert any(item.get("path") == "entrypoint.path_or_hint" for item in draft_errors[0]["errors"])
-
-
-@pytest.mark.asyncio
-async def test_grounding_report_normalizes_blocked_sources_and_verified_sections(tmp_path, monkeypatch):
-    write_tool = agent_tools.PaperResearchWriteGroundingReportTool(db=object(), user_id=1)
-
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return _project_payload(), _workspace()
-
-    monkeypatch.setattr(write_tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(write_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-
-    payload = _complete_grounding_payload()
-    payload["repo"] = {
-        "status": "unknown",
-        "url": "https://github.com/facebookresearch/fastText.git",
-        "default_branch": "main",
-        "verification_status": "verified",
-        "blockers": [],
-    }
-    payload["entrypoint"] = {
-        "status": "unknown",
-        "selected_candidate": {"path": "main.py"},
-        "evidence_files": ["repo/source/main.py"],
-        "verification_status": "verified",
-        "blockers": [],
-    }
-    payload["dataset"] = {
-        "status": "blocked",
-        "sources": [
-            {"name": "IMDB", "source_url": "https://example.com/imdb.bin"},
-        ],
-        "local_presence": {"available": False},
-        "blockers": [],
-        "alternative_source_candidates": [
-            {
-                "url": "https://mirror.example.com/imdb.bin",
-                "source_type": "mirror",
-                "status": "candidate",
-            }
-        ],
-    }
-    payload["external_dependencies"] = {
-        "status": "blocked",
-        "urls": ["https://example.com/imdb.bin"],
-        "probe_results": [
-            {"url": "https://example.com/imdb.bin", "status": 403, "diagnosis": "http_403"},
-        ],
-        "blockers": [],
-        "alternative_source_candidates": [
-            {
-                "url": "https://mirror.example.com/imdb.bin",
-                "source_type": "mirror",
-                "status": "candidate",
-            }
-        ],
-    }
-    payload["summary"] = {}
-
-    result = await write_tool._execute(project_id=7, grounding_report=payload)
+    result = await tool._execute(paper_id=113, create_project=True, refresh_intake=False)
 
     assert result.success is True
-    content = result.data["content"]
-    assert content["repo"]["status"] == "grounded"
-    assert content["entrypoint"]["status"] == "grounded"
-    assert content["dataset"]["status"] == "blocked"
-    assert "Official dataset source blocked: IMDB (HTTP 403, http_403)" in content["dataset"]["blockers"]
-    assert "Official external dependency blocked: https://example.com/imdb.bin (HTTP 403, http_403)" in content["external_dependencies"]["blockers"]
-    assert content["summary"]["overall_status"] == "blocked"
-    assert any("Official dataset source blocked" in item for item in content["summary"]["blockers"])
-    assert content["external_dependencies"]["alternative_source_candidates"][0]["url"] == "https://mirror.example.com/imdb.bin"
-    assert "alternative_source_candidates" not in " ".join(content["summary"]["next_actions"])
+    assert result.data["project"]["id"] == 7
+    assert result.data["reference_builder"]["reference_ready"] is True
+    assert "Project reference builder 完成" in result.output
+    assert "reference/paper/paper_pdf2md.md" in result.output
+    assert "Repo status: reused" in result.output
 
 
 @pytest.mark.asyncio
-async def test_workspace_output_tools_support_list_delete_and_scope_cleanup(tmp_path, monkeypatch):
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return _project_payload(), _workspace()
+async def test_status_tool_resolves_project_from_paper_and_lists_reference_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("UPLOAD_DIR", str(tmp_path / "uploads"))
 
-    (tmp_path / "paper_summary.json").write_text("{}", encoding="utf-8")
-    specs_dir = tmp_path / "specs"
-    specs_dir.mkdir(parents=True, exist_ok=True)
-    (specs_dir / "grounding_report.json").write_text("{}", encoding="utf-8")
+    tool = agent_tools.PaperResearchStatusTool(db=object(), user_id=1)
+    paper = SimpleNamespace(
+        id=113,
+        title="Example Paper",
+        year=2024,
+        venue="ICML",
+        arxiv_id="2401.00001",
+    )
 
-    list_tool = agent_tools.PaperResearchListOutputsTool(db=object(), user_id=1)
-    delete_tool = agent_tools.PaperResearchDeleteOutputTool(db=object(), user_id=1)
-    cleanup_tool = agent_tools.PaperResearchCleanupScopeTool(db=object(), user_id=1)
-    for tool in [list_tool, delete_tool, cleanup_tool]:
-        monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
-        monkeypatch.setattr(tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
+    project_root = tmp_path / "uploads" / "projects" / "8"
+    for relative_path in (
+        "reference/paper/paper_pdf2md.md",
+        "reference/paper/paper_interpretation.md",
+        "reference/repo/readme_intake.json",
+    ):
+        path = project_root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ok\n", encoding="utf-8")
 
-    async def _list_workspace_outputs(self, *, project_id: int, user_id: int, workspace_id: int):
-        assert project_id == 7 and user_id == 1 and workspace_id == 21
-        return [
-            {
-                "relative_path": "paper_summary.json",
-                "scope": "planning",
-                "kind": "json",
-                "present": True,
-            },
-            {
-                "relative_path": "specs/grounding_report.json",
-                "scope": "grounding",
-                "kind": "json",
-                "present": True,
-            },
-        ]
+    async def _resolve_paper(_db, *, paper_id=None, paper_title=None):
+        assert paper_id == 113
+        assert paper_title is None
+        return paper
 
-    async def _delete_workspace_output(self, *, project_id: int, user_id: int, workspace_id: int, relative_path: str):
-        assert project_id == 7 and user_id == 1 and workspace_id == 21
-        target = tmp_path / relative_path
-        if not target.exists():
-            return None
-        target.unlink()
-        return {"success": True, "relative_path": relative_path, "deleted": True}
-
-    async def _cleanup_workspace_outputs_scope(self, *, project_id: int, user_id: int, workspace_id: int, scope: str):
-        assert project_id == 7 and user_id == 1 and workspace_id == 21
-        deleted = []
-        if scope == "planning":
-            target = tmp_path / "paper_summary.json"
-            if target.exists():
-                target.unlink()
-                deleted.append("paper_summary.json")
+    async def _resolve_project_payload(_service, *, paper, project_id, create_project=False):
+        assert paper.id == 113
+        assert project_id is None
+        assert create_project is False
         return {
-            "project_id": project_id,
-            "workspace_id": workspace_id,
-            "scope": scope,
-            "deleted_file_count": len(deleted),
-            "deleted_dir_count": 0,
-            "deleted_run_count": 0,
-            "deleted_paths": deleted,
+            "id": 8,
+            "title": "Example Project",
+            "status": "draft",
+            "goal": None,
+            "paper_count": 1,
+            "workspace_count": 0,
+            "primary_paper": {
+                "id": 113,
+                "title": "Example Paper",
+            },
         }
 
-    monkeypatch.setattr(ProjectService, "list_workspace_outputs", _list_workspace_outputs)
-    monkeypatch.setattr(ProjectService, "delete_workspace_output", _delete_workspace_output)
-    monkeypatch.setattr(ProjectService, "cleanup_workspace_outputs_scope", _cleanup_workspace_outputs_scope)
+    monkeypatch.setattr(tool, "_resolve_paper", _resolve_paper)
+    monkeypatch.setattr(tool, "_resolve_project_payload", _resolve_project_payload)
 
-    list_result = await list_tool._execute(project_id=7, scope="all")
-    assert list_result.success is True
-    assert list_result.data["count"] == 2
-    assert any(item["relative_path"] == "paper_summary.json" for item in list_result.data["outputs"])
-
-    delete_result = await delete_tool._execute(project_id=7, relative_path="specs/grounding_report.json")
-    assert delete_result.success is True
-    assert not (tmp_path / "specs" / "grounding_report.json").exists()
-
-    cleanup_result = await cleanup_tool._execute(project_id=7, scope="planning")
-    assert cleanup_result.success is True
-    assert cleanup_result.data["deleted_file_count"] == 1
-    assert cleanup_result.data["scope"] == "planning"
-    assert not (tmp_path / "paper_summary.json").exists()
-
-
-@pytest.mark.asyncio
-async def test_search_outputs_finds_matches_in_planning_artifacts(tmp_path, monkeypatch):
-    async def _resolve_project_workspace(_db, *, project_id: int):
-        assert project_id == 7
-        return _project_payload(), _workspace()
-
-    markdown_path = tmp_path / "paper_intake_markdown.md"
-    markdown_path.write_text(
-        "# Bag of Tricks\n\nThe paper studies fastText and AG News.\nAnother line.\n",
-        encoding="utf-8",
-    )
-    summary_path = tmp_path / "paper_summary.json"
-    summary_path.write_text('{"method":"fastText baseline"}', encoding="utf-8")
-
-    tool = agent_tools.PaperResearchSearchOutputsTool(db=object(), user_id=1)
-    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
-    monkeypatch.setattr(tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-
-    async def _list_workspace_outputs(self, *, project_id: int, user_id: int, workspace_id: int):
-        assert project_id == 7 and user_id == 1 and workspace_id == 21
-        return [
-            {
-                "relative_path": "paper_intake_markdown.md",
-                "scope": "planning",
-                "kind": "markdown",
-                "storage": "file",
-                "present": True,
-            },
-            {
-                "relative_path": "paper_summary.json",
-                "scope": "planning",
-                "kind": "json",
-                "storage": "file",
-                "present": True,
-            },
-        ]
-
-    monkeypatch.setattr(ProjectService, "list_workspace_outputs", _list_workspace_outputs)
-
-    result = await tool._execute(project_id=7, query="AG News", scope="planning", context_lines=1)
+    result = await tool._execute(paper_id=113)
 
     assert result.success is True
-    assert result.data["matched_file_count"] == 1
-    assert result.data["searchable_output_count"] == 2
-    assert result.data["matches"][0]["relative_path"] == "paper_intake_markdown.md"
-    assert result.data["matches"][0]["line_number"] == 3
-    assert "AG News" in result.data["matches"][0]["line_text"]
-    assert result.data["matches"][0]["context_start_line"] == 2
-    assert result.data["matches"][0]["context_end_line"] == 4
-    assert "AG News" in str(result.data["matches"][0].get("context_text") or "")
+    assert result.data["project"]["id"] == 8
+    assert result.data["reference_ready"] is False
+    assert result.data["reference_files"] == [
+        "reference/paper/paper_pdf2md.md",
+        "reference/paper/paper_interpretation.md",
+        "reference/repo/readme_intake.json",
+    ]
+    assert "paper_id=113" in result.output
+    assert "/projects/8" in result.output

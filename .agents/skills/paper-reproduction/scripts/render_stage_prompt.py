@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render short seed prompts for paper reproduction stages."""
+"""Render stage prompts for the project-first paper-reproduction skill."""
 
 from __future__ import annotations
 
@@ -17,115 +17,32 @@ def _build_prompt(stage: str, paper_id: int, project_id: int | None, goal: str |
         header.append(f"preferred_draft_id={preferred_draft_id}")
     prefix = "\n".join(header)
 
-    templates = {
-        "planning": [
-            "请使用 paper-reproduction skill，继续 planning / intake 阶段。",
-            "先调用 paper_research_status 判断现有 Project / workspace / intake 状态。",
-            "只有在 workspace 或 structured intake 缺失、损坏、或被明确要求刷新时，才调用 paper_research_prepare。",
-            "本轮只输出 planning result，不要执行训练，不要创建 run draft。",
-            "本阶段只做论文理解、链接分类、材料线索与调优方向建议，不要替 repo 下主路径或执行范围结论。",
-            "正文、方法描述、实验叙述、图注优先；表格只作参考证据，不单独作为执行真相。",
-        ],
-        "grounding": [
-            "请使用 paper-reproduction skill，继续 grounding 阶段。",
-            "先读当前状态与 planning 产物，确认 `paper_intake_result`、`paper_summary`、`experiment_spec` 是否齐全；缺失时先回到 planning。",
-            "如果 `repo/repo_readme_reproduction_intake.json` 已存在，先读这份 README 解读结果；只有它缺失、过弱、互相矛盾，或当前问题需要原文证据时，才回源读原 README。",
-            "当前 runtime 标签虽然叫 grounding，但主 skill 设计已经改成：stage1 之后默认进入 repo-first run loop。",
-            "grounding 是可选的 readiness 调查，不是 execution 前的强制门槛；如果 README/entrypoint/runtime 已经足够清晰，直接走 repo-first execution。",
-            "当你决定做 grounding 时，目标是写出 `specs/grounding_report.json` 作为复现准备清单，而不是尽快把字段填满。",
-            "推荐顺序：先读 README intake，再按需回源读 README，再看仓库结构，再合并论文链接与 README/仓库新发现链接，再做轻量探活，最后再决定是否需要把这些 readiness 事实沉淀成 grounding_report。",
-            "先用 `paper_research_probe_repo`、README 阅读、仓库结构判断 repo 是否像一个可复现项目；如果 repo 残缺、README 很弱、主任务不清，不要先深挖代码。",
-            "对链接探活时，优先回答三个问题：reachable、usable、paper_aligned；页面可访问不等于资源可用，资源可用不等于与论文对齐。",
-            "对数据集、模型权重、压缩包、Google Drive 下载门页这类真实下载链接，`paper_research_probe_url` 默认用 `expected_kind=file`；只有明确是文档/参考页才用 `html`，只有必须证明特定格式时才用 `zip`/`hdf5` 这类更窄类型。",
-            "如果 `paper_research_probe_url` 返回的是 HTML，不要只看 status_code；先根据 resolution_status、selected_follow_link、page_title/page_kind/page_signals/suggested_next_action 和页面正文摘要判断它最终是参考页、可继续跟随的资源页、门页还是失效页。",
-            "如果结果是 `gdrive_confirm_required`、`download_gate` 或 Google Drive virus-scan warning，这表示官方链接仍然存活，只是还需要确认/跟随一步；不要把这种结果写成 dead link 或 `not_found`。",
-            "repo 证据一旦足够，调用 `paper_research_assess_repo_mainpath`，明确最可能主路径、选择原因、替代候选以及当前缺失条件。",
-            "如果要宣称一组数据集链接或 external URLs 已 grounded，必须对这组里每个必要官方链接逐个 probe，或明确说明本地已存在；不能用一个成功样本外推整组都可用。",
-            "如果官方 repo / dataset / dependency URL 被 probe 成 blocked，先把 failure_type、why_not_usable 写清楚，再做一次 focused 的替代源探索；优先可信官方页面、项目页、镜像页，不要做宽泛搜索。",
-            "替代源探索只允许一轮：先 `web_search`，必要时 `web_scrape`，并把候选写入 `alternative_source_candidates`；如果没有明显可信替代，就保留官方失败这个高风险信号。",
-            "如果当前 repo-backed 主路径已经明确，允许跳过 grounding_report，直接去写最小 execution_spec 并开始运行；grounding 证据只是帮助你更稳地决定是否继续。",
-            "没找到就是 absent 或 blocked，不要把缺失事实翻译成应该存在的脚本、路径或 workaround。",
-            "如果你选择写 grounding_report，它必须明确 blocker、blocker_details、当前可继续部分和 next_actions；如果事实层面卡住，再停在 grounding。",
-        ],
-        "implementation_prep": [
-            "请使用 paper-reproduction skill，继续 implementation-prep 阶段。",
-            "先读当前状态，优先复用已归档 planning 与 grounding 证据。",
-            "当前 runtime 标签虽然叫 implementation-prep，但 implementation_spec 只是可选的路径沉淀文件。",
-            "implementation_spec 是可选的路径沉淀文件，不是 execution 前的强制关卡。",
-            "如果 `specs/grounding_report.json` 已存在，优先复用它；如果 repo-backed 路径已经足够清晰，也可以直接基于 README/entrypoint/runtime 证据写 implementation_spec，或跳过它直接进入 execution。",
-            "implementation_spec 必须反映当前机器/worker 的真实环境约束，例如可用运行方式、已安装关键包、缺失包、可用命令、repo root/cwd 约束。",
-            "如果 implementation_spec 已存在，优先读回再决定是复用还是局部修订。",
-            "不要让 implementation_spec 重新承担 repo/data/runtime 发现工作；它要消费 grounding 结论，而不是重跑 grounding。",
-            "如果 grounding 已经给出 blocked 结论，implementation_spec 应当引用这些 blocker；但如果 execution 已经提供了更新的本地事实，也要据此修订旧 blocker。",
-        ],
-        "run_drafts": [
-            "请使用 paper-reproduction skill，继续 run-drafts 阶段。",
-            "当前 runtime 标签虽然叫 run-drafts，但默认主线仍然是 repo-first run loop。",
-            "run_drafts 是可选的候选运行集合；只有在存在多个 plausible path、多个 variant，或你需要沉淀选择理由时才写。",
-            "如果当前只有一个清晰可跑的 repo-backed 路径，可以跳过 run_drafts，直接写 execution_spec。",
-            "如果 implementation_spec 已存在，先读它；如果没有，也可以直接基于 README/entrypoint/runtime 证据整理 run_drafts。",
-            "只生成 grounded drafts，不要执行训练，不要假装 baseline 已成功。",
-            "run_drafts 必须严格使用当前 schema：每个 draft 使用 id/kind/title/objective/entrypoint{type,path_or_hint}/depends_on/data_requirements/env_requirements/params/expected_outputs/blockers/evidence_files/grounding_notes。",
-            "repo 文件 entrypoint 一律写成 entrypoint.type=repo_script，并把 repo-relative 文件名写进 entrypoint.path_or_hint，例如 seq2seq.py。",
-            "README 里的步骤、手工操作、数据下载动作不要伪装成 repo_script；这类步骤应写成 readme_command / dataset_step / manual_step。",
-            "evidence_files 一律写 canonical archived paths，例如 repo/source/seq2seq.py 或 specs/implementation_spec.json。",
-            "不要再使用旧字段名或旧类型：draft_id、label、description、goal、changes、entrypoint.path、python_script。",
-        ],
-        "execution": [
-            "请使用 paper-reproduction skill，继续 execution 阶段。",
-            "如果存在可用的 run_drafts，可以读它；如果没有，也可以直接基于 README intake、entrypoint、runtime 证据写最小 execution_spec。",
-            "如果 smoke 已成功，不要重复 smoke，优先推进 baseline_repro。",
-            "execution 阶段不是重新做大范围 repo 发现。implementation_spec.json 和 run_drafts.json 是当前真值；execution 新发现只应用来修整这两份真值，然后继续。",
-            "如果 preferred_draft_id 或选中的 execution_id 已有归档 spec/result，必须先读回；已有结果足够回答时不要新建或重跑。",
-            "如果 preferred_draft_id=baseline_repro，而旧 baseline 失败早于一个新的 data_prep 成功结果，且旧失败是坏 HDF5 或 schema mismatch，不要把那个旧 baseline 当成最终结果；它已经过时，必须基于新的 data_prep 继续推进。",
-            "data_prep 成功后，先确认准备好的 artifact 已经存在且可被 baseline loader 使用，然后立刻写一个 fresh baseline_repro execution_spec 并 start_execution。",
-            "然后调用 paper_research_inspect_runtime，检查 runtime candidates 和 runtime_worker.environment。",
-            "repo-backed baseline 不要只看通用 environment 摘要。必须先读取 `repo/repo_readme_reproduction_intake.json`；只有它不够时，再读取 README、requirements/pyproject/environment/setup 这类依赖文件（如果存在），然后读取选中的 entrypoint 脚本，并按需要读取少量本地模块来理解 imports。",
-            "定位代码片段时，不要对同一个 repo 文件反复把 max_chars 从 3000 增加到 10000。先用 paper_research_search_repo 找命中行，再用 paper_research_read_repo_file(line_start,line_end) 读取局部范围。",
-            "如果需要改 repo/source 或局部修补 JSON/Markdown truth files，优先使用 `paper_research_run_aider`；repo 改动用 target_root=repo，truth-file 局部修补用 target_root=workspace。",
-            "execution_spec 对 plain-python/dockerfile/docker_compose/repo2docker/devcontainer 只接受直接 argv；不要写 bash -lc、sh -lc、source venv && python ... 这类 shell wrapper。",
-            "Python repo 文件优先用 execution_intent.repo_script；如果真实入口是可执行 shell 脚本（如 classification-results.sh），直接写 argv 例如 [\"./classification-results.sh\"]，不要伪装成 python repo_script。",
-            "如果确实需要 wrapper 或小型辅助程序，先用 `paper_research_write_execution_script` 写到 executions/{execution_id}/...，再让 execution_spec 引用它。",
-            "如果 execution 或 repo 证据暴露了新的 grounded 事实，例如 Dataset 已存在、runtime 已可用、缺 numpyencoder、正确 argv 已确认，先修订 implementation_spec 或 run_drafts，再生成下一次 execution_spec。",
-            "一旦真值文件已经更新，不要继续重复读取大段 README、目录树或脚本尾部；只读取解决当前矛盾所需的最小文件。",
-            "依赖判断以 repo 证据为准，不要让固定默认 ML 包清单替代 repo 自己声明的依赖。",
-            "如果从 repo 证据推断出具体依赖缺失，先给出明确 blocker，或写一个只处理这些缺失包的 env_setup；不要直接启动 baseline 再让它因缺包失败。",
-            "如果需要做 package probe，用 scripts/check_runtime_environment.py 并显式传入从 repo 推断出来的 --require 包名，不要再做泛化的默认探测。",
-            "如果启动的是 env_setup 或 data_prep，这只是主任务的前置补救步骤，不是最终回答；要在同一轮里继续读取其结果，并在完成后回到 baseline 主线。",
-            "必要时参考 references/runtime-environment.md 和 scripts/render_execution_spec.py 生成 execution_spec 骨架。",
-            "execution_spec 里优先保留 README 或官方仓库给出的原始命令和官方 URL；不要为了测活再发明小工具。",
-            "如果需要填写 preflight_checks，必须写成对象数组，例如 [{\"name\":\"check_python\",\"required\":true,\"status\":\"passed\"}]；不要写成 {\"check_python\": true} 这种 map。",
-            "runtime 会在 start_execution 前自动对 command/external_dependencies 中的官方下载链接做 preflight。",
-            "如果 preflight 因 required official external dependency 失败，不要停在“链接失效”。必须进入一次官方来源恢复流程。",
-            "恢复顺序固定为：先读 `repo_reference.json`；如果其中给出了 `repo_history_candidates_file`，立刻读取这份历史候选文件，从 commit diff 里的旧官方 URL 中寻找同文件名 candidate；只有历史候选为空、不可用、或全部被 runtime preflight 否掉时，才退到 web_search / web_scrape。",
-            "repo history 候选优先于公网搜索，因为它仍然属于官方 repo 证据。不要拉多个版本 repo；只使用当前 repo 的历史候选文件。",
-            "当历史候选里已经出现同名 artifact URL 时，不要继续搜索，直接把这个 candidate official fallback 写入新的 execution_spec 并重试 start_execution。",
-            "只有在 repo history 没给出候选时，才使用 web_search。先用精确文件名 + repo/project 名；如果只返回当前仓库主页或当前失效 URL，再改成精确文件名 + org/lab 名，或加 site:official-domain。",
-            "如果搜索结果含糊但看起来来自当前官方 repo 页面、项目页或同组织页面，就立刻对那个页面做 web_scrape，直接读取当前页面正文和链接，再决定是否重写 execution_spec。",
-            "如果 web_search 的官方结果摘要里直接出现可下载 URL，只要文件名完全一致且域名仍然明显属于同一官方组织/实验室，就可以把它当成 candidate official fallback，再写入新的 execution_spec 交给 runtime 重新 preflight。",
-            "恢复流程只做一轮。先历史候选，后公网搜索；找到 candidate 就立刻重写 execution_spec 并重试 start_execution。不要连续做宽泛搜索。",
-            "如果本轮只是 baseline_repro，并且用户明确要求复现/运行，可以直接启动 baseline。",
-            "只有在 baseline 确实被环境阻塞时才创建 env_check / env_setup；如果 repo 已经有数据文件、inspect_runtime 也返回了可用 candidate，就不要降级成环境检查。",
-            "如果必须做 environment check，不要手写复杂的 python -c 一行脚本；使用 skills/paper-reproduction/scripts/check_runtime_environment.py 对 runtime-worker 做检查。",
-            "当 paper_research_start_execution 返回 running/pending 时，只有真正的 baseline/tuning/compare 训练任务才立刻向用户回报并结束本轮；env_setup 或 data_prep 这类前置补救任务要继续读取结果并回到主线。",
-            "写入 execution_spec 后才能启动 execution，并在回答前读回 execution 结果/日志。",
-            "读取 execution 结果必须调用 paper_research_read_execution；读取 execution spec 必须调用 paper_research_read_execution_spec；不要用 paper_research_read_artifact 读取 executions/* 或 executions 目录。",
-        ],
-        "tuning": [
-            "请使用 paper-reproduction skill，继续 first_tuning / compare 阶段。",
-            "调优不是旧多阶段流程的延续关卡，而是 baseline 之后的可选分析与下一次运行准备。",
-            "先调用 paper_research_status，然后读取 implementation_spec 与已完成 baseline execution。",
-            "先根据 baseline、implementation_spec、repo 证据做现状分析，再从 implementation_spec.tuning_plan 或 experiment_spec.optimization_candidates 中整理 2-4 个 grounded tuning 选项。",
-            "先用 paper_research_search_repo 找 CLI/config/notebook 参数入口，再决定读哪些 repo 文件。",
-            "优先复用现有 CLI/config/notebook 参数；只有参数写死时，才用 execution_spec.generated_files 生成 execution-scoped variant script，且不要覆盖原 repo 文件。generated_files 每项至少包含 relative_path 和 content。",
-            "默认不要直接写 execution_spec 或 start_execution。",
-            "先向用户输出：当前 baseline 现状、推荐的 first_tuning、以及每个候选的变更点、依据、风险、预计成本。",
-            "只有当用户明确说执行/启动/运行某个 tuning 选项，或 goal 明确包含执行意图时，才写 execution_spec 并 start_execution。",
-            "当 execution 进入 running/pending 时，立即回报 execution_id 和状态并结束本轮。",
-            "如果 tuning 已完成，再读取 baseline 与 tuning execution，比较共享指标，输出 improved/regressed/inconclusive。",
-        ],
-    }
-    lines = templates.get(stage, [f"Unknown stage: {stage}"])
+    lines = [
+        f"stage={stage}",
+        "Use the paper-reproduction skill for this project-based paper reproduction task.",
+        "When the task is reproduction work, read and follow the paper-reproduction skill before doing anything else.",
+        "Do not invent a workflow state machine.",
+        "First confirm the paper and project binding.",
+        "Treat /app/uploads/projects/{project_id} as the only working root for this task.",
+        "If no project exists yet, create or reuse it through paper_research_prepare.",
+        "If a project already exists, check its status first with paper_research_status.",
+        "If prepare is not finished yet, call paper_research_prepare.",
+        "As soon as prepare is finished, stop trying to do the reproduction work yourself and start using project_claude.",
+        "Let project_claude work in the current Project until it reports a result.",
+        "Use paper_search only to find a saved paper by title, authors, keywords, or natural-language description; if paper_id is already known, pass it directly instead of searching for the numeric ID.",
+        "Use project_tree only to inspect directory structure when needed.",
+        "Use project_read_file to read a specific known file by relative path when needed.",
+        "Use project_write_file only when you want to overwrite a file with complete final contents.",
+        "Use project_claude as the default worker for coding, command execution, debugging, and continuing the reproduction attempt inside the current Project directory.",
+        "Use paper_research_search_project_zoekt only for targeted text search across the project.",
+        "Use paper_research_probe_repo only for checking a remote official repo URL.",
+        "Use paper_research_probe_url only for lightweight checks of external download/doc links.",
+        "Do not use `*` to list files with Zoekt; that is what project_tree is for.",
+        "Preferred Zoekt query patterns include plain terms, file:README, content:\"...\", regex:/.../, case:yes, lang:python, sym:\"...\", boolean OR with parentheses, and negation such as -file:website/.",
+        "Useful reproduction-oriented Zoekt recipes include (README or docs) supervised, content:\"train_supervised\", bucket wordNgrams dim lr epoch, file:classification-results.sh test, and file:dictionary.cc getLine.",
+        "If a Zoekt query returns 0 results, shorten it to one strong term or one concrete filename before adding more filters.",
+        "Do not stay in an inspection loop after prepare is ready; hand the concrete reproduction work to project_claude.",
+    ]
     return f"{prefix}\n" + "\n".join(lines)
 
 
@@ -134,7 +51,7 @@ build_prompt = _build_prompt
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", required=True, choices=["planning", "grounding", "implementation_prep", "run_drafts", "execution", "tuning"])
+    parser.add_argument("--stage", required=True, choices=["planning", "execution", "tuning"])
     parser.add_argument("--paper-id", type=int, required=True)
     parser.add_argument("--project-id", type=int)
     parser.add_argument("--goal")

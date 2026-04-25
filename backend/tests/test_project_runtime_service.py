@@ -38,7 +38,8 @@ def test_runtime_inspection_detects_repo_environment_signals(tmp_path, monkeypat
     )
 
     candidate_types = [item["runtime_type"] for item in payload["runtime_candidates"]]
-    assert candidate_types[:5] == [
+    assert candidate_types[:6] == [
+        "claude_code",
         "devcontainer",
         "dockerfile",
         "papermill",
@@ -63,7 +64,7 @@ def test_write_and_read_execution_spec(tmp_path, monkeypatch):
             "runtime_type": "plain-python",
             "cwd": "repo/source",
             "command": ["python", "-c", "print('ok')"],
-            "evidence_files": ["drafts/run_drafts.json"],
+            "evidence_files": ["reference/repo/readme_intake.json"],
         },
     )
 
@@ -162,6 +163,69 @@ def test_write_execution_spec_renders_generated_python_from_execution_intent(tmp
     assert content["cwd"] == "repo/source"
     assert content["command"] == ["python", "../../executions/intent-generated-script/train_variant.py"]
     assert content["validation"]["valid"] is True
+
+
+def test_write_execution_spec_accepts_claude_code_runtime(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime_module.shutil, "which", _fake_which)
+    repo = tmp_path / "paper_repo"
+    repo.mkdir()
+    brief = tmp_path / "executions" / "claude-run" / "claude_task_brief.md"
+    brief.parent.mkdir(parents=True, exist_ok=True)
+    brief.write_text("# task\nrun the repo\n", encoding="utf-8")
+
+    saved = ProjectRuntimeService().write_execution_spec(
+        workspace_dir=tmp_path,
+        project_id=1,
+        workspace_id=2,
+        notebook_id="nb",
+        execution_spec={
+            "execution_id": "claude-run",
+            "runtime_type": "claude_code",
+            "repo_root_relative_path": "repo/source",
+            "cwd": "repo/source",
+            "task_brief_relative_path": "executions/claude-run/claude_task_brief.md",
+            "model": "qwen3.6-plus",
+            "max_turns": 16,
+            "allowed_tools": ["Read", "Edit"],
+            "disallowed_tools": ["Bash"],
+        },
+    )
+
+    content = saved["content"]
+    assert content["runtime_type"] == "claude_code"
+    assert content["task_brief_relative_path"] == "executions/claude-run/claude_task_brief.md"
+    assert content["model"] == "qwen3.6-plus"
+    assert content["validation"]["valid"] is True
+
+
+def test_validate_execution_spec_skips_local_claude_warning_when_runtime_worker_enabled(tmp_path, monkeypatch):
+    repo = tmp_path / "paper_repo"
+    repo.mkdir()
+    brief = tmp_path / "executions" / "claude-run" / "claude_task_brief.md"
+    brief.parent.mkdir(parents=True, exist_ok=True)
+    brief.write_text("# task\nrun the repo\n", encoding="utf-8")
+
+    def _fake_worker_which(name: str) -> str | None:
+        if name in {"docker", "repo2docker", "papermill", "devcontainer", "python", "python3"}:
+            return f"/usr/bin/{name}"
+        return None
+
+    monkeypatch.setattr(runtime_module.shutil, "which", _fake_worker_which)
+    monkeypatch.setattr(runtime_module.settings, "project_runtime_worker_enabled", True)
+
+    validation = ProjectRuntimeService().validate_execution_spec(
+        {
+            "execution_id": "claude-run",
+            "runtime_type": "claude_code",
+            "repo_root_relative_path": "repo/source",
+            "cwd": "repo/source",
+            "task_brief_relative_path": "executions/claude-run/claude_task_brief.md",
+        },
+        workspace_dir=tmp_path,
+    )
+
+    assert validation["valid"] is True
+    assert not any("runtime tool `claude`" in item for item in validation["warnings"])
 
 
 def test_write_execution_generated_file_defaults_to_execution_workspace(tmp_path):
@@ -728,7 +792,7 @@ async def test_start_execution_uses_worker_when_enabled(tmp_path, monkeypatch):
             "runtime_type": "dockerfile",
             "cwd": "repo/source",
             "command": ["python", "-c", "print('ok')"],
-            "evidence_files": ["drafts/run_drafts.json"],
+            "evidence_files": ["reference/repo/readme_intake.json"],
         },
     )
 
@@ -752,3 +816,51 @@ async def test_start_execution_uses_worker_when_enabled(tmp_path, monkeypatch):
 
     assert payload["status"] == "running"
     assert payload["worker"] == "runtime-worker"
+
+
+@pytest.mark.asyncio
+async def test_start_execution_uses_worker_for_claude_code_runtime(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime_module.settings, "project_runtime_worker_enabled", True)
+    monkeypatch.setattr(runtime_module.shutil, "which", _fake_which)
+    repo = tmp_path / "paper_repo"
+    repo.mkdir()
+    brief = tmp_path / "executions" / "claude-run" / "claude_task_brief.md"
+    brief.parent.mkdir(parents=True, exist_ok=True)
+    brief.write_text("# task\nfix the repo\n", encoding="utf-8")
+
+    service = ProjectRuntimeService()
+    service.write_execution_spec(
+        workspace_dir=tmp_path,
+        project_id=1,
+        workspace_id=2,
+        notebook_id="nb",
+        execution_spec={
+            "execution_id": "claude-run",
+            "runtime_type": "claude_code",
+            "repo_root_relative_path": "repo/source",
+            "cwd": "repo/source",
+            "task_brief_relative_path": "executions/claude-run/claude_task_brief.md",
+        },
+    )
+
+    async def _fake_start(self, **kwargs):  # type: ignore[no-untyped-def]
+        assert kwargs["execution_id"] == "claude-run"
+        assert kwargs["spec"]["runtime_type"] == "claude_code"
+        return {
+            "execution_id": "claude-run",
+            "runtime_type": "claude_code",
+            "status": "running",
+            "worker": "runtime-worker",
+        }
+
+    monkeypatch.setattr(runtime_module.ProjectRuntimeWorkerClient, "start", _fake_start)
+
+    payload = await service.start_execution(
+        project_id=1,
+        workspace_id=2,
+        workspace_dir=tmp_path,
+        execution_id="claude-run",
+    )
+
+    assert payload["status"] == "running"
+    assert payload["runtime_type"] == "claude_code"

@@ -1,6 +1,6 @@
 import type { ChatSkillLaunchRequest } from '@/services/api'
 
-export type PaperWorkflowStage = 'planning' | 'implementation_prep' | 'run_drafts' | 'execution' | 'tuning'
+export type PaperWorkflowStage = 'planning' | 'execution' | 'tuning'
 
 type PaperWorkflowLaunchArgs = {
   paperId: number
@@ -13,8 +13,6 @@ const PAPER_WORKFLOW_SKILL = 'paper-reproduction'
 
 const stageMessageLabel = (stage: PaperWorkflowStage): string => {
   if (stage === 'planning') return '规划阶段'
-  if (stage === 'implementation_prep') return '实施准备阶段'
-  if (stage === 'run_drafts') return '运行草案阶段'
   if (stage === 'tuning') return '调参与对比阶段'
   return '执行阶段'
 }
@@ -46,19 +44,9 @@ export const buildPaperPlanningLaunch = (args: PaperWorkflowLaunchArgs) => ({
   skillLaunch: buildPaperWorkflowSkillLaunch('planning', args),
 })
 
-export const buildPaperImplementationPrepLaunch = (args: PaperWorkflowLaunchArgs) => ({
-  initialMessage: buildPaperWorkflowInitialMessage('implementation_prep', args),
-  skillLaunch: buildPaperWorkflowSkillLaunch('implementation_prep', args),
-})
-
 export const buildPaperExecutionLaunch = (args: PaperWorkflowLaunchArgs) => ({
   initialMessage: buildPaperWorkflowInitialMessage('execution', args),
   skillLaunch: buildPaperWorkflowSkillLaunch('execution', args),
-})
-
-export const buildPaperRunDraftsLaunch = (args: PaperWorkflowLaunchArgs) => ({
-  initialMessage: buildPaperWorkflowInitialMessage('run_drafts', args),
-  skillLaunch: buildPaperWorkflowSkillLaunch('run_drafts', args),
 })
 
 export const buildPaperTuningLaunch = (args: PaperWorkflowLaunchArgs) => ({

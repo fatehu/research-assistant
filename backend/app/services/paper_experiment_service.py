@@ -1151,13 +1151,12 @@ class PaperExperimentService:
             or "deepseek"
         )
         model = str((settings.get_llm_config(provider) or {}).get("model") or "")
-        text_budget = self._resolve_paper_context_char_budget(provider=provider, model=model)
         original_paper_markdown = paper_markdown
         original_total_chars = len(original_paper_markdown)
-        paper_markdown = original_paper_markdown[:_PAPER_MARKDOWN_STORE_MAX_CHARS]
-        store_truncated = original_total_chars > len(paper_markdown)
-        paper_markdown_for_llm = paper_markdown[:text_budget]
-        llm_truncated = len(paper_markdown) > len(paper_markdown_for_llm)
+        paper_markdown = original_paper_markdown
+        store_truncated = False
+        paper_markdown_for_llm = paper_markdown
+        llm_truncated = False
         raw_data_text = json.dumps(paper.raw_data or {}, ensure_ascii=False, indent=2, default=str)
         raw_data_text = raw_data_text[:_RAW_DATA_CONTEXT_MAX_CHARS]
         metadata = {
