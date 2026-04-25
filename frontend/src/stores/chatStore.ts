@@ -40,6 +40,107 @@ export interface IterationStep {
   timestamp: number
 }
 
+const appendRollingToolOutput = (existing: string | undefined, incoming: string, maxLines = 8): string => {
+  const next = String(incoming || '')
+  if (!next) return String(existing || '')
+  const merged = `${String(existing || '')}${next}`
+  const lines = merged.split('\n')
+  const kept = lines.slice(-maxLines)
+  return kept.join('\n').trimStart()
+}
+
+const truncateToolLine = (value: unknown, maxChars = 160): string => {
+  const text = String(value || '').replace(/\s+/g, ' ').trim()
+  if (!text) return ''
+  return text.length > maxChars ? `${text.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…` : text
+}
+
+const summarizeClaudeToolResult = (value: unknown): string => {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  const lines = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+  if (!lines.length) return ''
+  const errorLine = lines.find((line) => /(?:Error|Exception|Traceback|Exit code|ValueError|RuntimeError|AssertionError)/i.test(line))
+  if (errorLine) return truncateToolLine(errorLine, 180)
+  return truncateToolLine(lines[0], 180)
+}
+
+const formatClaudeStreamLine = (rawLine: string): string[] => {
+  const normalized = String(rawLine || '').trim()
+  if (!normalized) return []
+
+  let parsed: any
+  try {
+    parsed = JSON.parse(normalized)
+  } catch {
+    return [truncateToolLine(normalized, 180)]
+  }
+
+  const eventType = String(parsed?.type || '').trim()
+  const message = parsed?.message && typeof parsed.message === 'object' ? parsed.message : null
+  const content = Array.isArray(message?.content) ? message.content : []
+  const lines: string[] = []
+
+  if (eventType === 'assistant') {
+    content.forEach((item: any) => {
+      const itemType = String(item?.type || '').trim()
+      if (itemType === 'thinking') {
+        const thought = truncateToolLine(item?.thinking, 180)
+        if (thought) lines.push(`Claude 思考: ${thought}`)
+        return
+      }
+      if (itemType === 'text') {
+        const text = truncateToolLine(item?.text, 180)
+        if (text) lines.push(`Claude: ${text}`)
+        return
+      }
+      if (itemType === 'tool_use') {
+        const toolName = String(item?.name || '工具').trim()
+        const description = truncateToolLine(item?.input?.description, 120)
+        const command = truncateToolLine(item?.input?.command, 120)
+        if (toolName === 'Bash') {
+          lines.push(`执行 Bash: ${description || command || '运行命令'}`)
+        } else {
+          lines.push(`调用 ${toolName}: ${description || command || '执行子工具'}`)
+        }
+      }
+    })
+    return lines
+  }
+
+  if (eventType === 'user') {
+    content.forEach((item: any) => {
+      if (String(item?.type || '').trim() !== 'tool_result') return
+      const summary = summarizeClaudeToolResult(item?.content)
+      if (!summary) return
+      lines.push(`${item?.is_error ? '执行失败' : '执行结果'}: ${summary}`)
+    })
+    return lines
+  }
+
+  const resultText = summarizeClaudeToolResult(parsed?.tool_use_result || parsed?.result || parsed?.text)
+  if (resultText) return [resultText]
+  return []
+}
+
+const appendClaudeProgressOutput = (existing: string | undefined, incoming: string, maxLines = 8): string => {
+  const extracted = String(incoming || '')
+    .split('\n')
+    .flatMap((line) => formatClaudeStreamLine(line))
+    .filter(Boolean)
+  if (!extracted.length) {
+    return appendRollingToolOutput(existing, incoming, maxLines)
+  }
+  const previousLines = String(existing || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+  return [...previousLines, ...extracted].slice(-maxLines).join('\n')
+}
+
 export type SendPhase =
   | 'idle'
   | 'submitting'
@@ -205,6 +306,27 @@ const applySpanRewriteToConversation = (
   }
 }
 
+const upsertConversationListItem = (
+  conversations: Conversation[],
+  conversation: Conversation | null,
+): Conversation[] => {
+  if (!conversation?.id) return conversations
+  const updatedConversation: Conversation = {
+    ...conversation,
+    updated_at: conversation.updated_at || new Date().toISOString(),
+  }
+  const existingIndex = conversations.findIndex((item) => item.id === updatedConversation.id)
+  if (existingIndex < 0) {
+    return [updatedConversation, ...conversations]
+  }
+  const next = [...conversations]
+  next[existingIndex] = {
+    ...next[existingIndex],
+    ...updatedConversation,
+  }
+  return next
+}
+
 interface ChatState {
   // 对话列表
   conversations: Conversation[]
@@ -242,6 +364,7 @@ interface ChatState {
   // Actions
   fetchConversations: () => Promise<void>
   createConversation: (title?: string) => Promise<Conversation>
+  branchConversation: (conversationId?: number) => Promise<number | undefined>
   selectConversation: (conversationId: number) => Promise<void>
   resumeBackgroundRun: (runId: string, conversationId: number) => Promise<void>
   deleteConversation: (conversationId: number) => Promise<void>
@@ -264,6 +387,7 @@ interface ChatState {
       chatPreferenceOverrides?: Partial<ChatUserPreferences>
       ragOverrides?: ChatRagOverrides | null
       skillLaunch?: ChatSkillLaunchRequest | null
+      documentArtifactBlockIds?: string[]
     },
   ) => Promise<number | undefined>  // 返回新对话ID（如果有）
   stopGeneration: () => void  // 停止生成
@@ -329,6 +453,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
+  branchConversation: async (conversationId?: number) => {
+    const sourceConversationId = conversationId || get().currentConversation?.id
+    if (!sourceConversationId) return undefined
+
+    try {
+      const conversation = await chatApi.branchConversation(sourceConversationId)
+      const sortedMessages = sortMessagesByCreatedAt(conversation.messages)
+      set((state) => ({
+        conversations: upsertConversationListItem(state.conversations, conversation),
+        currentConversation: conversation,
+        messages: sortedMessages,
+        streamingContextDebug: null,
+        lastRunContextDebug: null,
+        workflowControl: resolveConversationWorkflowControl(sortedMessages),
+        sendPhase: 'idle',
+        sendPhaseLabel: null,
+        sendPhaseHint: null,
+        currentBackgroundRunId: null,
+      }))
+      return conversation.id
+    } catch (error) {
+      handleApiError(error, '创建对话分支')
+      throw error
+    }
+  },
+
   selectConversation: async (conversationId: number) => {
     const existingAbortController = get().abortController
     if (existingAbortController) {
@@ -383,6 +533,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     let fullContent = ''
     let currentThought = ''
     let latestContextDebug: ChatContextDebug | null = null
+    let donePayload: Record<string, any> | null = null
 
     set({
       isSending: true,
@@ -513,13 +664,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
               }))
               break
 
-            case 'action': {
-              const toolCall = {
-                tool: data.tool,
-                input: data.input,
-                timestamp: Date.now(),
-              }
-              set((state) => ({
+            case 'action':
+              set((state) => {
+                const existingLiveOutput =
+                  state.currentToolCall && state.currentToolCall.tool === data.tool
+                    ? state.currentToolCall.output
+                    : undefined
+                const toolCall = {
+                  tool: data.tool,
+                  input: data.input,
+                  output: existingLiveOutput,
+                  timestamp: Date.now(),
+                }
+                return ({
                 currentToolCall: toolCall,
                 toolCalls: [...state.toolCalls, toolCall],
                 isThinking: false,
@@ -536,9 +693,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
                     timestamp: Date.now(),
                   },
                 ],
-              }))
+                })
+              })
               break
-            }
 
             case 'observation':
               set((state) => {
@@ -573,6 +730,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
               })
               break
 
+            case 'tool_output': {
+              const toolName = typeof data?.tool === 'string' ? data.tool : 'project_claude'
+              const toolInput = data && typeof data?.input === 'object' ? data.input : {}
+              const text = typeof data?.text === 'string' ? data.text : ''
+              if (!text) break
+              set((state) => {
+                const previousOutput =
+                  state.currentToolCall && state.currentToolCall.tool === toolName
+                    ? state.currentToolCall.output
+                    : undefined
+                const mergedOutput =
+                  toolName === 'project_claude'
+                    ? appendClaudeProgressOutput(previousOutput, text)
+                    : appendRollingToolOutput(previousOutput, text)
+                return {
+                  currentToolCall: {
+                    tool: toolName,
+                    input: toolInput,
+                    output: mergedOutput,
+                    timestamp: Date.now(),
+                  },
+                }
+              })
+              break
+            }
+
             case 'content':
               fullContent += data
               set({
@@ -590,6 +773,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
               break
 
             case 'done':
+              donePayload = data && typeof data === 'object' ? (data as Record<string, any>) : {}
+              break
             case 'error':
             case 'cancelled':
             case 'stopped':
@@ -603,7 +788,68 @@ export const useChatStore = create<ChatState>((set, get) => ({
         console.error('[ChatStore] 恢复后台任务流失败:', error)
       }
     } finally {
-      await refreshConversationFromServer()
+      const completedPayload = donePayload as Record<string, any> | null
+      if (completedPayload) {
+        const conversationContextState =
+          completedPayload.context_state && typeof completedPayload.context_state === 'object'
+            ? (completedPayload.context_state as ConversationContextState)
+            : undefined
+        const conversationTurnStore =
+          completedPayload.turn_store && typeof completedPayload.turn_store === 'object'
+            ? (completedPayload.turn_store as ConversationTurnStore)
+            : undefined
+        const conversationToolLedger =
+          completedPayload.tool_ledger && typeof completedPayload.tool_ledger === 'object'
+            ? (completedPayload.tool_ledger as ConversationToolLedger)
+            : undefined
+        const conversationItemStream =
+          completedPayload.item_stream && typeof completedPayload.item_stream === 'object'
+            ? (completedPayload.item_stream as ConversationItemStream)
+            : undefined
+        const workflowControl =
+          completedPayload.workflow_control && typeof completedPayload.workflow_control === 'object'
+            ? (completedPayload.workflow_control as ChatWorkflowControl)
+            : null
+        const finalAssistantContent = String(fullContent || completedPayload.answer || '')
+        const finalAssistantThought =
+          typeof completedPayload.thought === 'string' && completedPayload.thought.trim()
+            ? completedPayload.thought.trim()
+            : currentThought || undefined
+        const resolvedAssistantMessage = buildDoneAssistantMessage({
+          itemStream: conversationItemStream,
+          turnStore: conversationTurnStore,
+          currentTurnId: get().currentTurnId,
+          fallbackContent: finalAssistantContent,
+          fallbackThought: finalAssistantThought,
+          conversationId,
+        })
+        set((state) => {
+          const nextConversation = state.currentConversation?.id === conversationId
+            ? {
+                ...state.currentConversation,
+                ...(conversationContextState ? { context_state: conversationContextState } : {}),
+                ...(conversationTurnStore ? { turn_store: conversationTurnStore } : {}),
+                ...(conversationToolLedger ? { tool_ledger: conversationToolLedger } : {}),
+                ...(conversationItemStream ? { item_stream: conversationItemStream } : {}),
+              }
+            : state.currentConversation
+          return {
+            currentConversation: nextConversation,
+            conversations: upsertConversationListItem(state.conversations, nextConversation),
+            messages: resolvedAssistantMessage
+              ? [
+                  ...state.messages.filter((message) =>
+                    resolvedAssistantMessage.id ? message.id !== resolvedAssistantMessage.id : true,
+                  ),
+                  resolvedAssistantMessage,
+                ]
+              : state.messages,
+            workflowControl,
+          }
+        })
+      } else {
+        await refreshConversationFromServer()
+      }
       set((state) => ({
         isSending: false,
         isThinking: false,
@@ -738,9 +984,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       chatPreferenceOverrides?: Partial<ChatUserPreferences>
       ragOverrides?: ChatRagOverrides | null
       skillLaunch?: ChatSkillLaunchRequest | null
+      documentArtifactBlockIds?: string[]
     },
   ): Promise<number | undefined> => {
-    const { currentConversation, fetchConversations, isSending } = get()
+    const { currentConversation, isSending } = get()
 
     // 防止重复发送
     if (isSending) {
@@ -758,6 +1005,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       content: message,
       message_type: 'text',
       created_at: new Date().toISOString(),
+      metadata: options?.documentArtifactBlockIds?.length
+        ? { document_artifact_selection: { block_ids: options.documentArtifactBlockIds } }
+        : undefined,
     }
 
     set((state) => ({
@@ -882,14 +1132,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 data && typeof data === 'object' && data.workflow_control && typeof data.workflow_control === 'object'
                   ? (data.workflow_control as ChatWorkflowControl)
                   : null
-              const toolCall = {
-                tool: data.tool,
-                input: data.input,
-                timestamp: Date.now(),
-              }
               set((state) => ({
-                currentToolCall: toolCall,
-                toolCalls: [...state.toolCalls, toolCall],
+                currentToolCall: {
+                  tool: data.tool,
+                  input: data.input,
+                  output:
+                    state.currentToolCall && state.currentToolCall.tool === data.tool
+                      ? state.currentToolCall.output
+                      : undefined,
+                  timestamp: Date.now(),
+                },
+                toolCalls: [
+                  ...state.toolCalls,
+                  {
+                    tool: data.tool,
+                    input: data.input,
+                    output:
+                      state.currentToolCall && state.currentToolCall.tool === data.tool
+                        ? state.currentToolCall.output
+                        : undefined,
+                    timestamp: Date.now(),
+                  },
+                ],
                 isThinking: false,
                 sendPhase: 'tool',
                 sendPhaseLabel: null,
@@ -940,6 +1204,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 }
               })
               break
+
+            case 'tool_output': {
+              const toolName = typeof data?.tool === 'string' ? data.tool : 'project_claude'
+              const toolInput = data && typeof data?.input === 'object' ? data.input : {}
+              const text = typeof data?.text === 'string' ? data.text : ''
+              if (!text) break
+              set((state) => {
+                const previousOutput =
+                  state.currentToolCall && state.currentToolCall.tool === toolName
+                    ? state.currentToolCall.output
+                    : undefined
+                const mergedOutput =
+                  toolName === 'project_claude'
+                    ? appendClaudeProgressOutput(previousOutput, text)
+                    : appendRollingToolOutput(previousOutput, text)
+                return {
+                  currentToolCall: {
+                    tool: toolName,
+                    input: toolInput,
+                    output: mergedOutput,
+                    timestamp: Date.now(),
+                  },
+                }
+              })
+              break
+            }
 
             case 'content':
               // 流式回答内容
@@ -1051,45 +1341,47 @@ export const useChatStore = create<ChatState>((set, get) => ({
               })
               const shouldAppendLocalAssistantMessage = Boolean(resolvedAssistantMessage)
 
-              set((state) => ({
-                messages: shouldAppendLocalAssistantMessage
-                  ? [
-                      ...state.messages.filter((message) =>
-                        resolvedAssistantMessage?.id ? message.id !== resolvedAssistantMessage.id : true,
-                      ),
-                      resolvedAssistantMessage as Message,
-                    ]
-                  : state.messages,
-                currentConversation: state.currentConversation
+              set((state) => {
+                const nextCurrentConversation = state.currentConversation
                   ? {
                       ...state.currentConversation,
                       ...(conversationContextState ? { context_state: conversationContextState } : {}),
                       ...(conversationTurnStore ? { turn_store: conversationTurnStore } : {}),
                       ...(conversationToolLedger ? { tool_ledger: conversationToolLedger } : {}),
                       ...(conversationItemStream ? { item_stream: conversationItemStream } : {}),
+                      updated_at: new Date().toISOString(),
                     }
-                  : state.currentConversation,
-                isSending: false,
-                isThinking: false,
-                sendPhase: 'idle',
-                sendPhaseLabel: null,
-                sendPhaseHint: null,
-                streamingContent: '',
-                streamingThought: '',
-                streamingContextDebug: null,
-                lastRunContextDebug: contextDebug || state.streamingContextDebug,
-                workflowControl,
-                iterationSteps: [],  // 清空迭代步骤
-                currentIteration: 0,
-                toolCalls: [],  // 清空工具调用记录
-                currentToolCall: null,
-                currentTurnId: null,
-                abortController: null,
-                currentBackgroundRunId: null,
-              }))
-
-              // 刷新对话列表（新对话或更新标题）
-              fetchConversations()
+                  : state.currentConversation
+                return {
+                  messages: shouldAppendLocalAssistantMessage
+                    ? [
+                        ...state.messages.filter((message) =>
+                          resolvedAssistantMessage?.id ? message.id !== resolvedAssistantMessage.id : true,
+                        ),
+                        resolvedAssistantMessage as Message,
+                      ]
+                    : state.messages,
+                  currentConversation: nextCurrentConversation,
+                  conversations: upsertConversationListItem(state.conversations, nextCurrentConversation),
+                  isSending: false,
+                  isThinking: false,
+                  sendPhase: 'idle',
+                  sendPhaseLabel: null,
+                  sendPhaseHint: null,
+                  streamingContent: '',
+                  streamingThought: '',
+                  streamingContextDebug: null,
+                  lastRunContextDebug: contextDebug || state.streamingContextDebug,
+                  workflowControl,
+                  iterationSteps: [],  // 清空迭代步骤
+                  currentIteration: 0,
+                  toolCalls: [],  // 清空工具调用记录
+                  currentToolCall: null,
+                  currentTurnId: null,
+                  abortController: null,
+                  currentBackgroundRunId: null,
+                }
+              })
               break
 
             case 'error':
@@ -1121,6 +1413,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         options?.chatPreferenceOverrides,
         options?.ragOverrides,
         options?.skillLaunch,
+        options?.documentArtifactBlockIds,
       )
       set({ currentBackgroundRunId: run.run_id })
       if (abortController.signal.aborted) {

@@ -218,6 +218,69 @@ export interface AuthResponse {
   user: User
 }
 
+export interface DocumentArtifactBlock {
+  block_id: string
+  index: number
+  title: string
+  heading_path: string[]
+  required: boolean
+  target_words: number
+  block_constraints: string
+  markdown: string
+  status: string
+  updated_at?: string
+}
+
+export interface DocumentArtifact {
+  schema_version: string
+  artifact_id: string
+  template_id: string
+  title: string
+  global_constraints: string
+  blocks: DocumentArtifactBlock[]
+  created_at?: string
+  updated_at?: string
+}
+
+export interface DocumentArtifactSchemaGenerateRequest {
+  template_id: string
+  title?: string
+  user_notes?: string
+}
+
+export interface DocumentArtifactCreateRequest {
+  template_id: string
+  schema: DocumentArtifact
+}
+
+export interface DocumentArtifactBlockUpdateRequest {
+  title?: string
+  block_constraints?: string
+  markdown?: string
+  status?: string
+}
+
+export interface DocumentArtifactSpanRewriteRequest {
+  instruction: string
+  selected_text: string
+  before_context?: string
+  after_context?: string
+  occurrence_index?: number
+  start_offset?: number
+  end_offset?: number
+}
+
+export interface DocumentArtifactSpanRewriteResponse {
+  artifact: DocumentArtifact
+  block_id: string
+  old_markdown: string
+  new_markdown: string
+  selected_text: string
+  replacement_text: string
+  start_offset: number
+  end_offset: number
+}
+
 export interface Conversation {
   id: number
   user_id: number
@@ -237,6 +300,7 @@ export interface Conversation {
   tool_ledger?: ConversationToolLedger
   item_stream?: ConversationItemStream
   context_snapshots?: ConversationContextSnapshot[]
+  document_artifact?: DocumentArtifact | null
 }
 
 export interface ConversationEvidenceLedgerEntry {
@@ -694,6 +758,9 @@ export interface MessageMetadata extends Record<string, unknown> {
   reasoning_summary?: ReasoningSummary
   citation_index?: Record<string, MessageCitationSourceItem>
   workflow_control?: ChatWorkflowControl
+  document_artifact_selection?: {
+    block_ids: string[]
+  }
 }
 
 export interface Message {
@@ -1117,6 +1184,67 @@ export const chatApi = {
     return response.data
   },
 
+  generateDocumentArtifactSchema: async (
+    conversationId: number,
+    data: DocumentArtifactSchemaGenerateRequest,
+  ): Promise<DocumentArtifact> => {
+    const response = await api.post(
+      `/api/v1/chat/conversations/${conversationId}/document-artifact/schema`,
+      data,
+      { timeout: 120000 },
+    )
+    return response.data
+  },
+
+  createDocumentArtifact: async (
+    conversationId: number,
+    data: DocumentArtifactCreateRequest,
+  ): Promise<DocumentArtifact> => {
+    const response = await api.post(
+      `/api/v1/chat/conversations/${conversationId}/document-artifact`,
+      data,
+    )
+    return response.data
+  },
+
+  getDocumentArtifact: async (conversationId: number): Promise<DocumentArtifact> => {
+    const response = await api.get(`/api/v1/chat/conversations/${conversationId}/document-artifact`)
+    return response.data
+  },
+
+  updateDocumentArtifactBlock: async (
+    conversationId: number,
+    blockId: string,
+    data: DocumentArtifactBlockUpdateRequest,
+  ): Promise<DocumentArtifact> => {
+    const response = await api.patch(
+      `/api/v1/chat/conversations/${conversationId}/document-artifact/blocks/${encodeURIComponent(blockId)}`,
+      data,
+    )
+    return response.data
+  },
+
+  rewriteDocumentArtifactBlockSpan: async (
+    conversationId: number,
+    blockId: string,
+    data: DocumentArtifactSpanRewriteRequest,
+  ): Promise<DocumentArtifactSpanRewriteResponse> => {
+    const response = await api.post(
+      `/api/v1/chat/conversations/${conversationId}/document-artifact/blocks/${encodeURIComponent(blockId)}/rewrite-span`,
+      data,
+      { timeout: 120000 },
+    )
+    return response.data
+  },
+
+  branchConversation: async (conversationId: number, title?: string): Promise<Conversation> => {
+    const response = await api.post(
+      `/api/v1/chat/conversations/${conversationId}/branch`,
+      title ? { title } : {},
+    )
+    return response.data
+  },
+
   previewContext: async (
     message: string,
     conversationId?: number,
@@ -1168,6 +1296,7 @@ export const chatApi = {
     chatPreferenceOverrides?: Partial<ChatUserPreferences>,
     ragOverrides?: ChatRagOverrides | null,
     skillLaunch?: ChatSkillLaunchRequest | null,
+    documentArtifactBlockIds?: string[],
   ): Promise<ChatRunResponse> => {
     const response = await api.post('/api/v1/chat/runs', {
       message,
@@ -1179,6 +1308,7 @@ export const chatApi = {
         : {}),
       ...(ragOverrides && ragOverrides.enabled ? { rag_overrides: ragOverrides } : {}),
       ...(skillLaunch ? { skill_launch: skillLaunch } : {}),
+      ...(documentArtifactBlockIds?.length ? { document_artifact_block_ids: documentArtifactBlockIds } : {}),
     })
     return response.data
   },
@@ -1238,6 +1368,7 @@ export const chatApi = {
     chatPreferenceOverrides?: Partial<ChatUserPreferences>,
     ragOverrides?: ChatRagOverrides | null,
     skillLaunch?: ChatSkillLaunchRequest | null,
+    documentArtifactBlockIds?: string[],
   ): Promise<void> => {
     try {
       const response = await fetch(`${API_BASE_URL}/api/v1/chat/send`, {
@@ -1256,6 +1387,7 @@ export const chatApi = {
             : {}),
           ...(ragOverrides && ragOverrides.enabled ? { rag_overrides: ragOverrides } : {}),
           ...(skillLaunch ? { skill_launch: skillLaunch } : {}),
+          ...(documentArtifactBlockIds?.length ? { document_artifact_block_ids: documentArtifactBlockIds } : {}),
         }),
         signal: abortController?.signal,
       })
@@ -1528,63 +1660,6 @@ export interface Paper {
   collection_ids: number[]
 }
 
-export interface PaperExperimentRun {
-  id: number
-  workspace_id: number
-  user_id: number
-  notebook_id?: string
-  notebook_cell_id?: string
-  base_run_id?: number
-  run_kind: 'baseline' | 'variant' | string
-  status: 'draft' | 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | string
-  label: string
-  model_name?: string
-  hypothesis?: string
-  variant_spec: Record<string, unknown>
-  params: Record<string, unknown>
-  metrics: Record<string, unknown>
-  artifacts: Record<string, unknown>
-  summary: Record<string, unknown>
-  notes?: string
-  created_at: string
-  updated_at: string
-  started_at?: string
-  completed_at?: string
-}
-
-export interface PaperExperimentWorkspace {
-  id: number
-  user_id: number
-  paper_id: number
-  notebook_id?: string
-  status: string
-  title: string
-  summary: Record<string, unknown>
-  experiment_spec: Record<string, unknown>
-  compare_report: Record<string, unknown>
-  runs: PaperExperimentRun[]
-  created_at: string
-  updated_at: string
-}
-
-export interface PaperExperimentRunCreateRequest {
-  run_kind: 'baseline' | 'variant'
-  label: string
-  model_name?: string
-  hypothesis?: string
-  params?: Record<string, unknown>
-  variant_spec?: Record<string, unknown>
-  base_run_id?: number
-}
-
-export interface PaperExperimentRunUpdateRequest {
-  status?: 'draft' | 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
-  metrics?: Record<string, unknown>
-  artifacts?: Record<string, unknown>
-  summary?: Record<string, unknown>
-  notes?: string
-}
-
 export interface ResearchProjectPaperSummary {
   id: number
   title: string
@@ -1608,178 +1683,6 @@ export interface ResearchProjectWorkspaceSummary {
   latest_run_at?: string
 }
 
-export interface ResearchProjectExecutionSummary {
-  execution_id: string
-  label?: string
-  draft_id?: string
-  runtime_type?: string
-  status: string
-  success?: boolean
-  error?: string
-  message?: string
-  created_at?: string
-  started_at?: string
-  completed_at?: string
-  spec_relative_path?: string
-  result_relative_path?: string
-  log_relative_path?: string
-  result_exists: boolean
-  log_exists: boolean
-  log_total_chars: number
-  log_truncated: boolean
-  log_tail?: string
-  last_log_line?: string
-  latest_elapsed_sec?: number
-  latest_loss?: number
-  command_preview?: string
-}
-
-export interface ResearchProjectArtifactSummary {
-  label: string
-  relative_path: string
-  kind: string
-  present: boolean
-  updated_at?: string
-}
-
-export interface ResearchProjectStageSummary {
-  stage: string
-  label: string
-  status: string
-  summary?: string
-  blockers: string[]
-  artifacts: ResearchProjectArtifactSummary[]
-  updated_at?: string
-}
-
-export interface ResearchProjectRuntimeToolSummary {
-  tool_key: string
-  available: boolean
-  command?: string
-}
-
-export interface ResearchProjectRuntimeCandidateSummary {
-  runtime_type: string
-  status: string
-  priority: number
-  reason?: string
-  entrypoints: string[]
-  evidence_files: string[]
-  blockers: string[]
-  requires_runtime_worker: boolean
-  requires_explicit_user_confirm: boolean
-}
-
-export interface ResearchProjectRuntimeContextSummary {
-  execution_mode?: string
-  notebook_id?: string
-  notebook_asset_relative_path?: string
-  repo_available: boolean
-  repo_root_relative_path?: string
-  repo_file_count: number
-  repo_reference_url?: string
-  repo_history_candidate_count: number
-  entrypoint_hints: string[]
-  runtime_candidates: ResearchProjectRuntimeCandidateSummary[]
-  tools: ResearchProjectRuntimeToolSummary[]
-  runtime_worker_enabled: boolean
-  runtime_worker_available: boolean
-}
-
-export interface ResearchProjectResultSummary {
-  baseline_status: string
-  baseline_execution_id?: string
-  baseline_completed_at?: string
-  baseline_metrics: Record<string, unknown>
-  tuning_status: string
-  tuning_execution_id?: string
-  tuning_completed_at?: string
-  tuning_metrics: Record<string, unknown>
-  compare_status: string
-  compare_summary?: string
-  highlights: string[]
-}
-
-export interface ResearchProjectWorkspaceRuntimeOverview {
-  workspace_id: number
-  paper_id?: number
-  paper_title?: string
-  notebook_id?: string
-  title: string
-  status: string
-  role: string
-  run_count: number
-  latest_run_status?: string
-  latest_run_at?: string
-  current_stage: string
-  current_status: string
-  stage_ledger: ResearchProjectStageSummary[]
-  runtime_context: ResearchProjectRuntimeContextSummary
-  results: ResearchProjectResultSummary
-  execution_count: number
-  running_execution_count: number
-  recent_executions: ResearchProjectExecutionSummary[]
-}
-
-export interface ResearchProjectRuntimeOverview {
-  project_id: number
-  current_stage: string
-  current_status: string
-  recommended_chat_stage?: string
-  continue_reason?: string
-  primary_workspace_id?: number
-  workspace_count: number
-  execution_count: number
-  running_execution_count: number
-  workspaces: ResearchProjectWorkspaceRuntimeOverview[]
-}
-
-export interface ResearchProjectWorkspaceOutputSummary {
-  label: string
-  relative_path: string
-  category: string
-  scope: string
-  scope_label: string
-  kind: string
-  storage: string
-  present: boolean
-  size_bytes: number
-  editable: boolean
-  deletable: boolean
-  updated_at?: string
-}
-
-export interface ResearchProjectWorkspaceOutputContent {
-  label: string
-  relative_path: string
-  category: string
-  scope: string
-  scope_label: string
-  kind: string
-  storage: string
-  editable: boolean
-  updated_at?: string
-  content: string
-  total_chars: number
-  truncated: boolean
-}
-
-export interface ResearchProjectWorkspaceOutputCleanupResult {
-  project_id: number
-  workspace_id: number
-  preserve_repo: boolean
-  scope: string
-  effective_scopes?: string[]
-  deleted_file_count: number
-  deleted_dir_count: number
-  deleted_run_count: number
-  deleted_paths: string[]
-}
-
-export type ResearchProjectWorkspaceAssetSummary = ResearchProjectWorkspaceOutputSummary
-export type ResearchProjectWorkspaceAssetContent = ResearchProjectWorkspaceOutputContent
-export type ResearchProjectWorkspaceAssetCleanupResult = ResearchProjectWorkspaceOutputCleanupResult
-
 export interface ResearchProject {
   id: number
   user_id: number
@@ -1795,8 +1698,17 @@ export interface ResearchProject {
   primary_workspace?: ResearchProjectWorkspaceSummary
   papers: ResearchProjectPaperSummary[]
   workspaces: ResearchProjectWorkspaceSummary[]
+  project_root?: string
+  project_root_exists?: boolean
   created_at: string
   updated_at: string
+}
+
+export interface ResearchProjectFolderTree {
+  project_id: number
+  project_root: string
+  exists: boolean
+  tree: string
 }
 
 export interface ResearchProjectCreateRequest {
@@ -1829,6 +1741,7 @@ export interface PaperSearchResponse {
   total: number
   offset: number
   has_more: boolean
+  next_token?: string | null
   papers: PaperSearchResult[]
   query: string
   source: string
@@ -3273,7 +3186,7 @@ export interface CollectionKnowledgeReadinessItem {
 
 export interface CollectionKnowledgeReadiness {
   collection_id: number
-  knowledge_base_id: number
+  knowledge_base_id?: number
   total_papers: number
   completed_papers: number
   running_papers: number
@@ -3290,7 +3203,7 @@ export interface LiteratureAskRequest {
   scope: LiteratureAskScope
   paper_id?: number
   collection_id?: number
-  knowledge_base_id: number
+  knowledge_base_id?: number
   mode?: 'agentic' | 'classic'
   question: string
   session_id?: number
@@ -3298,6 +3211,7 @@ export interface LiteratureAskRequest {
 
 export interface LiteratureAskSource {
   idx?: number
+  knowledge_base_id?: number
   document_id: number
   document_name: string
   page?: number
@@ -3389,10 +3303,13 @@ export const literatureApi = {
     source?: string
     limit?: number
     offset?: number
+    page_token?: string
     year_start?: number
     year_end?: number
     fields?: string
     open_access?: boolean
+    sort_by?: string
+    sort_order?: string
   }): Promise<PaperSearchResponse> => {
     const response = await api.get('/api/v1/literature/search', { params })
     return response.data
@@ -3421,42 +3338,6 @@ export const literatureApi = {
 
   getPaper: async (paperId: number): Promise<Paper> => {
     const response = await api.get(`/api/v1/literature/papers/${paperId}`)
-    return response.data
-  },
-
-  getPaperExperimentWorkspace: async (paperId: number): Promise<PaperExperimentWorkspace> => {
-    const response = await api.get(`/api/v1/literature/papers/${paperId}/experiment-workspace`)
-    return response.data
-  },
-
-  bootstrapPaperExperimentWorkspace: async (paperId: number): Promise<PaperExperimentWorkspace> => {
-    const response = await api.post(`/api/v1/literature/papers/${paperId}/experiment-workspace/bootstrap`, undefined, {
-      timeout: 180000,
-    })
-    return response.data
-  },
-
-  refreshPaperExperimentWorkspaceIntake: async (paperId: number): Promise<PaperExperimentWorkspace> => {
-    const response = await api.post(`/api/v1/literature/papers/${paperId}/experiment-workspace/refresh-intake`, undefined, {
-      timeout: 180000,
-    })
-    return response.data
-  },
-
-  createPaperExperimentRun: async (
-    paperId: number,
-    data: PaperExperimentRunCreateRequest,
-  ): Promise<PaperExperimentRun> => {
-    const response = await api.post(`/api/v1/literature/papers/${paperId}/experiment-workspace/runs`, data)
-    return response.data
-  },
-
-  updatePaperExperimentRun: async (
-    paperId: number,
-    runId: number,
-    data: PaperExperimentRunUpdateRequest,
-  ): Promise<PaperExperimentRun> => {
-    const response = await api.patch(`/api/v1/literature/papers/${paperId}/experiment-workspace/runs/${runId}`, data)
     return response.data
   },
 
@@ -4050,10 +3931,10 @@ export const literatureApi = {
 
   getCollectionKnowledgeReadiness: async (
     collectionId: number,
-    knowledgeBaseId: number,
+    knowledgeBaseId?: number,
   ): Promise<CollectionKnowledgeReadiness> => {
     const response = await api.get(`/api/v1/literature/collections/${collectionId}/knowledge-readiness`, {
-      params: { knowledge_base_id: knowledgeBaseId },
+      params: knowledgeBaseId && knowledgeBaseId > 0 ? { knowledge_base_id: knowledgeBaseId } : undefined,
     })
     return response.data
   },
@@ -4212,116 +4093,247 @@ export const projectApi = {
     return response.data
   },
 
-  getProjectRuntimeOverview: async (
-    projectId: number,
-    params?: { recent_execution_limit?: number; max_log_chars?: number },
-  ): Promise<ResearchProjectRuntimeOverview> => {
-    const response = await api.get(`/api/v1/projects/${projectId}/runtime-overview`, { params })
+  getProjectFolderTree: async (projectId: number): Promise<ResearchProjectFolderTree> => {
+    const response = await api.get(`/api/v1/projects/${projectId}/folder-tree`)
     return response.data
   },
 
-  cancelProjectExecution: async (
-    projectId: number,
-    workspaceId: number,
-    executionId: string,
-  ): Promise<Record<string, unknown>> => {
-    const response = await api.post(
-      `/api/v1/projects/${projectId}/workspaces/${workspaceId}/executions/${encodeURIComponent(executionId)}/cancel`,
-    )
+  createProject: async (data: ResearchProjectCreateRequest): Promise<ResearchProject> => {
+    const response = await api.post('/api/v1/projects', data)
     return response.data
   },
 
-  listWorkspaceOutputs: async (
-    projectId: number,
-    workspaceId: number,
-  ): Promise<ResearchProjectWorkspaceOutputSummary[]> => {
-    const response = await api.get(`/api/v1/projects/${projectId}/workspaces/${workspaceId}/outputs`)
+  deleteProject: async (projectId: number): Promise<Record<string, unknown>> => {
+    const response = await api.delete(`/api/v1/projects/${projectId}`)
+    return response.data
+  },
+}
+
+export interface LiteratureReviewWorkspaceFile {
+  name: string
+  relative_path: string
+  group: 'root' | 'pdf' | 'md' | 'review' | 'searches' | 'other'
+  suffix: string
+  size: number
+  modified_at: string
+  media_type: string
+  previewable: boolean
+  download_path: string
+}
+
+export interface LiteratureReviewWorkspaceCounts {
+  pdf: number
+  md: number
+  json: number
+  review: number
+}
+
+export interface LiteratureReviewWorkspace {
+  literature_review_id: string
+  topic: string
+  notes: string
+  target_paper_count: number
+  user_id?: number | null
+  created_at: string
+  updated_at: string
+  modified_at: string
+  root_path: string
+  status: string
+  paper_count: number
+  counts: LiteratureReviewWorkspaceCounts
+  files: LiteratureReviewWorkspaceFile[]
+  has_final: boolean
+  manifest?: Record<string, unknown>
+}
+
+export interface LiteratureReviewWorkspaceOverview {
+  reviews_root: string
+  workspaces: LiteratureReviewWorkspace[]
+}
+
+export interface LiteratureReviewFileContent {
+  name: string
+  relative_path: string
+  suffix: string
+  size: number
+  modified_at: string
+  media_type: string
+  content: string
+  truncated: boolean
+}
+
+export const literatureReviewWorkspaceApi = {
+  getOverview: async (): Promise<LiteratureReviewWorkspaceOverview> => {
+    const response = await api.get('/api/v1/literature-reviews/overview')
     return response.data
   },
 
-  readWorkspaceOutput: async (
-    projectId: number,
-    workspaceId: number,
-    relativePath: string,
-    params?: { max_chars?: number },
-  ): Promise<ResearchProjectWorkspaceOutputContent> => {
-    const response = await api.get(`/api/v1/projects/${projectId}/workspaces/${workspaceId}/outputs/content`, {
-      params: { relative_path: relativePath, max_chars: params?.max_chars },
-    })
+  getWorkspace: async (reviewId: string): Promise<LiteratureReviewWorkspace> => {
+    const response = await api.get(`/api/v1/literature-reviews/${encodeURIComponent(reviewId)}`)
     return response.data
   },
 
-  writeWorkspaceOutput: async (
-    projectId: number,
-    workspaceId: number,
-    data: { relative_path: string; content: string },
-  ): Promise<ResearchProjectWorkspaceOutputContent> => {
-    const response = await api.put(`/api/v1/projects/${projectId}/workspaces/${workspaceId}/outputs/content`, data)
-    return response.data
-  },
-
-  deleteWorkspaceOutput: async (
-    projectId: number,
-    workspaceId: number,
-    relativePath: string,
-  ): Promise<Record<string, unknown>> => {
-    const response = await api.delete(`/api/v1/projects/${projectId}/workspaces/${workspaceId}/outputs`, {
+  getFileContent: async (reviewId: string, relativePath: string): Promise<LiteratureReviewFileContent> => {
+    const response = await api.get(`/api/v1/literature-reviews/${encodeURIComponent(reviewId)}/files/content`, {
       params: { relative_path: relativePath },
     })
     return response.data
   },
 
-  cleanupWorkspaceOutputs: async (
-    projectId: number,
-    workspaceId: number,
-    data?: { preserve_repo?: boolean },
-  ): Promise<ResearchProjectWorkspaceOutputCleanupResult> => {
-    const response = await api.post(`/api/v1/projects/${projectId}/workspaces/${workspaceId}/outputs/cleanup`, data || {})
+  downloadFile: async (reviewId: string, relativePath: string): Promise<Blob> => {
+    const response = await api.get(`/api/v1/literature-reviews/${encodeURIComponent(reviewId)}/files/download`, {
+      params: { relative_path: relativePath },
+      responseType: 'blob',
+    })
+    return response.data
+  },
+}
+
+export interface DocxManagedFile {
+  name: string
+  stored_name?: string
+  original_filename?: string
+  relative_path: string
+  path: string
+  size: number
+  modified_at: string
+  media_type: string
+  download_path: string
+  file_role: 'sample_template' | 'writing_guide' | 'reference'
+  file_role_label: string
+}
+
+export interface DocxTemplate {
+  template_id: string
+  name: string
+  description: string
+  created_at: string
+  updated_at: string
+  created_by?: number
+  root_path: string
+  files_path: string
+  md_constraints: string
+  docx_constraints: string
+  files: DocxManagedFile[]
+}
+
+export interface DocxWorkspace {
+  docx_id: string
+  template_id?: string
+  template_name?: string
+  artifact_id?: string
+  conversation_id?: number | null
+  user_id?: number | null
+  path: string
+  workspace_path?: string
+  source_path?: string
+  requirements_path?: string
+  output_basename?: string
+  docx_path?: string
+  pdf_path?: string
+  status?: string
+  validation_status?: string
+  session_id?: string
+  error?: string
+  modified_at: string
+  files: DocxManagedFile[]
+}
+
+export interface DocxTemplateOverview {
+  docx_root: string
+  templates_root: string
+  default_docx_style_prompt: string
+  templates: DocxTemplate[]
+  workspaces: DocxWorkspace[]
+}
+
+export interface DocxTemplateSaveRequest {
+  template_id?: string
+  name: string
+  description?: string
+  md_constraints?: string
+  docx_constraints?: string
+}
+
+export interface DocxTemplateAnalyzeResponse {
+  template_id: string
+  md_constraints: string
+  docx_constraints: string
+  notes: string
+  raw_model_output: string
+  analysis: Record<string, unknown>
+  artifacts: Record<string, string>
+}
+
+export const docxTemplateApi = {
+  getOverview: async (): Promise<DocxTemplateOverview> => {
+    const response = await api.get('/api/v1/docx/templates/overview')
     return response.data
   },
 
-  cleanupWorkspaceOutputScope: async (
-    projectId: number,
-    workspaceId: number,
-    data: { scope: 'planning' | 'repo_analysis' | 'grounding' | 'implementation' | 'run_drafts' | 'executions' | 'results' },
-  ): Promise<ResearchProjectWorkspaceOutputCleanupResult> => {
-    const response = await api.post(`/api/v1/projects/${projectId}/workspaces/${workspaceId}/outputs/cleanup-scope`, data)
+  saveTemplate: async (data: DocxTemplateSaveRequest): Promise<DocxTemplate> => {
+    const response = await api.post('/api/v1/docx/templates', data)
     return response.data
   },
 
-  // Backward-compatible aliases.
-  listWorkspaceAssets: async (
-    projectId: number,
-    workspaceId: number,
-  ): Promise<ResearchProjectWorkspaceOutputSummary[]> => projectApi.listWorkspaceOutputs(projectId, workspaceId),
+  updateDefaultDocxStylePrompt: async (prompt: string): Promise<{ default_docx_style_prompt: string }> => {
+    const response = await api.put('/api/v1/docx/templates/default-docx-style-prompt', { prompt })
+    return response.data
+  },
 
-  readWorkspaceAsset: async (
-    projectId: number,
-    workspaceId: number,
-    relativePath: string,
-    params?: { max_chars?: number },
-  ): Promise<ResearchProjectWorkspaceOutputContent> => projectApi.readWorkspaceOutput(projectId, workspaceId, relativePath, params),
+  uploadTemplateFile: async (
+    templateId: string,
+    file: File,
+    fileRole: DocxManagedFile['file_role'] = 'reference',
+  ): Promise<DocxManagedFile> => {
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('file_role', fileRole)
+    const response = await api.post(`/api/v1/docx/templates/${encodeURIComponent(templateId)}/files`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    return response.data
+  },
 
-  writeWorkspaceAsset: async (
-    projectId: number,
-    workspaceId: number,
-    data: { relative_path: string; content: string },
-  ): Promise<ResearchProjectWorkspaceOutputContent> => projectApi.writeWorkspaceOutput(projectId, workspaceId, data),
+  updateTemplateFileRole: async (
+    templateId: string,
+    fileName: string,
+    fileRole: DocxManagedFile['file_role'],
+  ): Promise<DocxManagedFile> => {
+    const response = await api.put(
+      `/api/v1/docx/templates/${encodeURIComponent(templateId)}/files/${encodeURIComponent(fileName)}/role`,
+      { file_role: fileRole },
+    )
+    return response.data
+  },
 
-  deleteWorkspaceAsset: async (
-    projectId: number,
-    workspaceId: number,
-    relativePath: string,
-  ): Promise<Record<string, unknown>> => projectApi.deleteWorkspaceOutput(projectId, workspaceId, relativePath),
+  deleteTemplateFile: async (
+    templateId: string,
+    fileName: string,
+  ): Promise<{ template_id: string; file_name: string; deleted: boolean }> => {
+    const response = await api.delete(
+      `/api/v1/docx/templates/${encodeURIComponent(templateId)}/files/${encodeURIComponent(fileName)}`,
+    )
+    return response.data
+  },
 
-  cleanupWorkspaceAssets: async (
-    projectId: number,
-    workspaceId: number,
-    data?: { preserve_repo?: boolean },
-  ): Promise<ResearchProjectWorkspaceOutputCleanupResult> => projectApi.cleanupWorkspaceOutputs(projectId, workspaceId, data),
+  analyzeTemplate: async (
+    templateId: string,
+    userNotes = '',
+  ): Promise<DocxTemplateAnalyzeResponse> => {
+    const response = await api.post(
+      `/api/v1/docx/templates/${encodeURIComponent(templateId)}/analyze`,
+      { user_notes: userNotes },
+      { timeout: 120000 },
+    )
+    return response.data
+  },
 
-  createProject: async (data: ResearchProjectCreateRequest): Promise<ResearchProject> => {
-    const response = await api.post('/api/v1/projects', data)
+  downloadFile: async (relativePath: string): Promise<Blob> => {
+    const response = await api.get('/api/v1/docx/templates/files/download', {
+      params: { relative_path: relativePath },
+      responseType: 'blob',
+    })
     return response.data
   },
 }

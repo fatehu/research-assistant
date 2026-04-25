@@ -18,7 +18,8 @@ from app.services.agent_runtime_service import get_agent_runtime_service
 from app.services.agent_tools import ToolRegistry
 from app.api import (
     auth, users, chat, health, knowledge, literature, codelab,
-    admin, mentor, student, invitations, share, announcements, mcp, projects
+    admin, mentor, student, invitations, share, announcements, mcp, projects, docx_templates,
+    literature_reviews
 )
 
 from app.api.chunking import router as chunking_router
@@ -215,7 +216,9 @@ app.include_router(users.router, prefix="/api/v1/users", tags=["用户"])
 app.include_router(chat.router, prefix="/api/v1/chat", tags=["对话"], dependencies=[Depends(chat_rate_limit)])
 app.include_router(knowledge.router, prefix="/api/v1/knowledge", tags=["知识库"], dependencies=[Depends(knowledge_rate_limit)])
 app.include_router(literature.router, prefix="/api/v1", tags=["文献管理"])
+app.include_router(literature_reviews.router, prefix="/api/v1", tags=["文献综述"])
 app.include_router(projects.router, prefix="/api/v1", tags=["研究项目"])
+app.include_router(docx_templates.router, prefix="/api/v1", tags=["DOCX 模板"])
 app.include_router(codelab.router, prefix="/api/v1/codelab", tags=["代码实验室"], dependencies=[Depends(codelab_rate_limit)])
 app.include_router(mcp.router, prefix="/api/v1/mcp", tags=["MCP 管理"])
 

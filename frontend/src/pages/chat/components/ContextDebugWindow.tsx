@@ -345,7 +345,7 @@ const ContextDebugWindow = ({
   isCompacting = false,
   onManualCompact,
 }: ContextDebugWindowProps) => {
-  const [expanded, setExpanded] = useState(true)
+  const [expanded, setExpanded] = useState(false)
   const [detailsExpanded, setDetailsExpanded] = useState(false)
   const activeConversationState = conversationState || contextDebug?.conversation_state || null
   const activeCompactedHistory = conversationCompactedHistory || null
@@ -450,8 +450,34 @@ const ContextDebugWindow = ({
     return null
   }
 
+  if (!expanded) {
+    return (
+      <div className="pointer-events-none fixed right-4 bottom-[60px] z-40">
+        <motion.button
+          type="button"
+          layout
+          whileHover={{ scale: 1.04 }}
+          whileTap={{ scale: 0.96 }}
+          onClick={() => setExpanded(true)}
+          title="展开上下文窗口"
+          className="pointer-events-auto relative flex h-[52px] w-[52px] items-center justify-center rounded-full border border-emerald-300/25 bg-slate-950/90 text-emerald-100 shadow-[0_18px_42px_rgba(2,6,23,0.42)] backdrop-blur-2xl transition hover:border-emerald-200/45 hover:bg-emerald-400/10"
+        >
+          <BranchesOutlined className="text-lg" />
+          {isSending ? (
+            <span className="absolute -right-0.5 -top-0.5 h-3 w-3 rounded-full border border-slate-950 bg-emerald-400 shadow-[0_0_18px_rgba(52,211,153,0.7)]" />
+          ) : null}
+          {contextDebug?.context_truncated ? (
+            <span className="absolute -bottom-0.5 -right-0.5 h-4 w-4 rounded-full border border-slate-950 bg-amber-400 text-[9px] font-bold text-amber-950">
+              !
+            </span>
+          ) : null}
+        </motion.button>
+      </div>
+    )
+  }
+
   return (
-    <div className="pointer-events-none fixed right-4 bottom-[104px] z-40 w-[min(420px,calc(100vw-1.5rem))]">
+    <div className="pointer-events-none fixed right-4 bottom-[60px] z-40 w-[min(420px,calc(100vw-1.5rem))]">
       <motion.div
         layout
         className="pointer-events-auto overflow-hidden rounded-[24px] border border-white/[0.08] bg-slate-950/88 shadow-[0_20px_60px_rgba(2,6,23,0.42)] backdrop-blur-2xl"

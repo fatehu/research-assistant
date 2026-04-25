@@ -21,6 +21,7 @@ import {
   DownOutlined,
   RightOutlined,
   BookOutlined,
+  ReadOutlined,
   ProjectOutlined,
   LoadingOutlined,
   TeamOutlined,
@@ -312,9 +313,19 @@ const MainLayout = () => {
       label: '文献管理',
     },
     {
+      key: '/literature-reviews',
+      icon: <ReadOutlined />,
+      label: '文献综述',
+    },
+    {
       key: '/projects',
       icon: <ProjectOutlined />,
       label: '研究项目',
+    },
+    {
+      key: '/templates',
+      icon: <FileTextOutlined />,
+      label: '模板管理',
     },
     {
       key: '/code',
@@ -540,7 +551,10 @@ const MainLayout = () => {
     // 前缀匹配
     if (path.startsWith('/chat')) return '/chat'
     if (path.startsWith('/knowledge')) return '/knowledge'
+    if (path.startsWith('/literature-reviews')) return '/literature-reviews'
+    if (path.startsWith('/literature')) return '/literature'
     if (path.startsWith('/projects')) return '/projects'
+    if (path.startsWith('/templates')) return '/templates'
     if (path.startsWith('/code')) return '/code'
     if (path.startsWith('/admin')) return '/admin/users'
     if (path.startsWith('/mentor')) return '/mentor/students'

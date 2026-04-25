@@ -127,9 +127,7 @@ const hasRenderableAssistantMessage = (message: Message | undefined): boolean =>
   return false
 }
 
-const buildHistorySteps = (
-  items: ConversationItemStreamEntry[],
-): Array<{
+type HistoryStep = {
   type: string
   iteration: number
   content?: string
@@ -140,18 +138,12 @@ const buildHistorySteps = (
   success?: boolean
   workflowSummary?: ToolWorkflowSummary
   rawContent?: string
-}> => {
-  const steps: Array<{
-    type: string
-    iteration: number
-    content?: string
-    tool?: string
-    input?: Record<string, unknown>
-    output?: string
-    success?: boolean
-    workflowSummary?: ToolWorkflowSummary
-    rawContent?: string
-  }> = []
+}
+
+const buildHistorySteps = (
+  items: ConversationItemStreamEntry[],
+): HistoryStep[] => {
+  const steps: HistoryStep[] = []
 
   for (const item of items) {
     const kind = String(item.kind || '').trim().toLowerCase()

@@ -78,6 +78,44 @@ const shouldCollapseText = (value: string | undefined, maxChars = 320, maxLines 
   return text.length > maxChars || text.split('\n').length > maxLines
 }
 
+type RawToggleTone = 'process' | 'tool' | 'result' | 'state' | 'neutral'
+
+const rawToggleToneClass: Record<RawToggleTone, string> = {
+  process:
+    'border-white/[0.1] bg-[linear-gradient(180deg,rgba(55,65,81,0.82)_0%,rgba(31,41,55,0.82)_100%)] text-slate-300 shadow-[0_4px_6px_-1px_rgba(0,0,0,0.3)] hover:border-amber-200/[0.24] hover:text-slate-100 hover:shadow-[0_6px_10px_-2px_rgba(0,0,0,0.34)] focus-visible:ring-amber-300/18',
+  tool:
+    'border-white/[0.1] bg-[linear-gradient(180deg,rgba(55,65,81,0.82)_0%,rgba(31,41,55,0.82)_100%)] text-slate-300 shadow-[0_4px_6px_-1px_rgba(0,0,0,0.3)] hover:border-sky-200/[0.24] hover:text-slate-100 hover:shadow-[0_6px_10px_-2px_rgba(0,0,0,0.34)] focus-visible:ring-sky-300/18',
+  result:
+    'border-white/[0.1] bg-[linear-gradient(180deg,rgba(55,65,81,0.82)_0%,rgba(31,41,55,0.82)_100%)] text-slate-300 shadow-[0_4px_6px_-1px_rgba(0,0,0,0.3)] hover:border-emerald-200/[0.24] hover:text-slate-100 hover:shadow-[0_6px_10px_-2px_rgba(0,0,0,0.34)] focus-visible:ring-emerald-300/18',
+  state:
+    'border-white/[0.1] bg-[linear-gradient(180deg,rgba(55,65,81,0.82)_0%,rgba(31,41,55,0.82)_100%)] text-slate-300 shadow-[0_4px_6px_-1px_rgba(0,0,0,0.3)] hover:border-cyan-200/[0.24] hover:text-slate-100 hover:shadow-[0_6px_10px_-2px_rgba(0,0,0,0.34)] focus-visible:ring-cyan-300/18',
+  neutral:
+    'border-white/[0.1] bg-[linear-gradient(180deg,rgba(55,65,81,0.78)_0%,rgba(31,41,55,0.82)_100%)] text-slate-300 shadow-[0_4px_6px_-1px_rgba(0,0,0,0.3)] hover:border-white/[0.18] hover:text-slate-100 hover:shadow-[0_6px_10px_-2px_rgba(0,0,0,0.34)] focus-visible:ring-slate-300/16',
+}
+
+const RawToggleButton = ({
+  expanded,
+  onClick,
+  expandLabel,
+  collapseLabel,
+  tone = 'neutral',
+}: {
+  expanded: boolean
+  onClick: () => void
+  expandLabel: string
+  collapseLabel: string
+  tone?: RawToggleTone
+}) => (
+  <button
+    type="button"
+    onClick={onClick}
+    className={`inline-flex cursor-pointer items-center gap-1.5 rounded-full border px-3 py-1.5 text-[11px] font-semibold tracking-[0.01em] transition duration-200 hover:-translate-y-px focus:outline-none focus-visible:ring-2 ${rawToggleToneClass[tone]}`}
+  >
+    {expanded ? <CompressOutlined className="text-[10px]" /> : <ExpandOutlined className="text-[10px]" />}
+    <span>{expanded ? collapseLabel : expandLabel}</span>
+  </button>
+)
+
 const ExpandableTextBlock = ({
   text,
   monospace = false,
@@ -114,13 +152,13 @@ const ExpandableTextBlock = ({
             </div>
           </div>
           {collapsible ? (
-            <button
-              type="button"
+            <RawToggleButton
+              expanded={expanded}
               onClick={() => setExpanded((value) => !value)}
-              className="inline-flex items-center gap-1 rounded-full border border-emerald-400/18 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-100 transition hover:border-emerald-300/28 hover:bg-emerald-500/14"
-            >
-              {expanded ? collapseLabel : expandLabel}
-            </button>
+              expandLabel={expandLabel}
+              collapseLabel={collapseLabel}
+              tone="result"
+            />
           ) : (
             <span className="rounded-full border border-white/[0.06] bg-white/[0.04] px-2.5 py-1 text-[11px] text-slate-400">
               已完整展示
@@ -156,14 +194,13 @@ const ExpandableTextBlock = ({
             </div>
           </div>
           {collapsible ? (
-            <button
-              type="button"
+            <RawToggleButton
+              expanded={expanded}
               onClick={() => setExpanded((value) => !value)}
-              className="inline-flex items-center gap-1.5 rounded-full border border-cyan-400/16 bg-cyan-500/10 px-2.5 py-1 text-[11px] font-medium text-cyan-100 transition hover:border-cyan-300/26 hover:bg-cyan-500/14"
-            >
-              {expanded ? <CompressOutlined /> : <ExpandOutlined />}
-              {expanded ? collapseLabel : expandLabel}
-            </button>
+              expandLabel={expandLabel}
+              collapseLabel={collapseLabel}
+              tone="state"
+            />
           ) : (
             <span className="rounded-full border border-white/[0.06] bg-white/[0.04] px-2.5 py-1 text-[11px] text-slate-400">
               已完整展示
@@ -192,13 +229,13 @@ const ExpandableTextBlock = ({
         </div>
       )}
       {collapsible ? (
-        <button
-          type="button"
+        <RawToggleButton
+          expanded={expanded}
           onClick={() => setExpanded((value) => !value)}
-          className="text-[11px] text-cyan-300 transition hover:text-cyan-100"
-        >
-          {expanded ? collapseLabel : expandLabel}
-        </button>
+          expandLabel={expandLabel}
+          collapseLabel={collapseLabel}
+          tone={monospace ? 'tool' : 'process'}
+        />
       ) : null}
     </div>
   )
@@ -277,6 +314,7 @@ const buildAttemptBlocks = (steps: TurnLaneStep[]): AttemptBlock[] => {
             tool: step.tool,
             toolCallId: step.toolCallId,
             input: step.input,
+            output: step.output,
             pending: true,
           })
           return
@@ -356,14 +394,13 @@ const SlotCard = ({
           {label}
         </div>
         {collapsible ? (
-          <button
-            type="button"
+          <RawToggleButton
+            expanded={!collapsed}
             onClick={() => setCollapsed((value) => !value)}
-            className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.08] bg-white/[0.04] px-2.5 py-1 text-[11px] font-medium text-slate-300 transition hover:border-white/[0.14] hover:text-slate-100"
-          >
-            {collapsed ? <ExpandOutlined /> : <CompressOutlined />}
-            {collapsed ? '展开' : '收起'}
-          </button>
+            expandLabel="展开"
+            collapseLabel="收起"
+            tone="neutral"
+          />
         ) : null}
       </div>
       {collapsed ? (

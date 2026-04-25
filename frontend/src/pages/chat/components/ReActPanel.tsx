@@ -7,7 +7,7 @@ interface ReActPanelProps {
   currentIteration: number
   isThinking: boolean
   currentThought: string
-  currentToolCall: { tool: string; input: Record<string, any> } | null
+  currentToolCall: { tool: string; input: Record<string, any>; output?: string } | null
 }
 
 const ReActPanel = ({
@@ -47,15 +47,24 @@ const ReActPanel = ({
     }
 
     if (currentToolCall) {
-      const hasPendingAction = [...normalized].reverse().some(
-        (item) => item.type === 'action' && item.tool === currentToolCall.tool,
-      )
-      if (!hasPendingAction) {
+      const pendingActionIndex = [...normalized]
+        .map((item, index) => ({ item, index }))
+        .reverse()
+        .find(({ item }) => item.type === 'action' && item.tool === currentToolCall.tool)?.index
+
+      if (typeof pendingActionIndex === 'number') {
+        const existing = normalized[pendingActionIndex]
+        normalized[pendingActionIndex] = {
+          ...existing,
+          output: currentToolCall.output,
+        }
+      } else {
         normalized.push({
           type: 'action',
           iteration: Math.max(currentIteration, 1),
           tool: currentToolCall.tool,
           input: currentToolCall.input,
+          output: currentToolCall.output,
           content: `调用工具: ${currentToolCall.tool}`,
         })
       }

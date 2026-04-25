@@ -194,6 +194,27 @@ const renderPreviewMessagePayload = (message: Record<string, any>) => {
   )
 }
 
+const renderPreviewRawObject = (value: unknown) => {
+  const serialized = (() => {
+    if (value == null) return ''
+    try {
+      return JSON.stringify(value, null, 2)
+    } catch {
+      return String(value)
+    }
+  })()
+
+  if (!serialized) {
+    return <div className="text-slate-500">当前没有可展示的内容。</div>
+  }
+
+  return (
+    <pre className="max-h-44 overflow-auto whitespace-pre-wrap break-words rounded-xl border border-white/[0.05] bg-black/10 px-2.5 py-2 text-xs leading-6 text-slate-300">
+      {serialized}
+    </pre>
+  )
+}
+
 /** 聊天输入区域 */
 const ChatInput = ({
   inputValue,
@@ -654,7 +675,7 @@ const ChatInput = ({
           : '',
       ].filter(Boolean)
     : []
-  const toolSchemaLabels = exactToolSchemas
+  const toolSchemaEntries = exactToolSchemas
     .map((schema, index) => {
       const name =
         (typeof schema?.name === 'string' && schema.name) ||
@@ -664,9 +685,12 @@ const ChatInput = ({
           : '') ||
         (typeof schema?.title === 'string' && schema.title) ||
         `tool_${index + 1}`
-      return String(name).trim()
+      return {
+        name: String(name).trim() || `tool_${index + 1}`,
+        schema,
+      }
     })
-    .filter(Boolean)
+    .filter((item) => Boolean(item.name))
   const previewRagEnabled = Boolean(contextPreview?.effective_rag_overrides?.enabled || effectiveRagOverrides?.enabled)
   const previewRagForceInitialSearch = Boolean(previewDebug?.rag_force_initial_knowledge_search)
   const previewRagForceInitialQuery = normalizePreviewScalar(previewDebug?.rag_force_initial_query)
@@ -1201,16 +1225,19 @@ const ChatInput = ({
                         </div>
 
                         <div>
-                          <div className="mb-1 text-slate-400">Tools（{exactToolSchemas.length} 个）</div>
-                          {toolSchemaLabels.length ? (
-                            <div className="flex flex-wrap gap-2">
-                              {toolSchemaLabels.map((label) => (
-                                <span
-                                  key={label}
-                                  className="rounded-full border border-white/[0.08] bg-white/[0.04] px-2.5 py-1 text-[11px] text-slate-300"
+                          <div className="mb-1 text-slate-400">Tool Schemas（{exactToolSchemas.length} 个）</div>
+                          {toolSchemaEntries.length ? (
+                            <div className="space-y-2">
+                              {toolSchemaEntries.map(({ name, schema }, index) => (
+                                <div
+                                  key={`${name}-${index}`}
+                                  className="rounded-xl border border-white/[0.05] bg-black/10 px-2.5 py-2"
                                 >
-                                  {label}
-                                </span>
+                                  <div className="mb-1 text-[11px] uppercase tracking-[0.12em] text-slate-500">
+                                    #{index + 1} {name}
+                                  </div>
+                                  {renderPreviewRawObject(schema)}
+                                </div>
                               ))}
                             </div>
                           ) : (

@@ -635,6 +635,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
     const isUser = msg.role === 'user'
     const baseContent = isStreaming ? streamingContent : msg.content
     const contentRef = useRef<HTMLDivElement | null>(null)
+    const pendingRewriteSelectionRef = useRef<RewriteSelectionState | null>(null)
     const [rewriteSelection, setRewriteSelection] = useState<RewriteSelectionState | null>(null)
     const [customRewriteInstruction, setCustomRewriteInstruction] = useState('')
     const [rewriteLoading, setRewriteLoading] = useState(false)
@@ -744,19 +745,31 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
       message.success('已复制到剪贴板')
     }
 
-    const handleCaptureRewriteSelection = () => {
-      if (isUser || isStreaming || rewriteLoading || rewriteAnimation || !onRewriteSpan) return
+    const handleCaptureRewriteSelection = (options?: { openPanel?: boolean; showWarnings?: boolean }): RewriteSelectionState | null => {
+      const openPanel = Boolean(options?.openPanel)
+      const showWarnings = Boolean(options?.showWarnings)
+      if (isUser || isStreaming || rewriteLoading || rewriteAnimation || !onRewriteSpan) return null
       const selection = window.getSelection()
-      if (!selection || selection.rangeCount <= 0 || selection.isCollapsed) return
+      if (!selection || selection.rangeCount <= 0 || selection.isCollapsed) {
+        if (!openPanel) pendingRewriteSelectionRef.current = null
+        return null
+      }
       const range = selection.getRangeAt(0)
       const container = contentRef.current
-      if (!container || !container.contains(range.commonAncestorContainer)) return
+      if (!container || !container.contains(range.commonAncestorContainer)) {
+        if (!openPanel) pendingRewriteSelectionRef.current = null
+        return null
+      }
 
       const selectedText = selection.toString()
-      if (selectedText.trim().length < 2) return
+      if (selectedText.trim().length < 2) {
+        if (!openPanel) pendingRewriteSelectionRef.current = null
+        return null
+      }
       if (selectedText.length > 4000) {
-        message.warning('选区太长，请缩小后再改写')
-        return
+        if (!openPanel) pendingRewriteSelectionRef.current = null
+        if (showWarnings) message.warning('选区太长，请缩小后再改写')
+        return null
       }
 
       const preRange = range.cloneRange()
@@ -770,17 +783,41 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
         renderedBefore,
       )
       if (!resolvedSelection) {
-        message.warning('这个选区暂时无法映射到原始 Markdown，请缩小选区后重试')
-        return
+        if (!openPanel) pendingRewriteSelectionRef.current = null
+        if (showWarnings) message.warning('这个选区暂时无法映射到原始 Markdown，请缩小选区后重试')
+        return null
       }
 
       const rect = range.getBoundingClientRect()
 
-      setRewriteSelection({
+      const nextSelection = {
         ...resolvedSelection,
         x: Math.min(Math.max(rect.left + rect.width / 2, 180), window.innerWidth - 180),
         y: Math.max(rect.top - 12, 72),
-      })
+      }
+      if (openPanel) {
+        setRewriteSelection(nextSelection)
+      } else {
+        pendingRewriteSelectionRef.current = nextSelection
+      }
+      return nextSelection
+    }
+
+    const handleOpenRewritePanel = () => {
+      if (pendingRewriteSelectionRef.current) {
+        setRewriteSelection(pendingRewriteSelectionRef.current)
+        return
+      }
+      const captured = handleCaptureRewriteSelection({ openPanel: true, showWarnings: true })
+      if (!captured && !window.getSelection()?.toString().trim()) {
+        message.info('请先在这条回复里选中需要改写的一段文字')
+      }
+    }
+
+    const handleCloseRewritePanel = () => {
+      setRewriteSelection(null)
+      pendingRewriteSelectionRef.current = null
+      setCustomRewriteInstruction('')
     }
 
     const runRewrite = async (instruction: string) => {
@@ -800,6 +837,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
           occurrence_index: rewriteSelection.occurrenceIndex,
         })
         setRewriteSelection(null)
+        pendingRewriteSelectionRef.current = null
         setCustomRewriteInstruction('')
         setAnimatedContent(response.old_content)
         setRewriteAnimation({
@@ -955,7 +993,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                     <>
                       <div
                         ref={contentRef}
-                        onMouseUp={handleCaptureRewriteSelection}
+                        onMouseUp={() => handleCaptureRewriteSelection()}
                         className="prose prose-invert prose-slate max-w-none
                         [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_li>p]:my-1
                         prose-p:my-6 prose-p:text-[16px] prose-p:leading-[1.95] prose-p:tracking-[0.004em] prose-p:text-slate-200/90
@@ -1172,12 +1210,12 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                       {!isStreaming && content && (
                     <div className="mt-5 flex items-center gap-3 border-t border-white/[0.04] pt-4">
                       {!isUser && onRewriteSpan && (
-                        <Tooltip title="选中回复中的一段文字后改写">
+                        <Tooltip title="先选中回复中的一段文字，再点击这里改写">
                           <Button
                             type="text"
                             size="small"
                             icon={<EditOutlined />}
-                            onClick={() => message.info('请先在这条回复里选中需要改写的一段文字')}
+                            onClick={handleOpenRewritePanel}
                             className="rounded-lg text-slate-400 transition-all hover:bg-white/[0.04] hover:text-cyan-300"
                           >
                             局部改写
@@ -1227,7 +1265,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                 </div>
                 <button
                   type="button"
-                  onClick={() => setRewriteSelection(null)}
+                  onClick={handleCloseRewritePanel}
                   className="rounded-full px-2 py-1 text-xs text-slate-500 transition-colors hover:bg-white/[0.06] hover:text-slate-200"
                 >
                   取消
