@@ -4,6 +4,8 @@
 !requirements.txt
 !alembic.ini
 !mcp_servers.json
+!scripts/
+!scripts/runtime_worker_entrypoint.sh
 !app/
 !app/**
 !alembic/

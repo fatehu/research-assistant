@@ -40,6 +40,7 @@ aiofiles==23.2.1
 sse-starlette==2.1.0
 langchain-core==1.2.23
 langchain-text-splitters==0.3.11
+langgraph==1.1.6
 llama-index-core==0.12.52.post1
 
 # PDF parsing

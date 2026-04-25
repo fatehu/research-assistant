@@ -36,3 +36,8 @@ Recent history follows Conventional Commit style such as `feat(reader): ...`, `f
 
 ## Security & Configuration Tips
 Copy `.env.example` to `.env` and keep secrets out of git. Prefer `AUTO_CREATE_TABLES=false` outside local development and use Alembic for schema changes. Treat `.env`, MCP credentials, and provider API keys as local-only configuration.
+
+## Collaboration Constraints
+Prioritize getting the system running stably before adding engineering hardening, safety hardening, or other non-essential improvements. Do not proactively add engineering or security enhancements until the core system is stable and the user explicitly asks for them.
+
+For any action, scope expansion, or design decision the user has not explicitly specified, stop and ask for confirmation before proceeding. Do not assume additional requirements or take initiative beyond the user's stated intent without approval.

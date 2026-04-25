@@ -55,6 +55,7 @@ services:
       - LC_ALL=${CONTAINER_LC_ALL:-C.UTF-8}
       - PYTHONUTF8=${CONTAINER_PYTHONUTF8:-1}
       - PYTHONIOENCODING=${CONTAINER_PYTHONIOENCODING:-UTF-8}
+      - WATCHFILES_FORCE_POLLING=${WATCHFILES_FORCE_POLLING:-true}
       - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - SECRET_KEY=${SECRET_KEY:?SECRET_KEY is required}
@@ -229,7 +230,7 @@ services:
       - CODELAB_RUNNER_TOKEN=${CODELAB_RUNNER_TOKEN:?CODELAB_RUNNER_TOKEN is required}
       - CODELAB_RUNNER_TIMEOUT_SECONDS=${CODELAB_RUNNER_TIMEOUT_SECONDS:-25}
       - CODELAB_RUNNER_CONNECT_TIMEOUT_SECONDS=${CODELAB_RUNNER_CONNECT_TIMEOUT_SECONDS:-3}
-      - PROJECT_RUNTIME_WORKER_ENABLED=${PROJECT_RUNTIME_WORKER_ENABLED:-false}
+      - PROJECT_RUNTIME_WORKER_ENABLED=${PROJECT_RUNTIME_WORKER_ENABLED:-true}
       - PROJECT_RUNTIME_WORKER_URL=${PROJECT_RUNTIME_WORKER_URL:-http://runtime-worker:8109}
       - PROJECT_RUNTIME_WORKER_TOKEN=${PROJECT_RUNTIME_WORKER_TOKEN:-dev-runtime-worker-token}
       - PROJECT_RUNTIME_WORKER_TIMEOUT_SECONDS=${PROJECT_RUNTIME_WORKER_TIMEOUT_SECONDS:-30}
@@ -255,7 +256,7 @@ services:
         condition: service_started
     command: >
       sh -c 'set -eu; alembic upgrade head; if [ "${BACKEND_UVICORN_RELOAD:-true}" = "true" ]; then
-        cd /tmp &&
+        cd /app/app &&
         exec uvicorn app.main:app --app-dir /app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/app --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}";
       fi; exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers "${BACKEND_UVICORN_WORKERS:-1}" --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}"'
     networks:
@@ -341,6 +342,11 @@ services:
       args:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
         TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        APT_MIRROR: ${APT_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/debian}
+        APT_SECURITY_MIRROR: ${APT_SECURITY_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/debian-security}
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-latest}
+        CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS: ${CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS:-240000}
     container_name: research_runtime_worker
     profiles:
       - runtime
@@ -358,7 +364,18 @@ services:
       - HF_HOME=${PROJECT_RUNTIME_HF_HOME:-/app/runtime_cache/huggingface}
       - HUGGINGFACE_HUB_CACHE=${PROJECT_RUNTIME_HF_HUB_CACHE:-/app/runtime_cache/huggingface/hub}
       - XDG_CACHE_HOME=${PROJECT_RUNTIME_XDG_CACHE_HOME:-/app/runtime_cache/xdg}
-    command: uvicorn app.runtime_worker.main:app --host 0.0.0.0 --port 8109
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-https://dashscope.aliyuncs.com/apps/anthropic}
+      - ANTHROPIC_API_KEY=${ALIYUN_API_KEY}
+      - ANTHROPIC_AUTH_TOKEN=${ALIYUN_API_KEY}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-qwen3.5-flash}
+      - CLAUDE_CODE_PLUGIN_CACHE_DIR=${CLAUDE_CODE_PLUGIN_CACHE_DIR:-/opt/claude-plugin-seed}
+      - CLAUDE_CODE_PLUGIN_SEED_DIR=${CLAUDE_CODE_PLUGIN_SEED_DIR:-/opt/claude-plugin-seed}
+      - CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS=${CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS:-240000}
+      - CLAUDE_CODE_PLUGIN_INSTALL_TIMEOUT_SECONDS=${CLAUDE_CODE_PLUGIN_INSTALL_TIMEOUT_SECONDS:-360}
+      - CLAUDE_CODE_PLUGIN_BOOTSTRAP_REQUIRED=${CLAUDE_CODE_PLUGIN_BOOTSTRAP_REQUIRED:-false}
+      - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}
+      - DISABLE_AUTOUPDATER=1
+    command: /usr/local/bin/runtime_worker_entrypoint.sh
     ports:
       - "${PROJECT_RUNTIME_WORKER_PORT:-8109}:8109"
     volumes:
@@ -366,6 +383,7 @@ services:
       - ./.agents:/app/.agents:ro
       - backend_uploads:/app/uploads
       - runtime_worker_cache:/app/runtime_cache
+      - runtime_worker_claude_plugins:/opt/claude-plugin-seed
       - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped
     networks:
@@ -455,3 +473,4 @@ volumes:
 
   frontend_node_modules:
   runtime_worker_cache:
+  runtime_worker_claude_plugins:

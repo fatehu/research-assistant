@@ -75,6 +75,12 @@ scripts/
 !.agents/skills/*/scripts/
 !.agents/skills/*/scripts/*.py
 
+# Runtime-worker checked-in support scripts
+!backend/scripts/
+backend/scripts/*
+!backend/scripts/runtime_worker_entrypoint.sh
+!backend/scripts/generate_docx_skill_demo.js
+
 # Build artifacts
 *.tsbuildinfo
 vite.config.js
@@ -89,6 +95,10 @@ output/
 
 # Runtime-generated MCP config
 backend/mcp_servers.json
+backend/.claude.json
+backend/.claude/
+backend/.config/
+.agents/skills/paper-reproduction-bak/
 
 # Retrieval eval temporary artifacts
 backend/phase4_eval_report.md

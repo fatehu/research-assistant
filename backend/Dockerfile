@@ -16,8 +16,10 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     fontconfig \
     fonts-wqy-zenhei \
+    libreoffice-writer \
     nodejs \
     npm \
+    pandoc \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
