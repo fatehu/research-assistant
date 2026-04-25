@@ -4239,12 +4239,29 @@ export interface DocxWorkspace {
   files: DocxManagedFile[]
 }
 
+export interface DocxDocumentArtifactSummary {
+  artifact_id: string
+  template_id?: string
+  title: string
+  conversation_id?: number | string | null
+  path: string
+  relative_path: string
+  download_path?: string
+  block_count: number
+  filled_block_count: number
+  updated_at?: string
+  modified_at: string
+  size: number
+}
+
 export interface DocxTemplateOverview {
   docx_root: string
   templates_root: string
+  artifacts_root?: string
   default_docx_style_prompt: string
   templates: DocxTemplate[]
   workspaces: DocxWorkspace[]
+  document_artifacts?: DocxDocumentArtifactSummary[]
 }
 
 export interface DocxTemplateSaveRequest {

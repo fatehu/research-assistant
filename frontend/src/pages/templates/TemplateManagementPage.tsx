@@ -28,6 +28,7 @@ import {
 } from '@ant-design/icons'
 import {
   docxTemplateApi,
+  type DocxDocumentArtifactSummary,
   type DocxManagedFile,
   type DocxTemplate,
   type DocxTemplateOverview,
@@ -159,9 +160,19 @@ export default function TemplateManagementPage() {
     return (overview?.workspaces || []).filter((workspace) => workspace.template_id === selectedTemplate.template_id)
   }, [isDraftTemplateSelected, overview?.workspaces, selectedTemplate])
 
+  const selectedTemplateArtifacts = useMemo(() => {
+    if (!selectedTemplate || isDraftTemplateSelected) return []
+    return (overview?.document_artifacts || []).filter((artifact) => artifact.template_id === selectedTemplate.template_id)
+  }, [isDraftTemplateSelected, overview?.document_artifacts, selectedTemplate])
+
   const unboundWorkspaceCount = useMemo(
     () => (overview?.workspaces || []).filter((workspace) => !workspace.template_id).length,
     [overview?.workspaces],
+  )
+
+  const unboundArtifactCount = useMemo(
+    () => (overview?.document_artifacts || []).filter((artifact) => !artifact.template_id).length,
+    [overview?.document_artifacts],
   )
 
   const applyTemplateToForm = useCallback((template: DocxTemplate | null) => {
@@ -333,13 +344,25 @@ export default function TemplateManagementPage() {
     }
   }
 
-  const handleDownload = async (file: DocxManagedFile) => {
+  const handleDownloadPath = async (relativePath: string, filename: string) => {
+    if (!relativePath) return
     try {
-      const blob = await docxTemplateApi.downloadFile(file.download_path || file.relative_path)
-      saveBlob(blob, file.name)
+      const blob = await docxTemplateApi.downloadFile(relativePath)
+      saveBlob(blob, filename)
     } catch (error) {
       message.error(String((error as Error)?.message || '下载文件失败'))
     }
+  }
+
+  const handleDownload = async (file: DocxManagedFile) => {
+    await handleDownloadPath(file.download_path || file.relative_path, file.original_filename || file.name)
+  }
+
+  const handleDownloadArtifact = async (artifact: DocxDocumentArtifactSummary) => {
+    await handleDownloadPath(
+      artifact.download_path || artifact.relative_path,
+      `${artifact.artifact_id || 'artifact'}.json`,
+    )
   }
 
   const templateFileOperationName = (file: DocxManagedFile) => file.stored_name || file.name
@@ -483,7 +506,7 @@ export default function TemplateManagementPage() {
             </Button>
           </Space>
         </div>
-        <div className="relative mt-5 grid gap-3 md:grid-cols-2">
+        <div className="relative mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           <div className="group rounded-2xl border border-white/[0.07] bg-[#020817]/45 px-4 py-3 transition-all duration-300 hover:border-emerald-400/30 hover:bg-[#020817]/70">
             <div className="text-[11px] uppercase tracking-[0.18em] text-emerald-200/80 transition-colors group-hover:text-emerald-200">DOCX Root</div>
             <div className="mt-1 break-all font-mono text-xs text-slate-300">{overview?.docx_root || '/app/uploads/docx'}</div>
@@ -491,6 +514,10 @@ export default function TemplateManagementPage() {
           <div className="group rounded-2xl border border-white/[0.07] bg-[#020817]/45 px-4 py-3 transition-all duration-300 hover:border-emerald-400/30 hover:bg-[#020817]/70">
             <div className="text-[11px] uppercase tracking-[0.18em] text-emerald-200/80 transition-colors group-hover:text-emerald-200">Templates Root</div>
             <div className="mt-1 break-all font-mono text-xs text-slate-300">{overview?.templates_root || '/app/uploads/docx/templates'}</div>
+          </div>
+          <div className="group rounded-2xl border border-white/[0.07] bg-[#020817]/45 px-4 py-3 transition-all duration-300 hover:border-emerald-400/30 hover:bg-[#020817]/70">
+            <div className="text-[11px] uppercase tracking-[0.18em] text-emerald-200/80 transition-colors group-hover:text-emerald-200">Artifacts Root</div>
+            <div className="mt-1 break-all font-mono text-xs text-slate-300">{overview?.artifacts_root || '/app/uploads/docx/artifacts'}</div>
           </div>
         </div>
       </div>
@@ -729,6 +756,77 @@ export default function TemplateManagementPage() {
                 <Tag color="green">template_files</Tag>
               </div>
               {renderFileList(selectedTemplate?.files || [], '这个模板还没有上传文件', { editableRole: true })}
+            </section>
+
+            <section className={`rounded-[30px] ${glassPanelClass} p-5`}>
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <Space className="text-slate-100">
+                    <FileTextOutlined />
+                    <span className="font-semibold">Document Artifacts</span>
+                  </Space>
+                  <div className="mt-1 text-xs text-slate-400/80">
+                    当前模板关联的可编辑文档草稿；DOCX 生成工具会优先使用 artifact 路径，而不是把大 JSON 直接塞进消息。
+                  </div>
+                </div>
+                <Space size={8}>
+                  <Tag>{selectedTemplateArtifacts.length} current</Tag>
+                  {unboundArtifactCount ? <Tag color="default">{unboundArtifactCount} unbound</Tag> : null}
+                </Space>
+              </div>
+              {selectedTemplateArtifacts.length ? (
+                <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-3">
+                  {selectedTemplateArtifacts.map((artifact) => (
+                    <div
+                      key={`${artifact.conversation_id}-${artifact.artifact_id}`}
+                      className="group relative overflow-hidden rounded-3xl border border-white/[0.08] bg-[#061122]/[0.88] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)] transition-all hover:-translate-y-0.5 hover:border-cyan-400/[0.18] hover:bg-[#08182c]"
+                    >
+                      <div className="pointer-events-none absolute -right-8 -top-8 h-24 w-24 rounded-full bg-cyan-400/[0.035] blur-2xl transition-opacity group-hover:opacity-100" />
+                      <div className="relative flex items-start gap-3">
+                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-white/[0.08] bg-white/[0.04] text-cyan-200">
+                          <FileTextOutlined />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate font-mono text-sm font-semibold text-slate-100">
+                            {artifact.artifact_id || artifact.title}
+                          </div>
+                          <div className="mt-1 truncate text-xs text-slate-300/75">
+                            {artifact.title || '未命名文档'}
+                          </div>
+                          <div className="mt-1 truncate font-mono text-[11px] text-slate-400/60">{artifact.relative_path}</div>
+                          <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-slate-400/70">
+                            <span className="rounded-full border border-white/[0.07] bg-white/[0.035] px-2 py-0.5">
+                              {artifact.filled_block_count}/{artifact.block_count} blocks
+                            </span>
+                            <span className="rounded-full border border-white/[0.07] bg-white/[0.035] px-2 py-0.5">
+                              chat {artifact.conversation_id || '-'}
+                            </span>
+                            <span className="rounded-full border border-white/[0.07] bg-white/[0.035] px-2 py-0.5">
+                              {formatSize(artifact.size)}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="relative mt-4 flex flex-wrap items-center justify-between gap-2">
+                        <Text className="!text-xs !text-slate-500">{formatDateTime(artifact.updated_at || artifact.modified_at)}</Text>
+                        <Button
+                          size="small"
+                          icon={<DownloadOutlined />}
+                          className={darkButtonClass}
+                          onClick={() => void handleDownloadArtifact(artifact)}
+                        >
+                          下载 JSON
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="group relative flex flex-col items-center justify-center overflow-hidden rounded-3xl border border-dashed border-white/[0.09] bg-[#020817]/55 px-5 py-12 transition-all hover:border-cyan-500/30 hover:bg-[#020817]/80">
+                  <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,rgba(34,211,238,0.05),transparent_60%)] opacity-0 transition-opacity group-hover:opacity-100" />
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={<span className="text-slate-400">当前模板暂无关联 artifact</span>} />
+                </div>
+              )}
             </section>
 
             <section className={`rounded-[30px] ${glassPanelClass} p-5`}>

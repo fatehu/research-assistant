@@ -65,6 +65,7 @@ class DocxTemplateService:
         self.upload_root = upload_root or self._default_upload_root()
         self.docx_root = self.upload_root / "docx"
         self.templates_root = self.docx_root / "templates"
+        self.artifacts_root = self.docx_root / "artifacts"
 
     @staticmethod
     def _default_upload_root() -> Path:
@@ -115,6 +116,7 @@ class DocxTemplateService:
     def ensure_roots(self) -> None:
         self.docx_root.mkdir(parents=True, exist_ok=True)
         self.templates_root.mkdir(parents=True, exist_ok=True)
+        self.artifacts_root.mkdir(parents=True, exist_ok=True)
         prompt_path = self.default_docx_style_prompt_path()
         if not prompt_path.exists():
             prompt_path.write_text(DEFAULT_DOCX_STYLE_PROMPT, encoding="utf-8")
@@ -1252,6 +1254,49 @@ class DocxTemplateService:
             workspaces.append(self._workspace_payload_from_path(path))
         return workspaces
 
+    def _artifact_payload_from_path(self, path: Path) -> Dict[str, Any]:
+        payload = self._read_json(path)
+        stat = path.stat()
+        modified_at = datetime.utcfromtimestamp(stat.st_mtime).isoformat()
+        blocks = [dict(item or {}) for item in list(payload.get("blocks") or []) if isinstance(item, dict)]
+        filled_blocks = [
+            item for item in blocks
+            if str(item.get("markdown") or "").strip()
+        ]
+        relative_path = ""
+        try:
+            relative_path = path.resolve().relative_to(self.docx_root.resolve()).as_posix()
+        except Exception:
+            relative_path = str(path)
+        artifact_id = str(payload.get("artifact_id") or path.parent.name or "").strip()
+        return {
+            "artifact_id": artifact_id,
+            "template_id": str(payload.get("template_id") or "").strip(),
+            "title": str(payload.get("title") or artifact_id or "文档 Artifact").strip(),
+            "conversation_id": int(path.parent.parent.name) if path.parent.parent.name.isdigit() else path.parent.parent.name,
+            "path": str(path),
+            "relative_path": relative_path,
+            "download_path": relative_path,
+            "block_count": len(blocks),
+            "filled_block_count": len(filled_blocks),
+            "updated_at": str(payload.get("updated_at") or modified_at),
+            "modified_at": modified_at,
+            "size": stat.st_size,
+        }
+
+    def _scanned_document_artifacts(self, *, limit: int = 300) -> List[Dict[str, Any]]:
+        if not self.artifacts_root.exists():
+            return []
+        paths = [
+            path for path in self.artifacts_root.glob("*/*/artifact.json")
+            if path.is_file()
+        ]
+        paths.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+        artifacts = []
+        for path in paths[:limit]:
+            artifacts.append(self._artifact_payload_from_path(path))
+        return artifacts
+
     async def list_overview_for_user(
         self,
         db: AsyncSession,
@@ -1287,9 +1332,11 @@ class DocxTemplateService:
         return {
             "docx_root": str(self.docx_root),
             "templates_root": str(self.templates_root),
+            "artifacts_root": str(self.artifacts_root),
             "default_docx_style_prompt": self.get_default_docx_style_prompt(),
             "templates": templates,
             "workspaces": workspaces,
+            "document_artifacts": self._scanned_document_artifacts(),
         }
 
     def resolve_download_file(self, relative_path: str) -> Optional[Dict[str, Any]]:
@@ -1331,7 +1378,9 @@ class DocxTemplateService:
         return {
             "docx_root": str(self.docx_root),
             "templates_root": str(self.templates_root),
+            "artifacts_root": str(self.artifacts_root),
             "default_docx_style_prompt": self.get_default_docx_style_prompt(),
             "templates": self._scanned_templates(),
             "workspaces": self._scanned_workspaces(),
+            "document_artifacts": self._scanned_document_artifacts(),
         }
