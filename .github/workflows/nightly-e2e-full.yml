@@ -61,6 +61,19 @@ jobs:
           ./e2e/role_business_api_smoke_e2e.ps1
           ./e2e/remaining_modules_api_smoke_e2e.ps1
 
+      - name: Wait frontend ready
+        run: |
+          for i in {1..120}; do
+            if curl -fsS http://localhost:3000/login >/dev/null; then
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Frontend not ready" >&2
+          docker compose -f docker-compose.yml -f .github/docker-compose.ci.yml ps
+          docker compose -f docker-compose.yml -f .github/docker-compose.ci.yml logs --tail 200 frontend
+          exit 1
+
       - name: Run UI E2E scripts
         shell: pwsh
         run: |
