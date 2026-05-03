@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="826" viewBox="0 0 1280 826">
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+<stop offset="0%" stop-color="#020617"/>
+<stop offset="55%" stop-color="#0f172a"/>
+<stop offset="100%" stop-color="#111827"/>
+</linearGradient>
+</defs>
+<rect width="1280" height="826" fill="url(#bg)"/>
+<rect x="30.00" y="16.00" width="1220.00" height="784.00" rx="28.00" ry="28.00" fill="#020817"/>
+<text x="42.00" y="56.00" fill="#f8fafc" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="24" font-weight="800">PDF Parser Benchmark on OpenDataLoader-Bench Corpus</text>
+<text x="42.00" y="84.00" fill="#9fb0c4" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="500">Local recorded evaluation files, full 200-document corpus, zero failed documents. Quality metrics are higher-is-better.</text>
+<text x="42.00" y="108.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="500">This is an internal reproduction chart, not the live upstream leaderboard. Speed values are recorded-run metadata.</text>
+<rect x="42.00" y="126.00" width="226.40" height="96.00" rx="18.00" ry="18.00" fill="#0b1220"/>
+<rect x="42.00" y="126.00" width="4.00" height="96.00" rx="2.00" ry="2.00" fill="#14b8a6"/>
+<text x="60.00" y="156.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">Overall</text>
+<text x="60.00" y="194.00" fill="#f8fafc" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="27" font-weight="800">0.848</text>
+<rect x="284.40" y="126.00" width="226.40" height="96.00" rx="18.00" ry="18.00" fill="#0b1220"/>
+<rect x="284.40" y="126.00" width="4.00" height="96.00" rx="2.00" ry="2.00" fill="#60a5fa"/>
+<text x="302.40" y="156.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">Reading Order</text>
+<text x="302.40" y="194.00" fill="#f8fafc" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="27" font-weight="800">0.903</text>
+<rect x="526.80" y="126.00" width="226.40" height="96.00" rx="18.00" ry="18.00" fill="#0b1220"/>
+<rect x="526.80" y="126.00" width="4.00" height="96.00" rx="2.00" ry="2.00" fill="#f59e0b"/>
+<text x="544.80" y="156.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">Table</text>
+<text x="544.80" y="194.00" fill="#f8fafc" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="27" font-weight="800">0.596</text>
+<rect x="769.20" y="126.00" width="226.40" height="96.00" rx="18.00" ry="18.00" fill="#0b1220"/>
+<rect x="769.20" y="126.00" width="4.00" height="96.00" rx="2.00" ry="2.00" fill="#a3e635"/>
+<text x="787.20" y="156.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">Heading</text>
+<text x="787.20" y="194.00" fill="#f8fafc" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="27" font-weight="800">0.769</text>
+<rect x="1011.60" y="126.00" width="226.40" height="96.00" rx="18.00" ry="18.00" fill="#0b1220"/>
+<rect x="1011.60" y="126.00" width="4.00" height="96.00" rx="2.00" ry="2.00" fill="#c084fc"/>
+<text x="1029.60" y="156.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">Speed</text>
+<text x="1029.60" y="194.00" fill="#f8fafc" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="27" font-weight="800">0.509s/doc</text>
+<text x="42.00" y="250.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="800">Engine</text>
+<text x="292.00" y="250.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="800">Overall</text>
+<text x="684.00" y="250.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="800">Reading</text>
+<text x="792.00" y="250.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="800">Table</text>
+<text x="900.00" y="250.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="800">Heading</text>
+<text x="1012.00" y="250.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="800">Recorded Speed</text>
+<rect x="42.00" y="256.00" width="1196.00" height="46.00" rx="14.00" ry="14.00" fill="#07111f"/>
+<text x="62.00" y="285.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="800">1</text>
+<text x="94.00" y="285.00" fill="#dbeafe" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="650">opendataloader-hybrid</text>
+<text x="94.00" y="303.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10" font-weight="500">200 docs</text>
+<rect x="292.00" y="276.00" width="320.00" height="14.00" rx="7.00" ry="7.00" fill="#111827"/>
+<rect x="292.00" y="276.00" width="290.95" height="14.00" rx="7.00" ry="7.00" fill="#475569"/>
+<text x="624.00" y="288.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="800">0.909</text>
+<text x="684.00" y="288.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.935</text>
+<text x="796.00" y="288.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.928</text>
+<text x="908.00" y="288.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.828</text>
+<text x="1012.00" y="288.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">0.433s/doc</text>
+<rect x="42.00" y="310.00" width="1196.00" height="46.00" rx="14.00" ry="14.00" fill="#07111f"/>
+<text x="62.00" y="339.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="800">2</text>
+<text x="94.00" y="339.00" fill="#dbeafe" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="650">docling</text>
+<text x="94.00" y="357.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10" font-weight="500">200 docs</text>
+<rect x="292.00" y="330.00" width="320.00" height="14.00" rx="7.00" ry="7.00" fill="#111827"/>
+<rect x="292.00" y="330.00" width="280.50" height="14.00" rx="7.00" ry="7.00" fill="#475569"/>
+<text x="624.00" y="342.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="800">0.877</text>
+<text x="684.00" y="342.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.899</text>
+<text x="796.00" y="342.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.887</text>
+<text x="908.00" y="342.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.802</text>
+<text x="1012.00" y="342.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">0.725s/doc</text>
+<rect x="42.00" y="364.00" width="1196.00" height="46.00" rx="14.00" ry="14.00" fill="#07111f"/>
+<text x="62.00" y="393.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="800">3</text>
+<text x="94.00" y="393.00" fill="#dbeafe" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="650">marker</text>
+<text x="94.00" y="411.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10" font-weight="500">200 docs</text>
+<rect x="292.00" y="384.00" width="320.00" height="14.00" rx="7.00" ry="7.00" fill="#111827"/>
+<rect x="292.00" y="384.00" width="275.47" height="14.00" rx="7.00" ry="7.00" fill="#475569"/>
+<text x="624.00" y="396.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="800">0.861</text>
+<text x="684.00" y="396.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.890</text>
+<text x="796.00" y="396.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.808</text>
+<text x="908.00" y="396.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.796</text>
+<text x="1012.00" y="396.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">53.932s/doc</text>
+<rect x="42.00" y="418.00" width="1196.00" height="46.00" rx="14.00" ry="14.00" fill="#0f1f2c"/>
+<rect x="42.00" y="418.00" width="5.00" height="46.00" rx="3.00" ry="3.00" fill="#14b8a6"/>
+<text x="62.00" y="447.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="800">4</text>
+<text x="94.00" y="447.00" fill="#f8fafc" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="800">local-structured-pdf</text>
+<text x="94.00" y="465.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10" font-weight="500">200 docs</text>
+<rect x="292.00" y="438.00" width="320.00" height="14.00" rx="7.00" ry="7.00" fill="#111827"/>
+<rect x="292.00" y="438.00" width="271.21" height="14.00" rx="7.00" ry="7.00" fill="#14b8a6"/>
+<text x="624.00" y="450.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="800">0.848</text>
+<text x="684.00" y="450.00" fill="#60a5fa" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="800">0.903</text>
+<text x="796.00" y="450.00" fill="#f59e0b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="800">0.596</text>
+<text x="908.00" y="450.00" fill="#a3e635" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="800">0.769</text>
+<text x="1012.00" y="450.00" fill="#c084fc" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">0.509s/doc</text>
+<rect x="42.00" y="472.00" width="1196.00" height="46.00" rx="14.00" ry="14.00" fill="#07111f"/>
+<text x="62.00" y="501.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="800">5</text>
+<text x="94.00" y="501.00" fill="#dbeafe" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="650">opendataloader</text>
+<text x="94.00" y="519.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10" font-weight="500">200 docs</text>
+<rect x="292.00" y="492.00" width="320.00" height="14.00" rx="7.00" ry="7.00" fill="#111827"/>
+<rect x="292.00" y="492.00" width="270.18" height="14.00" rx="7.00" ry="7.00" fill="#475569"/>
+<text x="624.00" y="504.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="800">0.844</text>
+<text x="684.00" y="504.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.913</text>
+<text x="796.00" y="504.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.494</text>
+<text x="908.00" y="504.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.761</text>
+<text x="1012.00" y="504.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">0.055s/doc</text>
+<rect x="42.00" y="526.00" width="1196.00" height="46.00" rx="14.00" ry="14.00" fill="#07111f"/>
+<text x="62.00" y="555.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="800">6</text>
+<text x="94.00" y="555.00" fill="#dbeafe" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="650">mineru</text>
+<text x="94.00" y="573.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10" font-weight="500">200 docs</text>
+<rect x="292.00" y="546.00" width="320.00" height="14.00" rx="7.00" ry="7.00" fill="#111827"/>
+<rect x="292.00" y="546.00" width="265.96" height="14.00" rx="7.00" ry="7.00" fill="#475569"/>
+<text x="624.00" y="558.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="800">0.831</text>
+<text x="684.00" y="558.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.857</text>
+<text x="796.00" y="558.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.873</text>
+<text x="908.00" y="558.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.743</text>
+<text x="1012.00" y="558.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">5.962s/doc</text>
+<rect x="42.00" y="580.00" width="1196.00" height="46.00" rx="14.00" ry="14.00" fill="#07111f"/>
+<text x="62.00" y="609.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="800">7</text>
+<text x="94.00" y="609.00" fill="#dbeafe" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="650">pymupdf4llm</text>
+<text x="94.00" y="627.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10" font-weight="500">200 docs</text>
+<rect x="292.00" y="600.00" width="320.00" height="14.00" rx="7.00" ry="7.00" fill="#111827"/>
+<rect x="292.00" y="600.00" width="234.12" height="14.00" rx="7.00" ry="7.00" fill="#475569"/>
+<text x="624.00" y="612.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="800">0.732</text>
+<text x="684.00" y="612.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.885</text>
+<text x="796.00" y="612.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.401</text>
+<text x="908.00" y="612.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.412</text>
+<text x="1012.00" y="612.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">0.091s/doc</text>
+<rect x="42.00" y="634.00" width="1196.00" height="46.00" rx="14.00" ry="14.00" fill="#07111f"/>
+<text x="62.00" y="663.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="800">8</text>
+<text x="94.00" y="663.00" fill="#dbeafe" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="650">markitdown</text>
+<text x="94.00" y="681.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10" font-weight="500">200 docs</text>
+<rect x="292.00" y="654.00" width="320.00" height="14.00" rx="7.00" ry="7.00" fill="#111827"/>
+<rect x="292.00" y="654.00" width="186.63" height="14.00" rx="7.00" ry="7.00" fill="#475569"/>
+<text x="624.00" y="666.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="800">0.583</text>
+<text x="684.00" y="666.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.879</text>
+<text x="796.00" y="666.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.000</text>
+<text x="908.00" y="666.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="600">0.000</text>
+<text x="1012.00" y="666.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">0.041s/doc</text>
+<text x="42.00" y="780.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="500">Data source: tmp/opendataloader-bench/prediction/*/evaluation.json. Excludes partial 2-document online_mm_eval.</text>
+</svg>

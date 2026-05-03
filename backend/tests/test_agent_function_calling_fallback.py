@@ -415,6 +415,202 @@ class _DateTimeOnlyTools:
         return ToolResult(success=True, output="2014 距今约 12 年。")
 
 
+class _DocxFakeClaimThenToolFCLLM:
+    provider = "test"
+    config = {"model": "test-model"}
+
+    def __init__(self):
+        self.calls = 0
+
+    def supports_function_calling(self):
+        return True
+
+    async def chat_with_tools(self, messages=None, *args, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "content": (
+                    "## ✅ 已重新生成 DOCX\n\n"
+                    "我再次调用 `docx_generate_with_claude` 工具并生成成功。\n\n"
+                    "| Docx ID | `docx-20260425150627-fake` |\n"
+                    "| DOCX 路径 | `generated_document.docx` |\n"
+                ),
+                "reasoning": "误把历史产物当作本轮结果",
+                "tool_calls": [],
+            }
+        if self.calls == 2:
+            assert any("缺失工具证据" in str(item.get("content") or "") for item in list(messages or []))
+            return {
+                "content": "",
+                "reasoning": "需要真实调用 DOCX 工具",
+                "tool_calls": [
+                    {
+                        "id": "call_docx_1",
+                        "type": "function",
+                        "name": "docx_generate_with_claude",
+                        "arguments": "{\"artifact_id\":\"docart-1\",\"template_id\":\"template-1\"}",
+                    }
+                ],
+            }
+        return {
+            "content": (
+                "## ✅ 已生成 DOCX\n\n"
+                "本轮 `docx_generate_with_claude` 已成功返回。\n\n"
+                "| Docx ID | `docx-202604260001-real` |\n"
+                "| DOCX 路径 | `/app/uploads/docx/docx-202604260001-real/generated_document.docx` |\n"
+            ),
+            "reasoning": "已有真实工具 observation",
+            "tool_calls": [],
+        }
+
+    async def chat(self, *args, **kwargs):
+        return {"content": "<answer>fallback</answer>"}
+
+
+class _DocxRuntimeTools:
+    def __init__(self):
+        self.calls = []
+
+    def get_tools_description(self, **kwargs):
+        return "- docx_generate_with_claude: 生成 DOCX"
+
+    def list_tools(self, **kwargs):
+        names = set(kwargs.get("include_tool_names") or {"docx_generate_with_claude"})
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": name,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "artifact_id": {"type": "string"},
+                            "template_id": {"type": "string"},
+                        },
+                    },
+                },
+            }
+            for name in sorted(names)
+            if name == "docx_generate_with_claude"
+        ]
+
+    async def execute(self, tool_name: str, **kwargs):
+        assert tool_name == "docx_generate_with_claude"
+        self.calls.append((tool_name, dict(kwargs)))
+        return ToolResult(
+            success=True,
+            output=(
+                "DOCX 生成完成: docx_id=docx-202604260001-real; "
+                "docx_path=/app/uploads/docx/docx-202604260001-real/generated_document.docx"
+            ),
+            data={
+                "docx_id": "docx-202604260001-real",
+                "docx_path": "/app/uploads/docx/docx-202604260001-real/generated_document.docx",
+            },
+        )
+
+
+class _ArtifactUpdateFailureThenRetryFCLLM:
+    provider = "test"
+    config = {"model": "test-model"}
+
+    def __init__(self):
+        self.calls = 0
+
+    def supports_function_calling(self):
+        return True
+
+    async def chat_with_tools(self, messages=None, *args, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "content": "",
+                "reasoning": "先尝试写入 artifact",
+                "tool_calls": [
+                    {
+                        "id": "call_update_bad",
+                        "type": "function",
+                        "name": "document_artifact_update_block",
+                        "arguments": "{}",
+                    }
+                ],
+            }
+        if self.calls == 2:
+            return {
+                "content": "我已经准备好要写入的 JSON，但还没有真正写入。",
+                "reasoning": "错误地准备直接回答",
+                "tool_calls": [],
+            }
+        if self.calls == 3:
+            assert any("刚刚失败" in str(item.get("content") or "") for item in list(messages or []))
+            return {
+                "content": "",
+                "reasoning": "需要重新调用 update 工具",
+                "tool_calls": [
+                    {
+                        "id": "call_update_good",
+                        "type": "function",
+                        "name": "document_artifact_update_block",
+                        "arguments": "{\"block_id\":\"lit-review-intro\",\"markdown\":\"## 背景介绍\\n\\n扩写内容\",\"status\":\"draft\"}",
+                    }
+                ],
+            }
+        return {
+            "content": "已成功写入 `lit-review-intro`。",
+            "reasoning": "已有成功工具 observation",
+            "tool_calls": [],
+        }
+
+    async def chat(self, *args, **kwargs):
+        return {"content": "<answer>fallback</answer>"}
+
+
+class _ArtifactUpdateTools:
+    def __init__(self):
+        self.calls = []
+
+    def get_tools_description(self, **kwargs):
+        return "- document_artifact_update_block: 更新 artifact block"
+
+    def list_tools(self, **kwargs):
+        names = set(kwargs.get("include_tool_names") or {"document_artifact_update_block"})
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": name,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "block_id": {"type": "string"},
+                            "markdown": {"type": "string"},
+                            "status": {"type": "string"},
+                        },
+                    },
+                },
+            }
+            for name in sorted(names)
+            if name == "document_artifact_update_block"
+        ]
+
+    async def execute(self, tool_name: str, **kwargs):
+        assert tool_name == "document_artifact_update_block"
+        self.calls.append(dict(kwargs))
+        if not kwargs.get("block_id") or not kwargs.get("markdown"):
+            return ToolResult(
+                success=False,
+                output="工具参数校验失败，请检查输入格式。 block_id: Field required；markdown: Field required",
+                error="validation_error",
+            )
+        return ToolResult(
+            success=True,
+            output="已更新文档 artifact block。",
+            data={"block_id": kwargs["block_id"]},
+        )
+
+
 class _RepeatedFailureLLM:
     provider = "test"
     config = {"model": "test-model"}
@@ -607,6 +803,67 @@ async def test_function_calling_tool_plan_keeps_original_reasoning_text_in_proce
     assert "让我先给出关键里程碑" in str(thought_events[0]["data"])
     assert "2014年：注意力机制进入机器翻译" in str(thought_events[0]["data"])
     assert "2014" in str(answer_event["data"])
+
+
+@pytest.mark.asyncio
+async def test_docx_completion_claim_requires_real_docx_tool_call():
+    llm = _DocxFakeClaimThenToolFCLLM()
+    tools = _DocxRuntimeTools()
+    agent = ReActAgent(llm, tools, max_iterations=4)
+
+    events = []
+    async for event in agent.run([{"role": "user", "content": "再次让它重新生成"}], stream=False):
+        events.append(event)
+
+    thought_text = "\n".join(str(event.get("data") or "") for event in events if event.get("type") == "thought")
+    action_events = [event for event in events if event.get("type") == "action"]
+    done_event = next(event for event in events if event.get("type") == "done")
+    answer = str(done_event["data"]["answer"])
+
+    assert "缺少真实工具证据" in thought_text
+    assert len(tools.calls) == 1
+    assert action_events and action_events[0]["data"]["tool"] == "docx_generate_with_claude"
+    assert "docx-202604260001-real" in answer
+    assert "docx-20260425150627-fake" not in answer
+
+
+def test_docx_completion_guard_allows_negative_status_statement():
+    agent = ReActAgent(_DirectAnswerFCLLM(), _NoopTools(), max_iterations=1)
+    context = AgentContext(messages=[{"role": "user", "content": "生成 docx 了吗"}])
+
+    missing = agent._missing_required_docx_runtime_tool_calls(
+        context,
+        "本轮没有生成成功的 DOCX 文件，无法确认输出路径。",
+    )
+
+    assert missing == []
+
+
+@pytest.mark.asyncio
+async def test_artifact_update_failure_blocks_final_answer_until_retry_succeeds():
+    llm = _ArtifactUpdateFailureThenRetryFCLLM()
+    tools = _ArtifactUpdateTools()
+    agent = ReActAgent(llm, tools, max_iterations=5)
+
+    events = []
+    async for event in agent.run([{"role": "user", "content": "把 artifact 这一段扩写"}], stream=False):
+        events.append(event)
+
+    thought_text = "\n".join(str(event.get("data") or "") for event in events if event.get("type") == "thought")
+    action_events = [event for event in events if event.get("type") == "action"]
+    done_event = next(event for event in events if event.get("type") == "done")
+
+    assert "文档 artifact 写入失败" in thought_text
+    assert len(tools.calls) == 2
+    assert tools.calls[0] == {}
+    assert tools.calls[1]["block_id"] == "lit-review-intro"
+    assert "扩写内容" in tools.calls[1]["markdown"]
+    assert [event["data"]["tool"] for event in action_events] == [
+        "document_artifact_update_block",
+        "document_artifact_update_block",
+    ]
+    assert "已成功写入" in str(done_event["data"]["answer"])
+    assert "还没有真正写入" not in str(done_event["data"]["answer"])
 
 
 @pytest.mark.asyncio

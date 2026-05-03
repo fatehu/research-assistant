@@ -13011,15 +13011,23 @@ class LiteratureReaderComposeService:
                     normalized["bbox_hint"] = None
             return [normalized]
 
+        paper_title = str(getattr(paper, "title", "") or "Untitled Paper")
+        paper_venue = str(getattr(paper, "venue", "") or "")
+        paper_year = getattr(paper, "year", None)
+        raw_authors = list(getattr(paper, "authors", None) or [])
+        author_names = [
+            str(item.get("name") or "") if isinstance(item, Mapping) else str(item or "")
+            for item in raw_authors[:10]
+        ]
         components.append(
             {
                 "id": next_id("header"),
                 "type": "PaperHeaderCard",
                 "props": {
-                    "title": str(paper.title or "Untitled Paper"),
-                    "venue": str(paper.venue or ""),
-                    "year": int(paper.year) if paper.year else None,
-                    "authors": [str(item.get("name") or "") for item in list(paper.authors or [])[:10]],
+                    "title": paper_title,
+                    "venue": paper_venue,
+                    "year": int(paper_year) if paper_year else None,
+                    "authors": author_names,
                 },
                 "children": [],
                 "source_anchor_refs": [],
@@ -13032,16 +13040,19 @@ class LiteratureReaderComposeService:
         )
 
         metadata_items: List[Dict[str, Any]] = []
-        if paper.doi:
-            metadata_items.append({"label": "DOI", "value": str(paper.doi)})
-        if paper.venue:
-            metadata_items.append({"label": "Venue", "value": str(paper.venue)})
-        if paper.year:
-            metadata_items.append({"label": "Year", "value": str(paper.year)})
-        if paper.pdf_url:
-            metadata_items.append({"label": "PDF", "value": str(paper.pdf_url)})
-        if paper.url:
-            metadata_items.append({"label": "Paper", "value": str(paper.url)})
+        paper_doi = str(getattr(paper, "doi", "") or "")
+        paper_pdf_url = str(getattr(paper, "pdf_url", "") or "")
+        paper_url = str(getattr(paper, "url", "") or "")
+        if paper_doi:
+            metadata_items.append({"label": "DOI", "value": paper_doi})
+        if paper_venue:
+            metadata_items.append({"label": "Venue", "value": paper_venue})
+        if paper_year:
+            metadata_items.append({"label": "Year", "value": str(paper_year)})
+        if paper_pdf_url:
+            metadata_items.append({"label": "PDF", "value": paper_pdf_url})
+        if paper_url:
+            metadata_items.append({"label": "Paper", "value": paper_url})
 
         components.append(
             {

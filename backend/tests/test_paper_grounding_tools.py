@@ -772,6 +772,84 @@ async def test_docx_generate_tool_applies_docx_template_constraints(tmp_path, mo
 
 
 @pytest.mark.asyncio
+async def test_docx_generate_tool_materializes_source_md_from_artifact(tmp_path, monkeypatch):
+    monkeypatch.setenv("UPLOAD_DIR", str(tmp_path))
+    tool = agent_tools.DocxGenerateWithClaudeTool()
+    artifact = {
+        "artifact_id": "docart-1",
+        "template_id": "",
+        "title": "项目申请书",
+        "global_constraints": "整体约束",
+        "blocks": [
+            {
+                "block_id": "intro",
+                "title": "立项依据",
+                "heading_path": ["正文", "立项依据"],
+                "target_words": 800,
+                "block_constraints": "说明研究背景",
+                "markdown": "这是立项依据正文。",
+                "status": "draft",
+            },
+            {
+                "block_id": "innovation",
+                "title": "特色与创新点",
+                "markdown": "这是创新点正文。",
+                "status": "draft",
+            },
+        ],
+    }
+
+    class _FakeDocxRuntimeWorkerClient:
+        @staticmethod
+        def enabled():
+            return True
+
+        async def claude(self, *, docx_id: str, workspace_dir, prompt: str, continue_session: bool):
+            source_md = workspace_dir / "source.md"
+            assert source_md.is_file()
+            source_text = source_md.read_text(encoding="utf-8")
+            assert "# 项目申请书" in source_text
+            assert "## 立项依据" in source_text
+            assert "<!-- block_id: intro -->" in source_text
+            assert "这是创新点正文。" in source_text
+            assert "由 artifact.blocks 按顺序展开的纯 Markdown 草稿" in prompt
+            manifest = json.loads((workspace_dir / "docx_inputs_manifest.json").read_text(encoding="utf-8"))
+            assert manifest["artifact_path"] == str(workspace_dir / "artifact.json")
+            assert manifest["source_path"] == str(source_md)
+            (workspace_dir / "generated_document.docx").write_bytes(b"fake-docx")
+            return {
+                "docx_id": docx_id,
+                "workspace_dir": str(workspace_dir),
+                "prompt": prompt,
+                "continue_session": continue_session,
+                "session_id": "docx-session-id",
+                "assistant_text": "created",
+                "result_text": "All validations PASSED!",
+                "is_error": False,
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "error": None,
+                "worker": "runtime-worker",
+            }
+
+    monkeypatch.setattr(
+        "app.services.docx_runtime_service.DocxRuntimeWorkerClient",
+        _FakeDocxRuntimeWorkerClient,
+    )
+
+    result = await tool._execute(
+        docx_id="artifact doc",
+        artifact_json=artifact,
+        requirements="按模板生成正式文档。",
+    )
+
+    workspace_dir = tmp_path / "docx" / "artifact-doc"
+    assert result.success is True
+    assert result.data["source_path"] == str(workspace_dir / "source.md")
+
+
+@pytest.mark.asyncio
 async def test_docx_refine_tool_modifies_existing_workspace_docx(tmp_path, monkeypatch):
     monkeypatch.setenv("UPLOAD_DIR", str(tmp_path))
     workspace_dir = tmp_path / "docx" / "doc-1"

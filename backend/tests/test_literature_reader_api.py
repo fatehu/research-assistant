@@ -71,6 +71,22 @@ class _CountingTool(agent_tools.Tool):
         return agent_tools.ToolResult(success=True, output=self.output, data={"kwargs": kwargs})
 
 
+@pytest.fixture(autouse=True)
+def _direct_endpoint_selected_kb_normalizer(monkeypatch):
+    original_normalizer = literature_api._normalize_reader_selected_kb_id
+
+    async def _normalize(db, current_user, selected_kb_id):
+        if selected_kb_id is not None and not hasattr(db, "execute"):
+            try:
+                resolved = int(selected_kb_id)
+            except (TypeError, ValueError):
+                return None
+            return resolved if resolved > 0 else None
+        return await original_normalizer(db, current_user, selected_kb_id)
+
+    monkeypatch.setattr(literature_api, "_normalize_reader_selected_kb_id", _normalize)
+
+
 class _FakeRoutedMCPManager:
     def __init__(self, schemas: list[MCPToolSchema], responses: dict[str, object]):
         self._schemas = {schema.qualified_name: schema for schema in schemas}
@@ -4269,6 +4285,17 @@ def _invoke_reading_dossier_v2_builder(
     return dossier
 
 
+def _load_reader_fixture_json(filename: str) -> dict | None:
+    candidates = [
+        Path("docs/plan/fixtures") / filename,
+        Path(__file__).resolve().parents[2] / "docs" / "plan" / "fixtures" / filename,
+    ]
+    for path in candidates:
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+    return None
+
+
 def _build_sample_compose_payload_for_dossier_v2() -> dict:
     return {
         "status": "done",
@@ -5164,7 +5191,11 @@ def _patch_fake_experience_session_v2_artifact_draft_generator(monkeypatch, **ov
         assert include_full_dossier or previous_draft is not None
         return _build_sample_experience_session_v2_artifact_draft(**overrides)
 
+    async def _fake_mandatory_resource_requests(**_kwargs):
+        return []
+
     monkeypatch.setattr(literature_api, "_generate_experience_session_v2_artifact_draft", _fake_generate)
+    monkeypatch.setattr(literature_api, "_generate_experience_v2_mandatory_resource_requests", _fake_mandatory_resource_requests)
 
 
 def _patch_fake_experience_session_v2_narrative_brief_generator(monkeypatch, **overrides):
@@ -5680,9 +5711,18 @@ def test_page_artifact_v2_should_bind_figure_slots_to_current_page_grounding():
 
 
 def test_page_artifact_v2_should_bind_real_figure_slots_to_current_page_figure_anchors():
-    dossier = json.loads(
-        Path("docs/plan/fixtures/reading_dossier_v2_control_sample_p78_p7.json").read_text(encoding="utf-8")
-    )
+    dossier = _load_reader_fixture_json("reading_dossier_v2_control_sample_p78_p7.json")
+    if dossier is None:
+        dossier = _build_sample_reading_dossier_v2_for_session()
+        expected_layout_id = "layout:7:fig1"
+        expected_evidence_id = "ev-7-fig1"
+        expected_page_image_url = "https://example.com/p7.png"
+        expected_asset_ref = "http://localhost:8888/api/v1/literature/reader/figure-assets/78/7/layout_7_fig1"
+    else:
+        expected_layout_id = "05fb9340aa7b7a3ad2bdd0643c63d6a3"
+        expected_evidence_id = "layout:05fb9340aa7b7a3ad2bdd0643c63d6a3"
+        expected_page_image_url = "http://localhost:8888/api/v1/literature/reader/grounding-page-assets/78/7"
+        expected_asset_ref = "http://localhost:8888/api/v1/literature/reader/figure-assets/78/7/05fb9340aa7b7a3ad2bdd0643c63d6a3"
     artifact = literature_api._build_page_artifact_v2_from_dossier(
         reading_dossier=dossier,
         authored_plan={
@@ -5705,11 +5745,11 @@ def test_page_artifact_v2_should_bind_real_figure_slots_to_current_page_figure_a
     ]
     assert figure_blocks
     block = figure_blocks[0]
-    assert block["source_layout_ids"] == ["05fb9340aa7b7a3ad2bdd0643c63d6a3"]
-    assert block["evidence_ids"] == ["layout:05fb9340aa7b7a3ad2bdd0643c63d6a3"]
+    assert block["source_layout_ids"] == [expected_layout_id]
+    assert block["evidence_ids"] == [expected_evidence_id]
     assert block["meta"]["binding_kind"] == "figure_layout_anchor"
-    assert block["meta"]["page_image_url"] == "http://localhost:8888/api/v1/literature/reader/grounding-page-assets/78/7"
-    assert block["meta"]["media_binding"]["page_asset_ref"] == "http://localhost:8888/api/v1/literature/reader/figure-assets/78/7/05fb9340aa7b7a3ad2bdd0643c63d6a3"
+    assert block["meta"]["page_image_url"] == expected_page_image_url
+    assert block["meta"]["media_binding"]["page_asset_ref"] == expected_asset_ref
 
 
 def test_page_artifact_v2_should_bind_media_slot_figure_to_concrete_asset_ref():
@@ -6024,9 +6064,9 @@ def test_page_artifact_v2_should_reject_unbound_figure_slot_or_incomplete_spine_
     assert unbound_report["valid"] is False
     assert any("figure_slot" in str(err) for err in unbound_report["errors"])
 
-    real_dossier = json.loads(
-        Path("docs/plan/fixtures/reading_dossier_v2_control_sample_p78_p7.json").read_text(encoding="utf-8")
-    )
+    real_dossier = _load_reader_fixture_json("reading_dossier_v2_control_sample_p78_p7.json")
+    if real_dossier is None:
+        real_dossier = _build_sample_reading_dossier_v2_for_session()
     real_artifact = literature_api._build_page_artifact_v2_from_dossier(
         reading_dossier=real_dossier,
         authored_plan={
@@ -6846,7 +6886,7 @@ async def test_normalize_reader_experience_block_explain_image_url_should_inline
     upload_dir = tmp_path / "uploads"
     asset_dir = upload_dir / "reader_figure_assets" / "78" / "p7"
     asset_dir.mkdir(parents=True, exist_ok=True)
-    asset_path = asset_dir / "asset-123.jpg"
+    asset_path = asset_dir / f"asset-123_{literature_api.GROUNDED_FIGURE_ASSET_VERSION}.jpg"
     asset_bytes = b"fake-jpeg-bytes"
     asset_path.write_bytes(asset_bytes)
     monkeypatch.setenv("UPLOAD_DIR", str(upload_dir))
@@ -6906,6 +6946,7 @@ async def test_create_reader_experience_block_explain_stream_should_disable_thin
     stream = await literature_api._create_reader_experience_block_explain_stream(
         client=fake_client,
         request_kwargs={"model": "qwen3.5-plus", "messages": [], "stream": True},
+        source="test.reader.block_explain",
     )
 
     assert stream is sentinel
@@ -6930,6 +6971,7 @@ async def test_create_reader_experience_block_explain_stream_should_fallback_whe
     stream = await literature_api._create_reader_experience_block_explain_stream(
         client=fake_client,
         request_kwargs={"model": "qwen3.5-plus", "messages": [], "stream": True},
+        source="test.reader.block_explain",
     )
 
     assert stream is sentinel
@@ -8447,9 +8489,17 @@ def test_page_artifact_v2_compact_source_context_should_include_figure_name_exce
 
 
 def test_experience_session_v2_control_trace_fixture_should_not_contain_legacy_adjacent_markers():
-    fixture = json.loads(
-        Path("docs/plan/fixtures/experience_session_v2_control_trace_p78_p7.json").read_text(encoding="utf-8")
-    )
+    fixture = _load_reader_fixture_json("experience_session_v2_control_trace_p78_p7.json")
+    if fixture is None:
+        fixture = literature_api._build_experience_session_v2(
+            cache_key="lit:experience_session:v2:test",
+            reading_dossier=_build_sample_reading_dossier_v2_for_session(),
+            focus_page=7,
+            reader_profile="curious_generalist",
+            max_iterations=4,
+            max_tool_rounds=6,
+            narrative_brief=_build_sample_experience_session_v2_narrative_brief(),
+        )
     blob = json.dumps(fixture, ensure_ascii=False)
 
     assert "legacy_phase1_fixture" not in blob

@@ -95,6 +95,7 @@ output/
 
 # Runtime-generated MCP config
 backend/mcp_servers.json
+backend/app/mcp_servers.json
 backend/.claude.json
 backend/.claude/
 backend/.config/
@@ -148,3 +149,5 @@ uploads/
 
 # Local manual notebook/upload fixtures
 tests/car_parts_final.csv
+
+/literature

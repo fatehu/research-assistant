@@ -4117,6 +4117,7 @@ class DocxGenerateWithClaudeTool(ToolBase):
                 "任务：",
                 "1. 先读取小清单 docx_inputs_manifest.json，按里面的路径处理 artifact、source、requirements 和模板文件。",
                 "2. artifact_path 是结构化章节、block 顺序和正文内容的权威来源；source_path 只在清单提供时作为 Markdown 原文参考。",
+                "   如果 source_path 指向 source.md，它是由 artifact.blocks 按顺序展开的纯 Markdown 草稿，便于整体阅读；仍以 artifact_path 的 block 结构和约束为准。",
                 "3. 如有模板文件，优先参考原始 template_file_paths 中的样例、指南、图片或规范文件。",
                 "4. 优先使用官方 document-skills/docx 工作流和校验脚本；不要只生成一个能打开的空壳文件。",
                 f"5. DOCX 输出到：{docx_path}",
@@ -4226,10 +4227,11 @@ class DocxGenerateWithClaudeTool(ToolBase):
                     output="source_path 不存在，或不在上传目录内。",
                     error="invalid_source_path",
                     data={"docx_id": docx_id, "source_path": source_path, "workspace_dir": str(workspace_dir)},
-                )
+            )
             source_file = resolved_source
         elif artifact_payload:
-            source_file = None
+            source_file = workspace_dir / "source.md"
+            source_file.write_text(self._artifact_to_markdown(artifact_payload), encoding="utf-8")
         else:
             return ToolResult(
                 success=False,
@@ -9035,16 +9037,31 @@ class DocumentArtifactReadInput(BaseModel):
     block_ids: List[str] = Field(
         default_factory=list,
         max_length=50,
-        description="可选：只读取指定 block_id；为空则读取全部 block。",
+        description="可选：只读取指定 block_id；为空时默认只列出 block 信息，不返回 Markdown 全文。",
     )
     include_constraints: bool = Field(default=True, description="是否包含整体和分块写作约束。")
-    include_markdown: bool = Field(default=True, description="是否包含 block 当前 Markdown 内容。")
+    include_markdown: bool = Field(default=False, description="是否包含 block 当前 Markdown 内容；只有传入 block_ids 时才会返回 Markdown。")
 
 
 class DocumentArtifactUpdateBlockInput(BaseModel):
     block_id: str = Field(..., min_length=1, max_length=120, description="要更新的 block_id。")
     markdown: str = Field(..., max_length=300000, description="写入该 block 的完整 Markdown 内容。")
     status: Optional[str] = Field(default="draft", max_length=40, description="可选状态，例如 draft/final。")
+
+
+class DocumentArtifactBlockUpdateItem(BaseModel):
+    block_id: str = Field(..., min_length=1, max_length=120, description="要更新的 block_id。")
+    markdown: str = Field(..., max_length=300000, description="写入该 block 的完整 Markdown 内容。")
+    status: Optional[str] = Field(default="draft", max_length=40, description="可选状态，例如 draft/final。")
+
+
+class DocumentArtifactUpdateBlocksInput(BaseModel):
+    updates: List[DocumentArtifactBlockUpdateItem] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="批量更新列表；每项包含 block_id、完整 markdown 和可选 status。",
+    )
 
 
 class ActivateSkillTool(ToolBase):
@@ -9150,6 +9167,9 @@ class DocumentArtifactReadTool(ToolBase):
     name = "document_artifact_read"
     description = (
         "读取当前会话绑定的文档 artifact。用于按模板填写内容、修改某些章节前，查看整体约束、block 列表和现有 Markdown。"
+        "优先按 block_ids 精确读取；不要默认空 block_ids 全量读取。"
+        "默认是列表模式：空 block_ids 只返回 block_id、标题、heading_path、约束等列表信息，不返回 Markdown。"
+        "如果不知道 block_id，直接调用本工具列出 block 信息，再按需要的 block_id 二次读取。"
         "返回中包含 artifact_path；如果只是要交给 docx_generate_with_claude 生成 DOCX，优先传 artifact_id/template_id，"
         "不要为了 DOCX 生成把 include_markdown=true 的全文读进上下文。"
     )
@@ -9159,7 +9179,7 @@ class DocumentArtifactReadTool(ToolBase):
             "block_ids": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "可选：只读取指定 block_id；为空读取全部 block。",
+                "description": "推荐填写：只读取指定 block_id。为空时默认列出所有 block 的标题/路径/约束，不返回 Markdown。",
                 "default": [],
             },
             "include_constraints": {
@@ -9169,8 +9189,8 @@ class DocumentArtifactReadTool(ToolBase):
             },
             "include_markdown": {
                 "type": "boolean",
-                "description": "是否返回当前 Markdown 内容。DOCX 生成场景不建议开启，避免把大 artifact 塞进上下文。",
-                "default": True,
+                "description": "是否返回当前 Markdown 内容。只有传入 block_ids 时才会返回 Markdown；未知 block_id 时保持 false 列 block 标题。",
+                "default": False,
             },
         },
         "required": [],
@@ -9204,10 +9224,14 @@ class DocumentArtifactReadTool(ToolBase):
         self,
         block_ids: Optional[List[str]] = None,
         include_constraints: bool = True,
-        include_markdown: bool = True,
+        include_markdown: bool = False,
     ) -> ToolResult:
         if self.conversation_id is None:
             return ToolResult(success=False, output="document_artifact_read 只能在绑定会话的 chat 回合中使用。", error="conversation_required")
+
+        normalized_block_ids = [str(item).strip() for item in list(block_ids or []) if str(item).strip()]
+        requested_markdown_without_ids = bool(include_markdown) and not normalized_block_ids
+        effective_include_markdown = bool(include_markdown) and bool(normalized_block_ids)
 
         async def handler(db: AsyncSession) -> ToolResult:
             from app.services.document_artifact_service import DocumentArtifactService
@@ -9217,12 +9241,24 @@ class DocumentArtifactReadTool(ToolBase):
                     db,
                     user_id=self.user_id,
                     conversation_id=int(self.conversation_id),
-                    block_ids=block_ids or [],
+                    block_ids=normalized_block_ids,
                     include_constraints=include_constraints,
-                    include_markdown=include_markdown,
+                    include_markdown=effective_include_markdown,
                 )
             except ValueError as exc:
                 return ToolResult(success=False, output=str(exc), error="document_artifact_unavailable")
+            if requested_markdown_without_ids:
+                payload["notice"] = (
+                    "空 block_ids 默认按列表模式返回，未返回 Markdown 全文。"
+                    "请从 blocks 中选择需要的 block_id 后，再用 include_markdown=true 精确读取。"
+                )
+                payload["list_mode"] = True
+            if len(normalized_block_ids) > 1 and effective_include_markdown:
+                payload["workflow_hint"] = (
+                    "本次已读取多个 block 的 Markdown。若接下来需要同时补写/扩写多个模块，"
+                    "请先形成多块写入计划，并优先调用 document_artifact_update_blocks 一次提交多个 block；"
+                    "不要把更新 JSON 或 Markdown 当普通回答输出。"
+                )
             return ToolResult(
                 success=True,
                 output=json.dumps(payload, ensure_ascii=False, indent=2),
@@ -9332,6 +9368,125 @@ class DocumentArtifactUpdateBlockTool(ToolBase):
                     },
                     "block_id": block_id,
                     "block": updated_block,
+                    "updated_at": artifact.get("updated_at"),
+                },
+            )
+
+        return await self._with_db(handler)
+
+
+class DocumentArtifactUpdateBlocksTool(ToolBase):
+    name = "document_artifact_update_blocks"
+    description = (
+        "批量更新当前会话文档 artifact 的多个 block。适合一次读取多个 block 后，按同一计划一次提交多块更新。"
+        "每个 update 都必须包含已有 block_id 和该 block 的完整 Markdown；后端会先校验全部 block，再一次性写入。"
+        "不要把准备写入的 JSON 或 Markdown 当作普通回答输出。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "updates": {
+                "type": "array",
+                "description": "批量更新列表。每项写一个 block；多块扩写/补全时优先使用本工具，避免连续单块写入时丢失流程。",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "block_id": {
+                            "type": "string",
+                            "description": "要更新的 block_id，必须来自当前 artifact。",
+                        },
+                        "markdown": {
+                            "type": "string",
+                            "description": "该 block 的完整 Markdown 内容，不是 diff。",
+                        },
+                        "status": {
+                            "type": "string",
+                            "description": "可选状态，例如 draft/final。",
+                            "default": "draft",
+                        },
+                    },
+                    "required": ["block_id", "markdown"],
+                },
+                "minItems": 1,
+                "maxItems": 20,
+            }
+        },
+        "required": ["updates"],
+    }
+    input_model = DocumentArtifactUpdateBlocksInput
+    retry_count = 0
+    output_max_tokens = 1600
+
+    def __init__(
+        self,
+        db: Optional[AsyncSession],
+        user_id: int,
+        *,
+        conversation_id: Optional[int],
+        db_session_factory: Optional[Callable[[], AsyncSession]] = None,
+    ):
+        self.db = db
+        self.user_id = int(user_id)
+        self.conversation_id = int(conversation_id) if conversation_id is not None else None
+        self.db_session_factory = db_session_factory
+
+    async def _with_db(self, handler: Callable[[AsyncSession], Any]) -> ToolResult:
+        if self.db is not None:
+            return await handler(self.db)
+        if self.db_session_factory is None:
+            return ToolResult(success=False, output="document artifact 工具不可用：数据库会话未初始化。", error="db_unavailable")
+        async with self.db_session_factory() as session:
+            return await handler(session)
+
+    async def _execute(self, updates: List[Dict[str, Any]]) -> ToolResult:
+        if self.conversation_id is None:
+            return ToolResult(success=False, output="document_artifact_update_blocks 只能在绑定会话的 chat 回合中使用。", error="conversation_required")
+
+        normalized_updates = [dict(item or {}) for item in list(updates or [])]
+
+        async def handler(db: AsyncSession) -> ToolResult:
+            from app.services.document_artifact_service import DocumentArtifactService
+
+            try:
+                result = await DocumentArtifactService().update_blocks(
+                    db,
+                    user_id=self.user_id,
+                    conversation_id=int(self.conversation_id),
+                    updates=normalized_updates,
+                )
+            except ValueError as exc:
+                return ToolResult(success=False, output=str(exc), error="document_artifact_update_failed")
+
+            artifact = dict(result.get("artifact") or {})
+            updated_blocks = [dict(item) for item in list(result.get("updated_blocks") or []) if isinstance(item, dict)]
+            block_ids = [str(block.get("block_id") or "") for block in updated_blocks if str(block.get("block_id") or "")]
+            block_lines = [
+                f"- {block.get('block_id')}: {len(str(block.get('markdown') or ''))} chars"
+                for block in updated_blocks
+            ]
+            output = "\n".join(
+                [
+                    "已批量更新文档 artifact blocks。",
+                    f"- artifact_id: {artifact.get('artifact_id')}",
+                    f"- updated_blocks: {len(updated_blocks)}",
+                    f"- updated_at: {artifact.get('updated_at')}",
+                    *block_lines,
+                ]
+            )
+            return ToolResult(
+                success=True,
+                output=output,
+                data={
+                    "artifact_id": artifact.get("artifact_id"),
+                    "artifact": {
+                        "artifact_id": artifact.get("artifact_id"),
+                        "template_id": artifact.get("template_id"),
+                        "title": artifact.get("title"),
+                        "block_count": len(list(artifact.get("blocks") or [])),
+                        "updated_at": artifact.get("updated_at"),
+                    },
+                    "block_ids": block_ids,
+                    "blocks": updated_blocks,
                     "updated_at": artifact.get("updated_at"),
                 },
             )
@@ -11309,6 +11464,12 @@ class DefaultToolProvider:
                             db_session_factory=ctx.db_session_factory,
                         ),
                         DocumentArtifactUpdateBlockTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            conversation_id=int(ctx.conversation_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        DocumentArtifactUpdateBlocksTool(
                             ctx.db,
                             int(ctx.user_id),
                             conversation_id=int(ctx.conversation_id),

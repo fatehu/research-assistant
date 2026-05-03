@@ -566,7 +566,7 @@ const MainLayout = () => {
     <Layout className="flex h-screen min-h-0 overflow-hidden bg-slate-950">
       {/* 侧边栏 */}
       <Sider
-        width={280}
+        width={300}
         collapsedWidth={72}
         collapsed={collapsed}
         className="main-layout__sider flex flex-col overflow-hidden bg-[#05070b]"
@@ -618,10 +618,10 @@ const MainLayout = () => {
         </div>
         
         {/* 可滚动区域 - 菜单 */}
-        <div 
-          className="main-layout__sider-scroll overflow-y-auto px-1" 
-          style={{ 
-            maxHeight: collapsed ? 'calc(100vh - 180px)' : 'calc(100vh - 400px)',
+        <div
+          className="main-layout__sider-scroll overflow-y-auto px-1"
+          style={{
+            maxHeight: collapsed ? 'calc(100vh - 180px)' : 'min(34vh, 320px)',
           }}
         >
           {/* 导航菜单 */}
@@ -874,7 +874,7 @@ const MainLayout = () => {
       {/* 主内容区 */}
       <Layout
         className="main-layout__content-shell flex min-h-0 flex-1 flex-col overflow-hidden bg-slate-950"
-        style={{ marginLeft: collapsed ? 72 : 280, transition: 'margin-left 0.2s' }}
+        style={{ marginLeft: collapsed ? 72 : 300, transition: 'margin-left 0.2s' }}
       >
         {/* 顶部栏 */}
         <Header className="flex h-14 shrink-0 items-center justify-between border-b border-white/[0.06] bg-[#0b1017]/80 px-6 backdrop-blur-xl" style={{ zIndex: 100 }}>

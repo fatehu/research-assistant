@@ -2458,6 +2458,25 @@ export default function PaperReaderPage() {
   const [collectionReadiness, setCollectionReadiness] = useState<CollectionKnowledgeReadiness | null>(null)
   const [collectionReadinessLoading, setCollectionReadinessLoading] = useState<boolean>(false)
   const [asking, setAsking] = useState<boolean>(false)
+  const askSessionOptions = useMemo(
+    () =>
+      askSessions.map((item) => {
+        const title = String(item.title || '未命名问题').trim()
+        const updatedAt = String(item.updated_at || '').replace('T', ' ').slice(0, 16)
+        return {
+          label: (
+            <div style={{ maxWidth: 680, whiteSpace: 'normal' }}>
+              <div style={{ fontWeight: 500, lineHeight: 1.4 }}>{title}</div>
+              <div style={{ color: '#64748b', fontSize: 12, marginTop: 2 }}>{updatedAt}</div>
+            </div>
+          ),
+          title: `${title}${updatedAt ? ` · ${updatedAt}` : ''}`,
+          searchText: `${title} ${updatedAt}`,
+          value: item.id,
+        }
+      }),
+    [askSessions],
+  )
 
   const [readPage, setReadPage] = useState<number>(1)
   const [zoomPercent, setZoomPercent] = useState<number>(120)
@@ -3163,17 +3182,26 @@ export default function PaperReaderPage() {
       paper_id?: number
       collection_id?: number
       limit: number
+      offset: number
     } = {
       scope: scopeValue,
-      limit: 50,
+      limit: 100,
+      offset: 0,
     }
     if (scopeValue === 'paper') {
       params.paper_id = parsedPaperId
     } else if (collectionId) {
       params.collection_id = collectionId
     }
-    const data = await literatureApi.getAskSessions(params)
-    setAskSessions(data)
+
+    const sessions: LiteratureAskSession[] = []
+    while (true) {
+      const page = await literatureApi.getAskSessions(params)
+      sessions.push(...page)
+      if (page.length < params.limit) break
+      params.offset += params.limit
+    }
+    setAskSessions(sessions)
   }
 
   const reloadAskMessages = async (sessionId: number | undefined) => {
@@ -6882,14 +6910,21 @@ export default function PaperReaderPage() {
                             placeholder="会话历史（仅自己可见）"
                             value={askSessionId}
                             allowClear
+                            showSearch
+                            optionLabelProp="title"
+                            popupMatchSelectWidth={false}
+                            listHeight={360}
+                            dropdownStyle={{ maxWidth: 720, minWidth: 520 }}
+                            filterOption={(input, option) =>
+                              String(option?.searchText || '')
+                                .toLowerCase()
+                                .includes(input.trim().toLowerCase())
+                            }
                             onChange={(v) => {
                               const next = Number(v || 0)
                               setAskSessionId(next > 0 ? next : undefined)
                             }}
-                            options={askSessions.map((item) => ({
-                              label: `${item.title || '未命名问题'} · ${String(item.updated_at || '').replace('T', ' ').slice(0, 16)}`,
-                              value: item.id,
-                            }))}
+                            options={askSessionOptions}
                           />
                           <TextArea
                             rows={3}

@@ -8,6 +8,66 @@ from typing import Any, Dict, List
 def get_mcp_server_templates() -> List[Dict[str, Any]]:
     return [
         {
+            "id": "research_assistant_used_stack",
+            "title": "Research Assistant 总模板",
+            "description": "当前科研系统常用 MCP 组合：Tavily、Firecrawl、内部 Web、内部文献服务，并保留本地 stdio 工具的关闭项。",
+            "claude_desktop_config": {
+                "mcpServers": {
+                    "tavily": {
+                        "enabled": True,
+                        "type": "http",
+                        "transport": "streamable_http",
+                        "url": "https://mcp.tavily.com/mcp/?tavilyApiKey=${MCP_TAVILY_API_KEY}",
+                    },
+                    "firecrawl": {
+                        "enabled": True,
+                        "type": "http",
+                        "transport": "streamable_http",
+                        "url": "https://mcp.firecrawl.dev/${MCP_FIRECRAWL_API_KEY}/v2/mcp",
+                    },
+                    "web_internal": {
+                        "enabled": True,
+                        "type": "http",
+                        "transport": "streamable_http",
+                        "url": "http://mcp_web:8091/mcp",
+                    },
+                    "literature_internal": {
+                        "enabled": True,
+                        "type": "http",
+                        "transport": "streamable_http",
+                        "url": "http://mcp_literature:8092/mcp",
+                    },
+                    "filesystem": {
+                        "enabled": False,
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/app"],
+                        "transport": "stdio",
+                    },
+                    "fetch": {
+                        "enabled": False,
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-fetch"],
+                        "transport": "stdio",
+                    },
+                    "sequential-thinking": {
+                        "enabled": False,
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+                        "transport": "stdio",
+                    },
+                }
+            },
+            "recommended_routes": {
+                "web_search": ["mcp.tavily.tavily_search", "mcp.web_internal.web_search"],
+                "web_scrape": [
+                    "mcp.firecrawl.firecrawl_scrape",
+                    "mcp.firecrawl.firecrawl_extract",
+                    "mcp.web_internal.web_scrape",
+                ],
+                "literature_search": ["mcp.literature_internal.literature_search"],
+            },
+        },
+        {
             "id": "filesystem",
             "title": "Filesystem (Official)",
             "description": "Local filesystem read/write tools via official MCP server.",

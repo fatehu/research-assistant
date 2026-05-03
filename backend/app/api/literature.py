@@ -9841,7 +9841,12 @@ class LiteratureAskAgentCore(AgentCore):
             followup = "请综合所有 observation 后继续。"
         return f"<observation>\n{output}\n</observation>\n\n{followup}"
 
-    def _build_system_prompt(self, messages: Optional[List[Dict[str, Any]]] = None) -> str:
+    def _build_system_prompt(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        *,
+        function_calling: bool = False,
+    ) -> str:
         user_text = self._latest_user_text(messages)
         include_names = {name for name in self.allowed_tool_names if self.tools.get(name)}
         try:

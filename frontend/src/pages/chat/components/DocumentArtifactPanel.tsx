@@ -882,7 +882,7 @@ const DocumentArtifactPanel = ({
                     <div className="truncate text-xs font-medium text-[#c9d8e8]">
                       {selectedBlockIds.length ? `发送将携带 ${selectedBlockIds.length} 个模块` : '未选择发送模块'}
                     </div>
-                    <div className="mt-0.5 text-[11px] text-[#6e8298]">AI 可通过 document_artifact_read/update_block 读写这些块。</div>
+                    <div className="mt-0.5 text-[11px] text-[#6e8298]">AI 可通过 document_artifact_read/update_block(s) 读写这些块。</div>
                   </div>
                   <button
                     type="button"

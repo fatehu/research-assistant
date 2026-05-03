@@ -253,6 +253,7 @@ class AgentCore:
     _PAPER_SKILL_NAME = "paper-reproduction"
     _PAPER_RESEARCH_TOOL_PREFIX = "paper_research_"
     _LITERATURE_REVIEW_SKILL_NAME = "literature-review"
+    _ARTIFACT_PARALLEL_WRITING_SKILL_NAME = "artifact-parallel-writing"
     _LITERATURE_REVIEW_TOOL_NAMES: set[str] = {
         "literature_review_start",
         "literature_review_download_pdf",
@@ -275,6 +276,28 @@ class AgentCore:
         "project_bash",
         "project_claude",
     }
+    _DOCX_RUNTIME_TOOL_NAMES: set[str] = {
+        "docx_generate_with_claude",
+        "docx_refine_with_claude",
+    }
+    _DOCUMENT_ARTIFACT_UPDATE_TOOL_NAMES: set[str] = {
+        "document_artifact_update_block",
+        "document_artifact_update_blocks",
+    }
+    _DOCX_COMPLETION_CLAIM_PATTERNS = (
+        r"(已|已经|再次|重新|本次|本轮|我已|我已经).{0,24}(生成|导出|创建|产出|保存|完成).{0,32}(docx|DOCX|Word|word|文档)",
+        r"(生成|导出|创建|产出|保存).{0,16}(成功|完成|PASS|pass|合格).{0,40}(docx|DOCX|Word|word|文档|generated_document\.docx)",
+        r"(最新生成结果|本次生成结果|重新生成结果|导出成功|生成成功).{0,120}(Docx ID|DOCX 路径|PDF 路径|generated_document\.docx|docx-\d{8})",
+        r"(Docx ID|DOCX 路径|PDF 路径).{0,120}(✅|成功|PASS|pass|generated_document\.docx)",
+    )
+    _DOCX_TOOL_CALL_CLAIM_PATTERNS = (
+        r"(已|已经|再次|重新|本次|本轮|我已|我已经).{0,32}(调用|使用|执行).{0,48}(docx_generate_with_claude|docx_refine_with_claude)",
+        r"(我|本轮|本次).{0,24}(调用|使用|执行).{0,48}(docx_generate_with_claude|docx_refine_with_claude)",
+    )
+    _DOCX_NEGATIVE_COMPLETION_PATTERNS = (
+        r"(没有|未|尚未|无法|不能|不确定).{0,24}(生成|导出|创建|产出|保存|完成|成功).{0,32}(docx|DOCX|Word|word|文档)",
+        r"(生成|导出|创建|产出|保存).{0,16}(失败|未成功|没有成功|不成功).{0,32}(docx|DOCX|Word|word|文档)?",
+    )
     _PAPER_SKILL_HIDDEN_TOOL_NAMES: set[str] = set(_PAPER_SKILL_SELF_WORK_TOOL_NAMES)
     _PAPER_PREPARE_MARKERS = (
         "paper_research_prepare",
@@ -927,6 +950,164 @@ class AgentCore:
             }
         )
         context.messages.append({"role": "user", "content": guard_message})
+        return events, False
+
+    @classmethod
+    def _answer_claims_docx_runtime_completion(cls, answer: str) -> bool:
+        text = str(answer or "")
+        if not text.strip():
+            return False
+        if any(re.search(pattern, text, re.IGNORECASE | re.DOTALL) for pattern in cls._DOCX_NEGATIVE_COMPLETION_PATTERNS):
+            return False
+        return any(re.search(pattern, text, re.IGNORECASE | re.DOTALL) for pattern in cls._DOCX_COMPLETION_CLAIM_PATTERNS)
+
+    @classmethod
+    def _answer_claims_docx_runtime_tool_call(cls, answer: str) -> bool:
+        text = str(answer or "")
+        if not text.strip():
+            return False
+        return any(re.search(pattern, text, re.IGNORECASE | re.DOTALL) for pattern in cls._DOCX_TOOL_CALL_CLAIM_PATTERNS)
+
+    def _missing_required_docx_runtime_tool_calls(self, context: AgentContext, answer: str) -> List[str]:
+        claims_completion = self._answer_claims_docx_runtime_completion(answer)
+        claims_tool_call = self._answer_claims_docx_runtime_tool_call(answer)
+        if not claims_completion and not claims_tool_call:
+            return []
+
+        attempted_tools = self._tool_action_names(context).intersection(self._DOCX_RUNTIME_TOOL_NAMES)
+        successful_tools = self._successful_tool_names(context).intersection(self._DOCX_RUNTIME_TOOL_NAMES)
+        missing: List[str] = []
+
+        if claims_completion and not successful_tools:
+            missing.append("successful docx_generate_with_claude/docx_refine_with_claude observation in this turn")
+        elif claims_tool_call and not attempted_tools:
+            missing.append("docx_generate_with_claude/docx_refine_with_claude action in this turn")
+
+        return missing
+
+    @staticmethod
+    def _build_docx_runtime_tool_guard_message(missing_tools: Sequence[str]) -> str:
+        missing = ", ".join(str(item) for item in missing_tools if str(item or "").strip())
+        if not missing:
+            missing = "required DOCX runtime tool call"
+        return (
+            "当前回答声称本轮已经调用 DOCX/Claude 工具或已经生成 DOCX 文件，"
+            "但本轮执行轨迹中没有对应的真实工具记录。\n"
+            f"缺失工具证据: {missing}\n"
+            "不能复述历史产物、不能编造 Docx ID、不能声称文件已经生成。"
+            "下一步必须调用 `docx_generate_with_claude` 或 `docx_refine_with_claude`。"
+            "如果缺少 artifact_id、template_id、docx_id 或路径，请明确说明缺什么；"
+            "如果工具失败，请基于真实 observation 报告失败原因。"
+        )
+
+    def _maybe_guard_docx_runtime_direct_answer(
+        self,
+        context: AgentContext,
+        answer: str,
+        *,
+        events: List[Dict[str, Any]],
+    ) -> Optional[tuple[List[Dict[str, Any]], bool]]:
+        missing_docx_tools = self._missing_required_docx_runtime_tool_calls(context, answer)
+        if not missing_docx_tools:
+            return None
+        retries = int((context.context_debug or {}).get("docx_runtime_tool_guard_retries") or 0)
+        context.context_debug = {
+            **dict(context.context_debug or {}),
+            "docx_runtime_tool_guard_retries": retries + 1,
+            "docx_runtime_tool_guard_missing": list(missing_docx_tools),
+        }
+        if retries >= 2:
+            safe_answer = (
+                "本轮没有真实完成 DOCX/Claude 工具调用，"
+                "因此不能确认 DOCX 文件已经生成或修改。"
+                "请重试生成，或先确认当前 artifact/template/docx_id 参数。"
+            )
+            context.final_answer = safe_answer
+            context.state = AgentState.DONE
+            events.append({"type": "answer", "data": safe_answer})
+            return events, True
+        guard_message = self._build_docx_runtime_tool_guard_message(missing_docx_tools)
+        events.append(
+            {
+                "type": "thought",
+                "data": "检测到 DOCX 生成声明缺少真实工具证据，已阻止直接回答并要求先调用 DOCX 工具。",
+            }
+        )
+        context.messages.append({"role": "user", "content": guard_message})
+        return events, False
+
+    def _pending_document_artifact_update_failure(self, context: AgentContext) -> Optional[AgentStep]:
+        pending_failure: Optional[AgentStep] = None
+        for step in list(context.steps or []):
+            if str(step.tool_name or "") not in self._DOCUMENT_ARTIFACT_UPDATE_TOOL_NAMES:
+                continue
+            if str(step.step_type or "") != "observation":
+                continue
+            if bool(step.success):
+                pending_failure = None
+            else:
+                pending_failure = step
+        return pending_failure
+
+    @staticmethod
+    def _build_document_artifact_update_retry_message(failure: AgentStep) -> str:
+        failure_text = re.sub(r"\s+", " ", str(failure.tool_output or failure.content or "")).strip()
+        if len(failure_text) > 600:
+            failure_text = f"{failure_text[:600]}..."
+        tool_name = str(failure.tool_name or "document_artifact_update_block").strip()
+        if tool_name == "document_artifact_update_blocks":
+            next_call = (
+                "下一步必须重新调用 `document_artifact_update_blocks`，参数必须包含 updates 数组；"
+                "每个元素都要包含 block_id 和 markdown，status 可选。"
+            )
+        else:
+            next_call = (
+                "下一步必须重新调用 `document_artifact_update_block`，参数必须包含：\n"
+                "- block_id: 要更新的 block_id\n"
+                "- markdown: 写入该 block 的完整 Markdown 内容\n"
+                "- status: 可选，通常为 draft"
+            )
+        return (
+            f"`{tool_name}` 刚刚失败，且本轮还没有后续成功写入。"
+            "不能把准备写入的 JSON 或 Markdown 当作普通回答输出。\n"
+            f"失败原因: {failure_text or 'unknown'}\n"
+            f"{next_call}\n"
+            "如果需要确认 block_id，先调用 `document_artifact_read` 的列表模式；"
+            "如果一次更新多个模块，优先使用 `document_artifact_update_blocks`。"
+        )
+
+    def _maybe_guard_document_artifact_update_failure_answer(
+        self,
+        context: AgentContext,
+        *,
+        events: List[Dict[str, Any]],
+    ) -> Optional[tuple[List[Dict[str, Any]], bool]]:
+        pending_failure = self._pending_document_artifact_update_failure(context)
+        if pending_failure is None:
+            return None
+        retries = int((context.context_debug or {}).get("document_artifact_update_guard_retries") or 0)
+        failure_text = re.sub(r"\s+", " ", str(pending_failure.tool_output or pending_failure.content or "")).strip()
+        context.context_debug = {
+            **dict(context.context_debug or {}),
+            "document_artifact_update_guard_retries": retries + 1,
+            "document_artifact_update_guard_failure": failure_text[:600],
+        }
+        if retries >= 2:
+            safe_answer = (
+                "本轮尝试更新文档 artifact 失败，且多次纠错后仍没有成功写入。"
+                f"最后失败原因: {failure_text or 'unknown'}"
+            )
+            context.final_answer = safe_answer
+            context.state = AgentState.DONE
+            events.append({"type": "answer", "data": safe_answer})
+            return events, True
+        events.append(
+            {
+                "type": "thought",
+                "data": "检测到文档 artifact 写入失败，已阻止直接回答并要求重新调用 update 工具。",
+            }
+        )
+        context.messages.append({"role": "user", "content": self._build_document_artifact_update_retry_message(pending_failure)})
         return events, False
 
     @staticmethod
@@ -2041,6 +2222,23 @@ class AgentCore:
                 await self._set_active_skill_names(
                     context,
                     [*current_active_skill_names, self._LITERATURE_REVIEW_SKILL_NAME],
+                )
+            return
+
+        if call.name == "document_artifact_update_blocks" or (
+            call.name == "document_artifact_read"
+            and isinstance(result.data, dict)
+            and str(result.data.get("workflow_hint") or "").strip()
+        ):
+            current_active_skill_names = [
+                str(item or "").strip()
+                for item in list(getattr(self.runtime_context, "active_skill_names", []) or [])
+                if str(item or "").strip()
+            ]
+            if self._ARTIFACT_PARALLEL_WRITING_SKILL_NAME not in current_active_skill_names:
+                await self._set_active_skill_names(
+                    context,
+                    [*current_active_skill_names, self._ARTIFACT_PARALLEL_WRITING_SKILL_NAME],
                 )
             return
 
@@ -6588,6 +6786,12 @@ class AgentCore:
 
         answer = answer_hint
         if answer:
+            guarded = self._maybe_guard_document_artifact_update_failure_answer(context, events=events)
+            if guarded is not None:
+                return guarded
+            guarded = self._maybe_guard_docx_runtime_direct_answer(context, answer, events=events)
+            if guarded is not None:
+                return guarded
             guarded = self._maybe_guard_paper_skill_direct_answer(context, events=events)
             if guarded is not None:
                 return guarded
@@ -6661,7 +6865,6 @@ class AgentCore:
                     continue
                 content_parts.append(chunk)
                 streamed_content = True
-                yield {"type": "content", "data": chunk}
                 continue
             if event_type == "reasoning":
                 reasoning_parts.append(str(event_data or ""))
@@ -6775,6 +6978,12 @@ class AgentCore:
 
         answer = answer_hint
         if answer:
+            guarded = self._maybe_guard_document_artifact_update_failure_answer(context, events=events)
+            if guarded is not None:
+                return guarded
+            guarded = self._maybe_guard_docx_runtime_direct_answer(context, str(answer), events=events)
+            if guarded is not None:
+                return guarded
             guarded = self._maybe_guard_paper_skill_direct_answer(context, events=events)
             if guarded is not None:
                 return guarded

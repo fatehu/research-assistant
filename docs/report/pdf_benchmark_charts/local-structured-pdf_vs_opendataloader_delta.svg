@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="380" viewBox="0 0 920 380">
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+<stop offset="0%" stop-color="#020617"/>
+<stop offset="55%" stop-color="#0f172a"/>
+<stop offset="100%" stop-color="#111827"/>
+</linearGradient>
+</defs>
+<rect width="920" height="380" fill="url(#bg)"/>
+<text x="36.00" y="42.00" fill="#f8fafc" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="24" font-weight="800">local-structured-pdf vs opendataloader</text>
+<text x="36.00" y="70.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="14" font-weight="500">Metric delta on the same 200-document corpus; positive means target is higher.</text>
+<line x1="520.00" y1="87.00" x2="520.00" y2="323.00" stroke="#334155" stroke-width="1.00"/>
+<text x="502.00" y="79.00" fill="#64748b" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="11" font-weight="500">0</text>
+<text x="36.00" y="121.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="700">Overall</text>
+<rect x="520.00" y="105.00" width="5.47" height="18.00" rx="9.00" ry="9.00" fill="#14b8a6"/>
+<text x="535.47" y="119.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="500">+0.003</text>
+<text x="36.00" y="173.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="700">Reading Order</text>
+<rect x="502.65" y="157.00" width="17.35" height="18.00" rx="9.00" ry="9.00" fill="#ef4444"/>
+<text x="410.65" y="171.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="500">-0.010</text>
+<text x="36.00" y="225.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="700">Table</text>
+<rect x="520.00" y="209.00" width="172.29" height="18.00" rx="9.00" ry="9.00" fill="#f59e0b"/>
+<text x="702.29" y="223.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="500">+0.101</text>
+<text x="36.00" y="277.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="700">Heading</text>
+<rect x="520.00" y="261.00" width="15.02" height="18.00" rx="9.00" ry="9.00" fill="#a3e635"/>
+<text x="545.02" y="275.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="13" font-weight="500">+0.009</text>
+</svg>

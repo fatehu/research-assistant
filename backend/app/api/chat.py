@@ -127,7 +127,8 @@ async def _attach_active_document_artifact(
 def _document_artifact_update_payload_from_observation(
     observation_payload: dict[str, Any],
 ) -> Optional[dict[str, Any]]:
-    if str(observation_payload.get("tool") or "").strip() != "document_artifact_update_block":
+    tool_name = str(observation_payload.get("tool") or "").strip()
+    if tool_name not in {"document_artifact_update_block", "document_artifact_update_blocks"}:
         return None
     if observation_payload.get("success") is False:
         return None
@@ -138,23 +139,33 @@ def _document_artifact_update_payload_from_observation(
     artifact_digest = data.get("artifact") if isinstance(data.get("artifact"), dict) else {}
     document_artifact = data.get("document_artifact") if isinstance(data.get("document_artifact"), dict) else None
     block = data.get("block") if isinstance(data.get("block"), dict) else None
+    blocks = [item for item in list(data.get("blocks") or []) if isinstance(item, dict)]
     block_id = str(data.get("block_id") or (block or {}).get("block_id") or "").strip()
+    block_ids = [
+        str(item).strip()
+        for item in list(data.get("block_ids") or [])
+        if str(item or "").strip()
+    ]
+    if not block_id and blocks:
+        block_id = str(blocks[0].get("block_id") or "").strip()
+    if not block_ids and block_id:
+        block_ids = [block_id]
     artifact_id = str(
         data.get("artifact_id")
         or artifact_digest.get("artifact_id")
         or (document_artifact or {}).get("artifact_id")
         or ""
     ).strip()
-    if not artifact_id or not block_id:
+    if not artifact_id or not block_ids:
         return None
 
     if block is None and document_artifact:
-        blocks = document_artifact.get("blocks")
-        if isinstance(blocks, list):
+        document_blocks = document_artifact.get("blocks")
+        if isinstance(document_blocks, list):
             block = next(
                 (
                     item
-                    for item in blocks
+                    for item in document_blocks
                     if isinstance(item, dict) and str(item.get("block_id") or "") == block_id
                 ),
                 None,
@@ -163,6 +174,7 @@ def _document_artifact_update_payload_from_observation(
     payload: dict[str, Any] = {
         "artifact_id": artifact_id,
         "block_id": block_id,
+        "block_ids": block_ids,
         "updated_at": data.get("updated_at")
         or artifact_digest.get("updated_at")
         or (document_artifact or {}).get("updated_at"),
@@ -171,6 +183,8 @@ def _document_artifact_update_payload_from_observation(
         payload["artifact"] = artifact_digest
     if block:
         payload["block"] = block
+    if blocks:
+        payload["blocks"] = blocks
     if document_artifact:
         payload["document_artifact"] = document_artifact
     return payload
@@ -405,7 +419,8 @@ def _append_document_artifact_selection(message: str, block_ids: List[str]) -> s
                     "[当前文档模块选择]",
                     f"用户本轮在右侧文档 Artifact 中选择了这些 block_id: {', '.join(block_ids)}",
                     "如果用户问题涉及文档生成、修改、续写、审阅或 DOCX 生成，请优先围绕这些模块处理。",
-                    "需要读取模块内容时，调用 document_artifact_read 并传入这些 block_ids；需要写回时，调用 document_artifact_update_block。",
+                    "需要读取模块内容时，调用 document_artifact_read 并传入这些 block_ids，避免空 block_ids 全量读取 artifact。",
+                    "如果需要了解其它模块，先用 document_artifact_read(include_markdown=false) 列出 block 标题，再按 block_id 精确读取；需要写回时，调用 document_artifact_update_block。",
                 ]
             ),
         ]

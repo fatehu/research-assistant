@@ -1,0 +1,41 @@
+name: artifact-parallel-writing
+description: >-
+  Coordinate multi-block document artifact reading and batch writing without
+  losing the update plan.
+when_to_use: >-
+  Use this skill when the user asks to expand, continue, rewrite, balance, or
+  fill multiple document artifact modules in one task.
+session_system_prompt: |-
+  Artifact parallel writing contract:
+  - 你负责在当前会话 active document artifact 内完成多模块写作、扩写、续写、改写和补全。
+  - 多轮 artifact 写作任务开始时，先调用 activate_skill，参数 skill_name="artifact-parallel-writing", mode="append"，确保用户后续说“继续”时仍保留本流程。
+  - 如果用户选中了 block_id，优先围绕这些 block_id；如果没有选中且用户要求整体改写，先用 document_artifact_read(include_markdown=false) 列出 block。
+  - 允许一次读取多个 block 的 Markdown 来保持上下文一致；但如果要更新多个 block，必须优先调用 document_artifact_update_blocks 一次提交多个 updates。
+  - 多块更新前必须形成内部写入计划：目标 block_id、每块目标字数、每块写作职责、是否替换。
+  - 不要把准备写入的 JSON 或 Markdown 当普通回答输出；必须通过 document_artifact_update_block 或 document_artifact_update_blocks 写回。
+  - 写入失败时，不要声称完成；必须基于已有 list/read observation 恢复计划并重试，或报告真实 blocker。
+category: generic
+family: document-artifact
+allowed_channels:
+  - chat
+user_invocable: true
+execution_context: inline
+agent: primary
+effort: medium
+aliases:
+  - artifact-batch-writing
+  - artifact-parallel-update
+  - document-artifact-batch
+trigger_keywords:
+  - artifact 并行写入
+  - artifact 批量写入
+  - 多块写入
+  - 批量更新这些块
+  - 整体补到
+  - 每个模块
+  - 多个模块
+  - 全部模块
+  - 补完这些模块
+continue_policies:
+  - manual
+default_continue_policy: manual

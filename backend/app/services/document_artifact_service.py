@@ -446,6 +446,73 @@ class DocumentArtifactService:
         await db.commit()
         return artifact
 
+    async def update_blocks(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        conversation_id: int,
+        updates: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        conversation = await self._load_conversation(db, user_id=user_id, conversation_id=conversation_id)
+        path = self._active_path_from_conversation(conversation)
+        if path is None or not path.is_file():
+            raise ValueError("当前对话没有 active document artifact")
+        artifact = self._read_json(path)
+        if not artifact:
+            raise ValueError("当前对话没有 active document artifact")
+
+        normalized: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for item in list(updates or []):
+            if not isinstance(item, dict):
+                raise ValueError("updates 中的每一项都必须是对象")
+            block_id = str(item.get("block_id") or "").strip()
+            markdown = item.get("markdown")
+            status = str(item.get("status") or "draft").strip() or "draft"
+            if not block_id:
+                raise ValueError("updates 中存在空 block_id")
+            if block_id in seen:
+                raise ValueError(f"updates 中存在重复 block_id: {block_id}")
+            if markdown is None or not str(markdown).strip():
+                raise ValueError(f"block {block_id} 的 markdown 不能为空")
+            seen.add(block_id)
+            normalized.append({"block_id": block_id, "markdown": str(markdown), "status": status})
+
+        if not normalized:
+            raise ValueError("updates 不能为空")
+
+        block_map: Dict[str, Dict[str, Any]] = {}
+        for block in list(artifact.get("blocks") or []):
+            if not isinstance(block, dict):
+                continue
+            block_id = str(block.get("block_id") or "").strip()
+            if block_id:
+                block_map[block_id] = block
+        missing = [item["block_id"] for item in normalized if item["block_id"] not in block_map]
+        if missing:
+            raise ValueError(f"未找到 block: {', '.join(missing)}")
+
+        now = self._now()
+        updated_blocks: List[Dict[str, Any]] = []
+        for item in normalized:
+            block = block_map[item["block_id"]]
+            block["markdown"] = item["markdown"]
+            block["status"] = item["status"]
+            block["updated_at"] = now
+            updated_blocks.append(dict(block))
+
+        artifact["updated_at"] = now
+        self._write_artifact_file(int(conversation.id), artifact)
+        metadata = dict(conversation.metadata_ or {}) if isinstance(conversation.metadata_, dict) else {}
+        metadata[self.METADATA_KEY] = self._metadata_pointer(artifact=artifact, path=path)
+        conversation.metadata_ = metadata
+        await db.commit()
+        return {
+            "artifact": artifact,
+            "updated_blocks": updated_blocks,
+        }
+
     async def read_blocks_for_tool(
         self,
         db: AsyncSession,

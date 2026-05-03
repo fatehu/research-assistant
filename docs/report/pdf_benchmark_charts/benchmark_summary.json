@@ -1,0 +1,114 @@
+[
+  {
+    "engine": "opendataloader-hybrid",
+    "document_count": 200,
+    "elapsed_per_doc": 0.43349149465560916,
+    "failed_count": 0,
+    "missing_predictions": 0,
+    "metrics": {
+      "overall_mean": 0.9092112668414152,
+      "nid_mean": 0.9353253519642838,
+      "teds_mean": 0.9276430534097512,
+      "mhs_mean": 0.827743389159334
+    },
+    "source": "tmp/opendataloader-bench/prediction/opendataloader-hybrid/evaluation.json"
+  },
+  {
+    "engine": "docling",
+    "document_count": 200,
+    "elapsed_per_doc": 0.7251043462753296,
+    "failed_count": 0,
+    "missing_predictions": 0,
+    "metrics": {
+      "overall_mean": 0.876575800852069,
+      "nid_mean": 0.8994733646797808,
+      "teds_mean": 0.8870548597181608,
+      "mhs_mean": 0.8018575186127493
+    },
+    "source": "tmp/opendataloader-bench/prediction/docling/evaluation.json"
+  },
+  {
+    "engine": "marker",
+    "document_count": 200,
+    "elapsed_per_doc": 53.93221109986305,
+    "failed_count": 0,
+    "missing_predictions": 0,
+    "metrics": {
+      "overall_mean": 0.8608364226049575,
+      "nid_mean": 0.8897399418827387,
+      "teds_mean": 0.8076072125952004,
+      "mhs_mean": 0.7955733168260926
+    },
+    "source": "tmp/opendataloader-bench/prediction/marker/evaluation.json"
+  },
+  {
+    "engine": "local-structured-pdf",
+    "document_count": 200,
+    "elapsed_per_doc": 0.5086154615879059,
+    "failed_count": 0,
+    "missing_predictions": 0,
+    "metrics": {
+      "overall_mean": 0.847520258011706,
+      "nid_mean": 0.9025377868634635,
+      "teds_mean": 0.5955778516732879,
+      "mhs_mean": 0.7694634182156811
+    },
+    "source": "tmp/opendataloader-bench/prediction/local-structured-pdf/evaluation.json"
+  },
+  {
+    "engine": "opendataloader",
+    "document_count": 200,
+    "elapsed_per_doc": 0.054992760419845584,
+    "failed_count": 0,
+    "missing_predictions": 0,
+    "metrics": {
+      "overall_mean": 0.8443021843119953,
+      "nid_mean": 0.9127464418765165,
+      "teds_mean": 0.49423206755711363,
+      "mhs_mean": 0.7606304544776121
+    },
+    "source": "tmp/opendataloader-bench/prediction/opendataloader/evaluation.json"
+  },
+  {
+    "engine": "mineru",
+    "document_count": 200,
+    "elapsed_per_doc": 5.961503773927689,
+    "failed_count": 0,
+    "missing_predictions": 0,
+    "metrics": {
+      "overall_mean": 0.8311354224973181,
+      "nid_mean": 0.8573619799638795,
+      "teds_mean": 0.8729915402457293,
+      "mhs_mean": 0.7429826268920451
+    },
+    "source": "tmp/opendataloader-bench/prediction/mineru/evaluation.json"
+  },
+  {
+    "engine": "pymupdf4llm",
+    "document_count": 200,
+    "elapsed_per_doc": 0.09086427569389344,
+    "failed_count": 0,
+    "missing_predictions": 0,
+    "metrics": {
+      "overall_mean": 0.7316207702134215,
+      "nid_mean": 0.8851037315269882,
+      "teds_mean": 0.4009531754407035,
+      "mhs_mean": 0.4122221259490795
+    },
+    "source": "tmp/opendataloader-bench/prediction/pymupdf4llm/evaluation.json"
+  },
+  {
+    "engine": "markitdown",
+    "document_count": 200,
+    "elapsed_per_doc": 0.040968511104583744,
+    "failed_count": 0,
+    "missing_predictions": 0,
+    "metrics": {
+      "overall_mean": 0.5832211961867046,
+      "nid_mean": 0.8785778586527911,
+      "teds_mean": 0.0,
+      "mhs_mean": 0.0
+    },
+    "source": "tmp/opendataloader-bench/prediction/markitdown/evaluation.json"
+  }
+]

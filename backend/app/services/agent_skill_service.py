@@ -168,7 +168,8 @@ class AgentSkillService:
             )
             available_matches.append(match)
             normalized_skill_name = self._normalize_text(skill.name)
-            explicit_activation = bool(score >= 90)
+            implicit_activation = activation_reason.startswith("命中 skill 触发词")
+            explicit_activation = bool(score >= 90 and (skill.allow_implicit_invocation or not implicit_activation))
             persisted_activation = normalized_skill_name in normalized_active_skill_names
             if explicit_activation or persisted_activation:
                 effective_reason = activation_reason or ("会话级已激活" if persisted_activation else "")

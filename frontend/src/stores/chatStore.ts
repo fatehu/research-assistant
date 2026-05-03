@@ -380,18 +380,22 @@ const applyDocumentArtifactUpdateToConversation = (
 
   const artifact = conversation.document_artifact
   const block = isDocumentArtifactBlock(data.block) ? data.block : null
-  if (!artifact || !block) return conversation
+  const payloadBlocks = Array.isArray(data.blocks) ? data.blocks.filter(isDocumentArtifactBlock) : []
+  if (!artifact || (!block && payloadBlocks.length === 0)) return conversation
 
   const artifactId = typeof data.artifact_id === 'string' ? data.artifact_id : ''
   if (artifactId && artifact.artifact_id !== artifactId) return conversation
 
+  const patchBlocks = payloadBlocks.length > 0 ? payloadBlocks : block ? [block] : []
+  const patchMap = new Map(patchBlocks.map((item) => [item.block_id, item]))
   let found = false
   const blocks = artifact.blocks.map((item) => {
-    if (item.block_id !== block.block_id) return item
+    const nextBlock = patchMap.get(item.block_id)
+    if (!nextBlock) return item
     found = true
     return {
       ...item,
-      ...block,
+      ...nextBlock,
     }
   })
   if (!found) return conversation
@@ -399,8 +403,8 @@ const applyDocumentArtifactUpdateToConversation = (
   const updatedAt =
     typeof data.updated_at === 'string'
       ? data.updated_at
-      : typeof block.updated_at === 'string'
-        ? block.updated_at
+      : typeof patchBlocks[0]?.updated_at === 'string'
+        ? patchBlocks[0].updated_at
         : artifact.updated_at
   return {
     ...conversation,
@@ -532,7 +536,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     set({ isLoadingList: true })
     try {
-      const conversations = await chatApi.getConversations()
+      const pageSize = 100
+      let skip = 0
+      const conversations: Conversation[] = []
+
+      while (true) {
+        const page = await chatApi.getConversations(skip, pageSize)
+        conversations.push(...page)
+        if (page.length < pageSize) break
+        skip += pageSize
+      }
+
       set({ conversations, isLoadingList: false })
     } catch (error) {
       handleApiError(error, '获取对话列表')

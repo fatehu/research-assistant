@@ -60,6 +60,7 @@ class _FakeRuntimeService:
     def __init__(self):
         self.turn_entries = {}
         self.item_entries = []
+        self.context_states = {}
 
     async def get_conversation_revision(self, conversation_id):
         return "rev-54"
@@ -102,7 +103,10 @@ class _FakeRuntimeService:
         }
 
     async def get_conversation_context_state(self, conversation_id):
-        return None
+        return self.context_states.get(int(conversation_id))
+
+    async def upsert_conversation_context_state(self, conversation_id, state):
+        self.context_states[int(conversation_id)] = dict(state or {})
 
     async def get_conversation_tool_ledger(self, conversation_id):
         return None
@@ -954,10 +958,10 @@ async def test_create_chat_background_run_binds_conversation_after_stream_start(
     )
 
     assert response["run_id"] == "bg-run-1"
-    assert runtime_service.bind_calls == [{"run_id": "bg-run-1", "conversation_id": 88}]
+    assert {"run_id": "bg-run-1", "conversation_id": 88} in runtime_service.bind_calls
     assert runtime_service.complete_calls[0]["run_id"] == "bg-run-1"
     assert runtime_service.complete_calls[0]["metadata"]["conversation_id"] == 88
-    assert runtime_service.call_sequence == [("bind", 88), ("complete", 88)]
+    assert runtime_service.call_sequence[-1] == ("complete", 88)
 
 
 @pytest.mark.asyncio

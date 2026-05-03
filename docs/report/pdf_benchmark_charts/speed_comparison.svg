@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1050" height="528" viewBox="0 0 1050 528">
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+<stop offset="0%" stop-color="#020617"/>
+<stop offset="55%" stop-color="#0f172a"/>
+<stop offset="100%" stop-color="#111827"/>
+</linearGradient>
+</defs>
+<rect width="1050" height="528" fill="url(#bg)"/>
+<text x="36.00" y="42.00" fill="#f8fafc" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="24" font-weight="800">PDF Benchmark Speed Comparison</text>
+<text x="36.00" y="70.00" fill="#94a3b8" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="14" font-weight="500">Seconds per document on recorded run; log scale, lower is better.</text>
+<text x="36.00" y="122.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="14" font-weight="500">markitdown</text>
+<rect x="220.00" y="105.00" width="750.00" height="18.00" rx="9.00" ry="9.00" fill="#0f172a"/>
+<rect x="220.00" y="105.00" width="3.00" height="18.00" rx="9.00" ry="9.00" fill="#64748b"/>
+<text x="233.00" y="119.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="500">0.041s/doc</text>
+<text x="36.00" y="168.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="14" font-weight="500">opendataloader</text>
+<rect x="220.00" y="151.00" width="750.00" height="18.00" rx="9.00" ry="9.00" fill="#0f172a"/>
+<rect x="220.00" y="151.00" width="30.74" height="18.00" rx="9.00" ry="9.00" fill="#64748b"/>
+<text x="260.74" y="165.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="500">0.055s/doc</text>
+<text x="36.00" y="214.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="14" font-weight="500">pymupdf4llm</text>
+<rect x="220.00" y="197.00" width="750.00" height="18.00" rx="9.00" ry="9.00" fill="#0f172a"/>
+<rect x="220.00" y="197.00" width="83.18" height="18.00" rx="9.00" ry="9.00" fill="#64748b"/>
+<text x="313.18" y="211.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="500">0.091s/doc</text>
+<text x="36.00" y="260.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="14" font-weight="500">opendataloader-hybrid</text>
+<rect x="220.00" y="243.00" width="750.00" height="18.00" rx="9.00" ry="9.00" fill="#0f172a"/>
+<rect x="220.00" y="243.00" width="246.33" height="18.00" rx="9.00" ry="9.00" fill="#64748b"/>
+<text x="476.33" y="257.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="500">0.433s/doc</text>
+<text x="36.00" y="306.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="14" font-weight="700">local-structured-pdf</text>
+<rect x="220.00" y="289.00" width="750.00" height="18.00" rx="9.00" ry="9.00" fill="#0f172a"/>
+<rect x="220.00" y="289.00" width="263.02" height="18.00" rx="9.00" ry="9.00" fill="#14b8a6"/>
+<text x="493.02" y="303.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="500">0.509s/doc</text>
+<text x="36.00" y="352.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="14" font-weight="500">docling</text>
+<rect x="220.00" y="335.00" width="750.00" height="18.00" rx="9.00" ry="9.00" fill="#0f172a"/>
+<rect x="220.00" y="335.00" width="300.05" height="18.00" rx="9.00" ry="9.00" fill="#64748b"/>
+<text x="530.05" y="349.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="500">0.725s/doc</text>
+<text x="36.00" y="398.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="14" font-weight="500">mineru</text>
+<rect x="220.00" y="381.00" width="750.00" height="18.00" rx="9.00" ry="9.00" fill="#0f172a"/>
+<rect x="220.00" y="381.00" width="520.03" height="18.00" rx="9.00" ry="9.00" fill="#64748b"/>
+<text x="750.03" y="395.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="500">5.962s/doc</text>
+<text x="36.00" y="444.00" fill="#e5edf7" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="14" font-weight="500">marker</text>
+<rect x="220.00" y="427.00" width="750.00" height="18.00" rx="9.00" ry="9.00" fill="#0f172a"/>
+<rect x="220.00" y="427.00" width="750.00" height="18.00" rx="9.00" ry="9.00" fill="#64748b"/>
+<text x="980.00" y="441.00" fill="#cbd5e1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12" font-weight="500">53.932s/doc</text>
+</svg>

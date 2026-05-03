@@ -1037,7 +1037,9 @@ class ReadingDossierV2AdjacentPageRow(BaseModel):
             item_payload["seq"] = index
             try:
                 item_payload = ReadingDossierV2AdjacentContentStreamItem.model_validate(item_payload).model_dump(mode="json")
-            except Exception:
+            except Exception as exc:
+                if "legacy JSON payload stuffing" in str(exc):
+                    raise
                 continue
             normalized_stream.append(item_payload)
 

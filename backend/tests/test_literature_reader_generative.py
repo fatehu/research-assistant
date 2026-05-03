@@ -756,6 +756,15 @@ async def test_stream_event_order(monkeypatch):
     monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_owned)
     monkeypatch.setattr(literature_api, "get_literature_reader_service", lambda: _FakeReaderService())
 
+    class _FakeSessionFactory:
+        async def __aenter__(self):
+            return _FakeDB()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(literature_api, "async_session_factory", lambda: _FakeSessionFactory())
+
     class _FakeRequest:
         async def is_disconnected(self):
             return False
@@ -764,7 +773,6 @@ async def test_stream_event_order(monkeypatch):
         paper_id=5,
         payload=SimpleNamespace(page=1, selected_kb_id=None, force_refresh=False, style_hint=None),
         request=_FakeRequest(),
-        db=_FakeDB(),
         current_user=SimpleNamespace(id=7),
     )
 
