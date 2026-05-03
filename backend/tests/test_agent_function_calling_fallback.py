@@ -1062,53 +1062,6 @@ async def test_execute_tool_calls_persists_tool_ledger_entries():
 
 
 @pytest.mark.asyncio
-async def test_finalize_function_calling_iteration_appends_internal_work_log(monkeypatch):
-    runtime_service = _ToolLedgerRuntimeService()
-    agent = ReActAgent(
-        llm_service=_DirectAnswerFCLLM(),
-        tool_registry=_SimpleExecuteTools(),
-        runtime_context=AgentRuntimeContext(user_id=7, channel="chat", conversation_id=54),
-        runtime_service=runtime_service,
-    )
-    context = AgentContext(
-        messages=[{"role": "user", "content": "调研注意力机制最早的论文"}],
-        iteration=1,
-        run_id="run-1",
-    )
-
-    async def _fake_work_log(_context, _executed):
-        return "已做: 读取时间线线索\n发现: Bahdanau 2014 引入注意力机制\n下一步: 继续定位对应论文与仓库材料"
-
-    monkeypatch.setattr(agent, "_generate_internal_tool_work_log", _fake_work_log)
-
-    events, done = await agent._finalize_function_calling_iteration(
-        context,
-        content="",
-        reasoning="",
-        parsed_calls=[
-            ParsedToolCall(
-                call_id="call_1",
-                name="datetime",
-                arguments={"query": "2014 到现在多少年"},
-                arguments_raw='{"query":"2014 到现在多少年"}',
-            )
-        ],
-    )
-
-    assert done is False
-    assert any(event.get("type") == "action" for event in events)
-    assert any(event.get("type") == "observation" for event in events)
-    assert context.messages[-1]["role"] == "assistant"
-    assert "<work_log>" in str(context.messages[-1]["content"])
-    assert "Bahdanau 2014" in str(context.messages[-1]["content"])
-    assert any(
-        str(item.get("kind") or "") == "assistant_message"
-        and bool((item.get("metadata") or {}).get("internal_work_log"))
-        for item in runtime_service.item_entries
-    )
-
-
-@pytest.mark.asyncio
 async def test_execute_tool_calls_marks_script_followup_after_execution_spec_failure():
     runtime_service = _ToolLedgerRuntimeService()
 

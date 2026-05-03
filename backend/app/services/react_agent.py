@@ -6579,81 +6579,6 @@ class AgentCore:
         except Exception as exc:
             logger.warning(f"[AgentCore] append tool use summary item failed: {exc}")
 
-    async def _generate_internal_tool_work_log(
-        self,
-        context: AgentContext,
-        executed_calls: Sequence[ExecutedToolCall],
-    ) -> str:
-        rows = [item for item in list(executed_calls or []) if isinstance(item, ExecutedToolCall)]
-        if not rows:
-            return ""
-        workflow_summary = self._build_tool_workflow_summary(context, rows)
-        tool_names = [
-            str(item.tool_name or "").strip()
-            for item in rows
-            if str(item.tool_name or "").strip()
-        ]
-        unique_tool_names = list(dict.fromkeys(tool_names))
-        success_count = sum(1 for item in rows if item.success)
-        failure_count = sum(1 for item in rows if not item.success)
-        highlights = [
-            self._compact_debug_text(item, 180)
-            for item in list(workflow_summary.get("highlights") or [])
-            if self._compact_debug_text(item, 180)
-        ]
-        next_action = self._compact_debug_text(workflow_summary.get("next_action") or "", 220)
-
-        lines: List[str] = []
-        if unique_tool_names:
-            lines.append(f"已做: 调用 {'、'.join(unique_tool_names[:6])}")
-        else:
-            lines.append("已做: 执行工具调用")
-        lines.append(f"结果: 成功 {success_count} 个，失败 {failure_count} 个")
-        if highlights:
-            lines.append("发现: " + "；".join(highlights[:3]))
-        if next_action:
-            lines.append(f"下一步: {next_action}")
-        return "\n".join(lines).strip()
-
-    async def _append_internal_work_log_item(
-        self,
-        context: AgentContext,
-        work_log: str,
-        executed_calls: Sequence[ExecutedToolCall],
-    ) -> None:
-        conversation_id = getattr(self.runtime_context, "conversation_id", None)
-        if conversation_id is None or not str(work_log or "").strip():
-            return
-        await self.runtime_service.append_conversation_item_entries(
-            int(conversation_id),
-            [
-                {
-                    "kind": "assistant_message",
-                    "turn_id": context.turn_id,
-                    "role": "assistant",
-                    "run_id": context.run_id,
-                    "iteration": context.iteration,
-                    "summary": self._compact_debug_text(work_log, 320),
-                    "content": f"<work_log>\n{work_log}\n</work_log>",
-                    "status": "internal",
-                    "metadata": {
-                        "internal_work_log": True,
-                        "tool_names": [
-                            item.tool_name
-                            for item in list(executed_calls or [])
-                            if isinstance(item, ExecutedToolCall) and str(item.tool_name or "").strip()
-                        ],
-                        "tool_call_ids": [
-                            item.tool_call_id
-                            for item in list(executed_calls or [])
-                            if isinstance(item, ExecutedToolCall) and str(item.tool_call_id or "").strip()
-                        ],
-                    },
-                    "created_at": datetime.utcnow().isoformat(),
-                }
-            ],
-        )
-
     async def _append_tool_ledger_entries(
         self,
         context: AgentContext,
@@ -6857,15 +6782,6 @@ class AgentCore:
                 events.append(item.action_event)
                 events.append(item.observation_event)
                 context.messages.append(item.tool_message)
-            work_log = await self._generate_internal_tool_work_log(context, executed)
-            if work_log:
-                context.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": f"<work_log>\n{work_log}\n</work_log>",
-                    }
-                )
-                await self._append_internal_work_log_item(context, work_log, executed)
             return events, False
 
         answer = answer_hint
