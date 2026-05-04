@@ -29,6 +29,22 @@ app = FastAPI(title="Project Runtime Worker", version="0.1.0")
 CLAUDE_STREAM_PIPE_LIMIT = 8 * 1024 * 1024
 
 
+def _claude_stream_heartbeat_seconds() -> float:
+    raw_value = getattr(settings, "claude_code_stream_heartbeat_seconds", 15.0)
+    try:
+        return max(1.0, float(raw_value))
+    except (TypeError, ValueError):
+        return 15.0
+
+
+def _claude_stream_heartbeat_payload() -> Dict[str, Any]:
+    return {
+        "type": "heartbeat",
+        "worker": "runtime-worker",
+        "timestamp": _utc_now(),
+    }
+
+
 class RuntimeStartRequest(BaseModel):
     project_id: int = Field(ge=1)
     workspace_id: int = Field(ge=1)
@@ -1155,6 +1171,8 @@ async def run_claude_stream(payload: ClaudeRunRequest):
         stdout_task = asyncio.create_task(_pump(process.stdout, "stdout", stdout_parts))
         stderr_task = asyncio.create_task(_pump(process.stderr, "stderr", stderr_parts))
         wait_task = asyncio.create_task(process.wait())
+        heartbeat_seconds = _claude_stream_heartbeat_seconds()
+        last_stream_activity = time.monotonic()
         try:
             while True:
                 if wait_task.done() and queue.empty():
@@ -1162,7 +1180,12 @@ async def run_claude_stream(payload: ClaudeRunRequest):
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=0.1)
                 except asyncio.TimeoutError:
+                    now = time.monotonic()
+                    if not wait_task.done() and now - last_stream_activity >= heartbeat_seconds:
+                        last_stream_activity = now
+                        yield json.dumps(_claude_stream_heartbeat_payload(), ensure_ascii=False, default=str) + "\n"
                     continue
+                last_stream_activity = time.monotonic()
                 yield json.dumps(item, ensure_ascii=False, default=str) + "\n"
         finally:
             await stdout_task
@@ -1326,6 +1349,8 @@ async def run_docx_claude_stream(payload: DocxClaudeRunRequest):
         stdout_task = asyncio.create_task(_pump(process.stdout, "stdout", stdout_parts))
         stderr_task = asyncio.create_task(_pump(process.stderr, "stderr", stderr_parts))
         wait_task = asyncio.create_task(process.wait())
+        heartbeat_seconds = _claude_stream_heartbeat_seconds()
+        last_stream_activity = time.monotonic()
         try:
             while True:
                 if wait_task.done() and queue.empty():
@@ -1333,7 +1358,12 @@ async def run_docx_claude_stream(payload: DocxClaudeRunRequest):
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=0.1)
                 except asyncio.TimeoutError:
+                    now = time.monotonic()
+                    if not wait_task.done() and now - last_stream_activity >= heartbeat_seconds:
+                        last_stream_activity = now
+                        yield json.dumps(_claude_stream_heartbeat_payload(), ensure_ascii=False, default=str) + "\n"
                     continue
+                last_stream_activity = time.monotonic()
                 yield json.dumps(item, ensure_ascii=False, default=str) + "\n"
         finally:
             await stdout_task

@@ -6,6 +6,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.config import settings
+import app.services.react_agent as react_agent_module
 from app.services.react_agent import AgentContext, ReActAgent
 
 
@@ -256,6 +257,31 @@ def test_summarize_messages_prefers_thought_for_assistant_history():
 
     assert "推理摘要" in summary
     assert "先检索知识库定义" in summary
+
+
+@pytest.mark.asyncio
+async def test_system_budget_summary_is_deterministic_without_llm_service(monkeypatch):
+    class _FailingLLMService:
+        def __init__(self, provider):
+            raise AssertionError("budget summary must not call LLMService")
+
+    monkeypatch.setattr(react_agent_module, "LLMService", _FailingLLMService)
+
+    long_tail = "关键事实路径 project_id=10 paper_id=113 " * 80
+    message = await ReActAgent._build_system_compression_message(
+        [
+            {"role": "user", "content": f"第{i}轮问题：{long_tail}"}
+            for i in range(8)
+        ],
+        title="更早历史系统压缩",
+        max_lines=4,
+    )
+
+    assert message is not None
+    content = message["content"]
+    assert content.startswith("更早历史系统压缩：")
+    assert "system-compression-summary-truncated" in content
+    assert "project_id=10" in content
 
 
 def test_context_window_uses_deepseek_test_alias_window(monkeypatch):

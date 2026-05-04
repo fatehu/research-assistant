@@ -325,6 +325,72 @@ async def test_project_claude_tool_uses_runtime_worker(tmp_path, monkeypatch):
     assert "Claude result:" in result.output
 
 
+@pytest.mark.asyncio
+async def test_project_claude_tool_forwards_runtime_heartbeat(tmp_path, monkeypatch):
+    tool = agent_tools.ProjectClaudeTool(db=object(), user_id=1)
+    live_events = []
+
+    async def _resolve_project_payload_only(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload()
+
+    class _FakeWorkerClient:
+        @staticmethod
+        def enabled():
+            return True
+
+        async def claude(self, *args, **kwargs):
+            raise AssertionError("live stream path should be used when emitter is active")
+
+        async def claude_stream(self, *, project_id: int, workspace_dir, prompt: str, continue_session: bool):
+            assert project_id == 7
+            assert workspace_dir == tmp_path
+            assert prompt == "inspect the repo"
+            assert continue_session is False
+            yield {"type": "heartbeat", "timestamp": "2026-05-04T00:00:00Z", "worker": "runtime-worker"}
+            yield {
+                "type": "result",
+                "payload": {
+                    "project_id": 7,
+                    "workspace_dir": str(tmp_path),
+                    "prompt": prompt,
+                    "continue_session": continue_session,
+                    "session_id": "test-session-id",
+                    "assistant_text": "done",
+                    "result_text": "done",
+                    "is_error": False,
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "error": None,
+                    "worker": "runtime-worker",
+                },
+            }
+
+    monkeypatch.setattr(tool, "_resolve_project_payload_only", _resolve_project_payload_only)
+    monkeypatch.setattr(tool, "_project_dir_for", lambda _project_id: tmp_path)
+    monkeypatch.setattr("app.services.project_runtime_service.ProjectRuntimeWorkerClient", _FakeWorkerClient)
+
+    token = agent_tools.set_tool_live_event_emitter(lambda event: live_events.append(event))
+    try:
+        result = await tool._execute(project_id=7, prompt="inspect the repo", continue_session=False)
+    finally:
+        agent_tools.reset_tool_live_event_emitter(token)
+
+    assert result.success is True
+    assert result.data["session_id"] == "test-session-id"
+    assert live_events == [
+        {
+            "type": "heartbeat",
+            "data": {
+                "tool": "project_claude",
+                "source": "runtime-worker",
+                "timestamp": "2026-05-04T00:00:00Z",
+            },
+        }
+    ]
+
+
 def test_project_claude_tool_has_no_tool_timeout():
     tool = agent_tools.ProjectClaudeTool(db=object(), user_id=1)
 

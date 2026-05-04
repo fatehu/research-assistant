@@ -698,6 +698,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         normalizedRunId,
         (event, data) => {
           switch (event) {
+            case 'heartbeat':
+              break
+
             case 'run_status': {
               const status = String(data?.status || '').toLowerCase()
               set({
@@ -1194,6 +1197,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       const handleStreamEvent = (event: string, data: any) => {
           switch (event) {
+            case 'heartbeat':
+              break
+
             case 'run_status':
               if (data && typeof data === 'object' && typeof data.run_id === 'string') {
                 set({ currentBackgroundRunId: data.run_id })

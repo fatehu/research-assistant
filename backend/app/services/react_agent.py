@@ -145,6 +145,7 @@ class ParsedToolCall:
     name: str
     arguments: Dict[str, Any]
     arguments_raw: str = ""
+    arguments_error: Optional[str] = None
 
 
 @dataclass
@@ -265,9 +266,16 @@ class AgentCore:
     _PAPER_SKILL_SELF_WORK_TOOL_NAMES: set[str] = {
         "project_bash",
         "project_write_file",
+    }
+    _PAPER_SKILL_LEGACY_EXECUTION_TOOL_NAMES: set[str] = {
         "paper_research_write_execution_script",
         "paper_research_write_execution_spec",
         "paper_research_start_execution",
+        "paper_research_read_execution_spec",
+        "paper_research_read_execution",
+        "paper_research_tail_execution_log",
+        "paper_research_cancel_execution",
+        "paper_research_launch_claude_code",
     }
     _PROJECT_TOOL_NAMES: set[str] = {
         "project_tree",
@@ -298,7 +306,9 @@ class AgentCore:
         r"(没有|未|尚未|无法|不能|不确定).{0,24}(生成|导出|创建|产出|保存|完成|成功).{0,32}(docx|DOCX|Word|word|文档)",
         r"(生成|导出|创建|产出|保存).{0,16}(失败|未成功|没有成功|不成功).{0,32}(docx|DOCX|Word|word|文档)?",
     )
-    _PAPER_SKILL_HIDDEN_TOOL_NAMES: set[str] = set(_PAPER_SKILL_SELF_WORK_TOOL_NAMES)
+    _PAPER_SKILL_HIDDEN_TOOL_NAMES: set[str] = (
+        set(_PAPER_SKILL_SELF_WORK_TOOL_NAMES) | set(_PAPER_SKILL_LEGACY_EXECUTION_TOOL_NAMES)
+    )
     _PAPER_PREPARE_MARKERS = (
         "paper_research_prepare",
         "paper_research_status",
@@ -355,34 +365,6 @@ class AgentCore:
         "revise",
         "rewrite",
     )
-    _PAPER_EXECUTION_MARKERS = (
-        "execution",
-        "execution_spec",
-        "execution result",
-        "baseline_repro",
-        "data_prep",
-        "smoke_test",
-        "执行",
-        "运行",
-        "训练",
-        "复现",
-        "结果",
-        "日志",
-        "read_execution",
-        "start_execution",
-        "paper_research_read_execution",
-        "paper_research_start_execution",
-    )
-    _PAPER_READBACK_MARKERS = (
-        "读回",
-        "读取",
-        "read back",
-        "readback",
-        "确认",
-        "verify",
-        "校验",
-    )
-
     def __init__(
         self,
         llm_service: LLMService,
@@ -713,7 +695,7 @@ class AgentCore:
             detail=(
                 "复现执行必须交给 Claude Code。"
                 "如果 project_claude 联系失败，主 agent 应直接说明 Claude Code 不可用并建议稍后重试，"
-                "不能改用 project_bash、project_write_file 或 execution 脚本工具继续工作。"
+                "不能改用 project_bash、project_write_file 继续工作。"
             ),
             retryable=True,
             metadata={
@@ -743,8 +725,7 @@ class AgentCore:
             return (
                 "工具适用范围提示：`project_claude` 是 paper-reproduction 的唯一项目执行 worker。"
                 "它失败通常表示 Claude Code/runtime-worker 当前不可用或超时。"
-                "主 agent 不能改用 `project_bash`、`project_write_file`、"
-                "`paper_research_start_execution` 等工具自行下载数据、运行训练或修改代码；"
+                "主 agent 不能改用 `project_bash`、`project_write_file` 自行下载数据、运行训练或修改代码；"
                 "应向用户报告 Claude Code 不可用，并等待用户重试或修复 runtime-worker。"
             )
 
@@ -787,14 +768,6 @@ class AgentCore:
                 "`project_write_file` 只适用于写入一个已明确指定路径和完整内容的文件；"
                 "参数不完整或需要调试/迭代时，应先报告缺失信息，不要伪造工具调用。"
             ),
-            "paper_research_start_execution": (
-                "`paper_research_start_execution` 只适用于已有有效 execution spec 的托管执行；"
-                "不要用它替代 Claude Code 做开放式复现工作。"
-            ),
-            "paper_research_write_execution_spec": (
-                "`paper_research_write_execution_spec` 只适用于把已确定的入口、命令和产物写成 execution spec；"
-                "不是自由格式 shell wrapper。"
-            ),
         }
         return scope_reminders.get(normalized_tool_name, "")
 
@@ -819,11 +792,6 @@ class AgentCore:
     def _decision_action_for_tool(tool_name: str) -> Optional[str]:
         normalized = str(tool_name or "").strip()
         mapping = {
-            "paper_research_write_execution_spec": "write_execution_spec",
-            "paper_research_launch_claude_code": "start_execution",
-            "paper_research_write_execution_script": "write_execution_script",
-            "paper_research_start_execution": "start_execution",
-            "paper_research_read_execution": "observe_execution",
             "paper_research_search_project_zoekt": "search_repo",
             "paper_research_probe_repo": "probe_repo",
             "paper_research_probe_url": "probe_url",
@@ -2108,45 +2076,20 @@ class AgentCore:
 
         paper_payload = dict(result_data.get("paper") or {})
         project_payload = dict(result_data.get("project") or {})
-        workspace_payload = dict(result_data.get("workspace") or {})
         status_summary = dict(result_data.get("status_summary") or {})
-        background_execution = (
-            dict(result_data.get("background_execution") or {})
-            if isinstance(result_data.get("background_execution"), dict)
-            else {}
-        )
 
         binding: Dict[str, Any] = {
             "skill": cls._PAPER_SKILL_NAME,
             "paper_id": paper_payload.get("id"),
-            "project_id": project_payload.get("id") or result_data.get("project_id") or background_execution.get("project_id"),
-            "workspace_id": workspace_payload.get("id") or result_data.get("workspace_id"),
-            "notebook_id": workspace_payload.get("notebook_id") or result_data.get("notebook_id"),
+            "project_id": project_payload.get("id") or result_data.get("project_id"),
             "current_stage": (
                 status_summary.get("current_stage")
-                or background_execution.get("stage")
                 or result_data.get("current_stage")
             ),
             "current_draft_id": (
                 result_data.get("draft_id")
                 or result_data.get("run_id")
                 or result_data.get("label")
-            ),
-            "baseline_execution_id": (
-                status_summary.get("baseline_execution_id")
-                or (
-                    background_execution.get("execution_id")
-                    if str(background_execution.get("stage") or "").strip().lower() == "baseline_repro"
-                    else None
-                )
-            ),
-            "tuning_execution_id": (
-                status_summary.get("tuning_execution_id")
-                or (
-                    background_execution.get("execution_id")
-                    if str(background_execution.get("stage") or "").strip().lower() == "tuning"
-                    else None
-                )
             ),
             "updated_at": datetime.utcnow().isoformat(),
         }
@@ -2479,6 +2422,7 @@ class AgentCore:
 
         if workflow_binding:
             skill_name = cls._compact_debug_text(workflow_binding.get("skill") or "", 64)
+            is_paper_reproduction = skill_name == cls._PAPER_SKILL_NAME
             paper_id = workflow_binding.get("paper_id")
             project_id = workflow_binding.get("project_id")
             workspace_id = workflow_binding.get("workspace_id")
@@ -2494,19 +2438,19 @@ class AgentCore:
                 binding_parts.append(f"paper_id={paper_id}")
             if project_id is not None:
                 binding_parts.append(f"project_id={project_id}")
-            if workspace_id is not None:
+            if workspace_id is not None and not is_paper_reproduction:
                 binding_parts.append(f"workspace_id={workspace_id}")
             if binding_parts:
                 lines.append(f"- Workflow 绑定: {', '.join(binding_parts)}")
-            if notebook_id:
+            if notebook_id and not is_paper_reproduction:
                 lines.append(f"- Notebook 绑定: {notebook_id}")
             if current_stage:
                 lines.append(f"- 当前阶段绑定: {current_stage}")
             if current_draft_id:
                 lines.append(f"- 当前 draft 绑定: {current_draft_id}")
-            if baseline_execution_id:
+            if baseline_execution_id and not is_paper_reproduction:
                 lines.append(f"- baseline_execution_id: {baseline_execution_id}")
-            if tuning_execution_id:
+            if tuning_execution_id and not is_paper_reproduction:
                 lines.append(f"- tuning_execution_id: {tuning_execution_id}")
 
         if active_topic:
@@ -2911,68 +2855,65 @@ class AgentCore:
         return re.sub(r"\s+", " ", str(value or "")).strip()
 
     @staticmethod
-    async def _compress_text_with_qwen_turbo(
+    def _truncate_text_head_tail_to_token_budget(
         text: str,
         *,
-        target_token_budget: int,
-        source: str,
-        compression_kind: str,
+        token_budget: int,
+        marker: str,
+        head_ratio: float = 0.65,
     ) -> str:
-        normalized = AgentCore._normalize_compacted_text(text)
-        if not normalized:
+        raw = str(text or "")
+        if not raw:
             return ""
 
-        provider = str(getattr(settings, "agent_budget_compression_provider", "aliyun") or "aliyun").strip()
-        model_name = str(getattr(settings, "agent_budget_compression_model", "qwen-turbo") or "qwen-turbo").strip()
-        output_budget = max(min(int(getattr(settings, "agent_budget_compression_max_tokens", 420) or 420), 1200), 96)
-        output_budget = min(output_budget, max(int(target_token_budget or 0), 96))
-        timeout_seconds = max(
-            float(getattr(settings, "agent_budget_compression_timeout_seconds", 8.0) or 8.0),
-            0.1,
-        )
+        budget = max(int(token_budget or 0), 1)
+        if estimate_tokens(raw) <= budget:
+            return raw
 
-        current = normalized
-        for attempt in range(2):
-            try:
-                llm = LLMService(provider)
-                llm.config = dict(llm.config)
-                llm.config["model"] = model_name
-                response = await asyncio.wait_for(
-                    llm.chat(
-                        messages=[{"role": "user", "content": current}],
-                        system_prompt=(
-                            "你是上下文压缩器。"
-                            f"当前任务是压缩{compression_kind}。"
-                            "请保留任务目标、关键事实、路径、文件名、参数名、错误名、execution_id、tool 名称等可继续执行所必需的信息。"
-                            "删除寒暄、重复描述、冗余细节。"
-                            "不要使用 markdown，不要解释，不要加前言。"
-                            f"请尽量把结果压到约 {max(int(target_token_budget or 0), 96)} token 以内。"
-                        ),
-                        temperature=0.1,
-                        max_tokens=output_budget,
-                        source=source,
-                    ),
-                    timeout=timeout_seconds,
-                )
-                compressed = AgentCore._normalize_compacted_text(response.get("content", ""))
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"[AgentCore] qwen-turbo compression timed out source={source} timeout={timeout_seconds}"
-                )
-                compressed = ""
-            except Exception as exc:
-                logger.warning(f"[AgentCore] qwen-turbo compression failed source={source}: {exc}")
-                compressed = ""
+        marker_text = str(marker or "[truncated]").strip() or "[truncated]"
 
-            if not compressed:
-                break
-            current = compressed
-            if estimate_tokens(current) <= max(int(target_token_budget or 0), 0):
-                return current
+        if estimate_tokens(marker_text) > budget:
+            low, high = 1, len(marker_text)
+            best = marker_text[:1]
+            while low <= high:
+                mid = (low + high) // 2
+                candidate = marker_text[:mid]
+                if estimate_tokens(candidate) <= budget:
+                    best = candidate
+                    low = mid + 1
+                else:
+                    high = mid - 1
+            return best
 
-        if current and estimate_tokens(current) <= estimate_tokens(normalized):
-            return current
-        return f"[上下文压缩失败，请在需要时重新读取原始内容。kind={compression_kind}]"
+        ratio = min(max(float(head_ratio or 0.65), 0.2), 0.8)
+
+        def build_candidate(keep_chars: int) -> str:
+            keep_chars = max(min(int(keep_chars or 0), len(raw)), 0)
+            if keep_chars <= 0:
+                return marker_text
+            head_chars = min(len(raw), max(int(round(keep_chars * ratio)), 0))
+            tail_chars = min(max(keep_chars - head_chars, 0), max(len(raw) - head_chars, 0))
+            head = raw[:head_chars].rstrip()
+            tail = raw[-tail_chars:].lstrip() if tail_chars > 0 else ""
+            parts = []
+            if head:
+                parts.append(head)
+            parts.append(marker_text)
+            if tail:
+                parts.append(tail)
+            return "\n".join(parts)
+
+        low, high = 0, len(raw)
+        best = marker_text
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = build_candidate(mid)
+            if estimate_tokens(candidate) <= budget:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best
 
     @classmethod
     def _summarize_messages(cls, messages: Sequence[Dict[str, Any]], max_lines: int = 8) -> str:
@@ -3004,12 +2945,16 @@ class AgentCore:
         summary = cls._summarize_messages(messages, max_lines=max_lines).strip()
         if not summary:
             return None
-        if estimate_tokens(summary) > max(160, max_lines * 40):
-            summary = await cls._compress_text_with_qwen_turbo(
+        target_budget = max(160, max_lines * 40)
+        summary_tokens = estimate_tokens(summary)
+        if summary_tokens > target_budget:
+            summary = cls._truncate_text_head_tail_to_token_budget(
                 summary,
-                target_token_budget=max(160, max_lines * 40),
-                source="chat.budget.message_summary",
-                compression_kind="消息摘要",
+                token_budget=target_budget,
+                marker=(
+                    "[system-compression-summary-truncated "
+                    f"original_tokens~{summary_tokens} target_tokens~{target_budget}]"
+                ),
             )
         return {"role": "system", "content": f"{title}：\n{summary}"}
 
@@ -3046,19 +2991,16 @@ class AgentCore:
         if current_tokens <= max(int(token_budget or 0), 0):
             return text
 
-        marker = f"[system-compression-truncated role={role or 'unknown'} kind={kind or 'unknown'}]"
-        marker_tokens = estimate_tokens(marker)
-        target_budget = max(int(token_budget or 0), 96)
-        compressed_budget = max(target_budget - marker_tokens - 8, 48)
-        compressed = await AgentCore._compress_text_with_qwen_turbo(
-            text,
-            target_token_budget=compressed_budget,
-            source="chat.budget.message_truncation",
-            compression_kind=f"消息裁剪 role={role or 'unknown'} kind={kind or 'unknown'}",
+        target_budget = max(int(token_budget or 0), 1)
+        marker = (
+            f"[system-compression-truncated role={role or 'unknown'} "
+            f"kind={kind or 'unknown'} original_tokens~{current_tokens} target_tokens~{target_budget}]"
         )
-        if compressed:
-            return f"{marker}\n{compressed}"
-        return marker
+        return AgentCore._truncate_text_head_tail_to_token_budget(
+            text,
+            token_budget=target_budget,
+            marker=marker,
+        )
 
     @classmethod
     async def _apply_content_truncation_until_budget(
@@ -4782,6 +4724,10 @@ class AgentCore:
         canonical = store.canonical_history(
             fallback_boundary_message_id=fallback_boundary_message_id,
         )
+        source_fingerprint = AgentRuntimeService.build_item_stream_fingerprint(
+            item_stream_payload,
+            fallback_boundary_message_id=fallback_boundary_message_id,
+        )
         active_entries = [entry.__dict__ for entry in canonical.active_entries]
         payload_rows = [
             self._sanitize_message_for_context(item)
@@ -4823,6 +4769,7 @@ class AgentCore:
             "canonical_rows": canonical_rows,
             "tool_rows": tool_rows,
             "latest_message_id": latest_message_id,
+            "source_fingerprint": source_fingerprint,
             "conversation_item_stream_unavailable_error": ConversationItemStreamUnavailableError,
         }
 
@@ -4891,81 +4838,88 @@ class AgentCore:
         compacted_history: Dict[str, Any],
         artifacts: Any,
         latest_message_id: Optional[int],
+        source_fingerprint: Dict[str, Any],
         mode: str,
         history_event_title: str,
-    ) -> None:
+    ) -> bool:
         from app.services.conversation_context_compaction_service import ConversationItemStreamUnavailableError
 
         compacted_history = dict(compacted_history or {})
         compacted_history["mid_run"] = mode == "mid_run"
         compacted_history["mode"] = mode
+        compacted_history["source_fingerprint"] = dict(source_fingerprint or {})
         merged_context_state = self._merge_conversation_state_with_workflow_binding(
             context.conversation_state,
             artifacts.context_state,
         )
-        artifacts.context_state = dict(merged_context_state)
-        context.conversation_state = dict(merged_context_state)
-        await self.runtime_service.upsert_conversation_context_state(
-            int(conversation_id),
-            dict(merged_context_state),
+        context_state_payload = dict(merged_context_state)
+        history_detail = (
+            f"mode={mode}, "
+            f"iteration={int(context.iteration)}, "
+            f"compacted_messages={artifacts.compacted_message_count}, "
+            f"summary_chars={len(artifacts.summary_text or '')}, "
+            f"up_to_message_id={latest_message_id or 0}, "
+            f"source_entry_count={(source_fingerprint or {}).get('entry_count')}"
         )
-        await self.runtime_service.upsert_conversation_compacted_history(
+        boundary_entry = {
+            "kind": "compact_boundary",
+            "turn_id": context.turn_id,
+            "role": "system",
+            "run_id": context.run_id,
+            "iteration": context.iteration,
+            "content": artifacts.summary_text,
+            "summary": str(compacted_history.get("history_anchors") or "").strip() or None,
+            "status": mode,
+            "message_id": latest_message_id,
+            "metadata": {
+                "compact_boundary_message_id": compacted_history.get("compact_boundary_message_id"),
+                "replacement_history": list(compacted_history.get("replacement_history") or []),
+                "compacted_message_count": artifacts.compacted_message_count,
+                "keep_turn_id": context.turn_id,
+                "mode": mode,
+                "source_fingerprint": dict(source_fingerprint or {}),
+            },
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        commit_result = await self.runtime_service.commit_conversation_compaction_if_current(
             int(conversation_id),
-            compacted_history,
-        )
-        await self.runtime_service.append_conversation_history_event(
-            int(conversation_id),
-            title=history_event_title,
-            detail=(
-                f"mode={mode}, "
-                f"iteration={int(context.iteration)}, "
-                f"compacted_messages={artifacts.compacted_message_count}, "
-                f"summary_chars={len(artifacts.summary_text or '')}, "
-                f"up_to_message_id={latest_message_id or 0}"
-            ),
-        )
-        await self.runtime_service.append_conversation_context_snapshot(
-            int(conversation_id),
-            build_context_snapshot_payload(
+            source_fingerprint=dict(source_fingerprint or {}),
+            context_state=context_state_payload,
+            compacted_history=compacted_history,
+            compact_boundary_entry=boundary_entry,
+            history_event_title=history_event_title,
+            history_event_detail=history_detail,
+            context_snapshot=build_context_snapshot_payload(
                 mode=mode,
-                context_state=artifacts.context_state,
+                context_state=context_state_payload,
                 compacted_history=compacted_history,
                 summary_text=artifacts.summary_text,
                 compacted_message_count=artifacts.compacted_message_count,
                 up_to_message_id=latest_message_id,
             ),
+            stale_history_event_title=f"{mode}_compact_stale_skipped",
+            stale_history_event_detail=(
+                f"reason=stale_source, "
+                f"source_entry_count={(source_fingerprint or {}).get('entry_count')}"
+            ),
         )
-        await self.runtime_service.append_conversation_item_entries(
-            int(conversation_id),
-            [
-                {
-                    "kind": "compact_boundary",
-                    "turn_id": context.turn_id,
-                    "role": "system",
-                    "run_id": context.run_id,
-                    "iteration": context.iteration,
-                    "content": artifacts.summary_text,
-                    "summary": str(compacted_history.get("history_anchors") or "").strip() or None,
-                    "status": mode,
-                    "message_id": latest_message_id,
-                    "metadata": {
-                        "compact_boundary_message_id": compacted_history.get("compact_boundary_message_id"),
-                        "replacement_history": list(compacted_history.get("replacement_history") or []),
-                        "compacted_message_count": artifacts.compacted_message_count,
-                        "keep_turn_id": context.turn_id,
-                        "mode": mode,
-                    },
-                    "created_at": datetime.utcnow().isoformat(),
-                }
-            ],
-        )
+        if not bool(commit_result.get("committed")):
+            current_fingerprint = dict(commit_result.get("current_fingerprint") or {})
+            context.context_debug = {
+                **dict(context.context_debug or {}),
+                f"{mode}_compaction_skipped": "stale_source",
+                f"{mode}_compaction_source_fingerprint": dict(source_fingerprint or {}),
+                f"{mode}_compaction_current_fingerprint": current_fingerprint,
+            }
+            return False
 
         refreshed_item_stream = await self.runtime_service.get_conversation_item_stream(int(conversation_id))
         if not isinstance(refreshed_item_stream, dict):
             raise ConversationItemStreamUnavailableError(int(conversation_id))
 
+        artifacts.context_state = context_state_payload
         context.context_summary = artifacts.summary_text or context.context_summary
-        context.conversation_state = dict(artifacts.context_state or {})
+        context.conversation_state = dict(context_state_payload)
         context.compacted_history = compacted_history
         context.item_stream = refreshed_item_stream
         context.history_messages = self._active_history_messages_from_item_stream(
@@ -4983,6 +4937,7 @@ class AgentCore:
             "formal_compaction_mode": mode,
             "formal_compaction_applied": True,
         }
+        return True
 
     async def _maybe_pre_turn_compact(self, context: AgentContext) -> bool:
         if not bool(getattr(settings, "agent_context_budget_enabled", True)):
@@ -5058,26 +5013,35 @@ class AgentCore:
             }
             return False
 
-        pre_turn_payload_rows = inputs["canonical_rows"] or inputs["payload_rows"]
-        compacted_history, artifacts = await self._resolve_runtime_compaction_artifacts(
-            payload_rows=pre_turn_payload_rows,
-            canonical_rows=inputs["canonical_rows"],
-            tool_rows=inputs["tool_rows"],
-            latest_message_id=inputs["latest_message_id"],
-        )
-        if not compacted_history:
-            return False
+        from app.services.conversation_context_compaction_service import get_conversation_context_compaction_service
 
-        await self._persist_runtime_compaction(
-            context=context,
-            conversation_id=int(conversation_id),
-            compacted_history=compacted_history,
-            artifacts=artifacts,
-            latest_message_id=inputs["latest_message_id"],
-            mode="pre_turn",
-            history_event_title="pre_turn_compact",
+        trigger_parts: List[str] = []
+        if old_history_exists:
+            trigger_parts.append("old_history")
+        if pressure_triggered:
+            trigger_parts.append("token_pressure")
+        trigger = "+".join(trigger_parts) or "pre_turn"
+        enqueue_result = get_conversation_context_compaction_service().enqueue_task(
+            int(conversation_id),
+            task_kind="full_compaction",
+            mode="pre_turn_deferred",
+            trigger=trigger,
+            source="react_agent.pre_turn",
         )
-        return True
+        enqueue_reason = str(enqueue_result.get("reason") or "").strip() or "unknown"
+        deferred = bool(enqueue_result.get("queued")) or enqueue_reason == "duplicate"
+        context.context_debug = {
+            **dict(context.context_debug or {}),
+            "pre_turn_compaction_deferred": deferred,
+            "pre_turn_compaction_deferred_trigger": trigger,
+            "pre_turn_compaction_enqueue_reason": enqueue_reason,
+            "pre_turn_compaction_candidate_tokens": candidate_tokens,
+            "pre_turn_compaction_trigger_tokens": trigger_tokens,
+            "pre_turn_compaction_compactable_messages": len(compactable_rows),
+        }
+        if isinstance(enqueue_result.get("duplicate_state"), str):
+            context.context_debug["pre_turn_compaction_duplicate_state"] = enqueue_result.get("duplicate_state")
+        return False
 
     async def _maybe_mid_run_compact(self, context: AgentContext, system_prompt: str) -> bool:
         if not bool(getattr(settings, "agent_mid_run_compaction_enabled", True)):
@@ -5131,15 +5095,18 @@ class AgentCore:
         if not compacted_history:
             return False
 
-        await self._persist_runtime_compaction(
+        committed = await self._persist_runtime_compaction(
             context=context,
             conversation_id=int(conversation_id),
             compacted_history=compacted_history,
             artifacts=artifacts,
             latest_message_id=inputs["latest_message_id"],
+            source_fingerprint=inputs["source_fingerprint"],
             mode="mid_run",
             history_event_title="mid_run_compact",
         )
+        if not committed:
+            return False
         context.mid_run_compactions += 1
         return True
 
@@ -5165,18 +5132,30 @@ class AgentCore:
             name = str(raw.get("name") or "").strip()
             if not name:
                 continue
-            raw_args = str(raw.get("arguments") or "{}")
-            try:
-                parsed_args = json.loads(raw_args)
-                arguments = parsed_args if isinstance(parsed_args, dict) else {}
-            except Exception:
-                arguments = {}
+            arguments_error: Optional[str] = None
+            raw_arguments = raw.get("arguments")
+            if isinstance(raw_arguments, dict):
+                arguments = dict(raw_arguments)
+                raw_args = json.dumps(arguments, ensure_ascii=False)
+            else:
+                raw_args = str(raw_arguments or "{}")
+                try:
+                    parsed_args = json.loads(raw_args)
+                    if isinstance(parsed_args, dict):
+                        arguments = parsed_args
+                    else:
+                        arguments = {}
+                        arguments_error = "tool arguments must be a JSON object"
+                except json.JSONDecodeError as exc:
+                    arguments = {}
+                    arguments_error = f"{type(exc).__name__}: {exc}"
             out.append(
                 ParsedToolCall(
                     call_id=str(raw.get("id") or uuid.uuid4().hex),
                     name=name,
                     arguments=arguments,
                     arguments_raw=raw_args,
+                    arguments_error=arguments_error,
                 )
             )
         return out
@@ -5288,26 +5267,6 @@ class AgentCore:
         )
 
     @staticmethod
-    def _execution_spec_failure_requires_script(detail: str) -> bool:
-        normalized = str(detail or "").strip().lower()
-        if not normalized:
-            return False
-        script_tokens = (
-            "generated_python",
-            "generated_files",
-            "generated file",
-            "entrypoint_path",
-            "generated_program_name",
-            "relative_path",
-            "shell wrapper",
-            "raw command",
-            "raw cwd",
-            "execution_intent",
-            "outside workspace",
-        )
-        return any(token in normalized for token in script_tokens)
-
-    @staticmethod
     def _repo_read_failure_requires_search(detail: str) -> bool:
         normalized = str(detail or "").strip().lower()
         if not normalized:
@@ -5364,23 +5323,6 @@ class AgentCore:
             return None
 
         recent_detail = self._truncate_failure_text(stop_output or "工具 observation 连续失败。")
-        if stop_tool == "paper_research_write_execution_spec" and self._execution_spec_failure_requires_script(stop_output):
-            context.final_answer = (
-                "`paper_research_write_execution_spec` 已连续失败 "
-                f"{stop_count} 次，已停止自动重试。最近失败信息：{recent_detail}。"
-                "先检查当前入口到底是哪一类：如果是 Python repo 文件，用 "
-                "`execution_intent.entrypoint_type=\"repo_script\"`；"
-                "如果是可执行 shell 脚本（如 `classification-results.sh`），直接写 argv "
-                "如 `command=[\"./classification-results.sh\"]`；"
-                "只有在确实需要新 wrapper/辅助程序时，才调用 "
-                "`paper_research_write_execution_script` 写到 `executions/{execution_id}/...`，"
-                "再让 `paper_research_write_execution_spec` 引用它。"
-            )
-            context.state = AgentState.DONE
-            return (
-                "检测到 execution_spec 连续失败且问题集中在脚本/命令表达，"
-                "已收束到“先分清 Python 入口 / 可执行 shell 入口 / 新建 wrapper”这三种合法路径。"
-            )
         context.final_answer = (
             f"`{stop_tool}` 已连续失败 {stop_count} 次，已停止自动重试。"
             f"最近失败信息：{recent_detail}。建议先检查前置条件或调整指令后再继续。"
@@ -5561,8 +5503,6 @@ class AgentCore:
             "notebook_variables",
             "paper_research_status",
             "paper_research_search_project_zoekt",
-            "paper_research_read_execution",
-            "paper_research_read_execution_spec",
         }
         threshold = 3
         observations = [
@@ -5690,7 +5630,24 @@ class AgentCore:
         }:
             live_event_token = set_tool_live_event_emitter(self.runtime_context.live_event_callback)
         try:
-            if self._paper_skill_is_active_for_context(context) and call.name in self._PAPER_SKILL_SELF_WORK_TOOL_NAMES:
+            if call.arguments_error:
+                raw_arguments = self._compact_debug_text(call.arguments_raw, limit=600)
+                contract = build_tool_error_contract(
+                    code="invalid_tool_arguments",
+                    message="工具参数不是有效 JSON 对象",
+                    tool_name=call.name,
+                    stage="agent_parse_arguments",
+                    detail=str(call.arguments_error),
+                    retryable=True,
+                    metadata={"arguments_raw": raw_arguments},
+                )
+                result = ToolResult(
+                    success=False,
+                    output=f"{contract['message']}: {call.arguments_error}",
+                    error=str(contract["code"]),
+                    data=merge_error_contract({"arguments_raw": raw_arguments}, contract),
+                )
+            elif self._paper_skill_is_active_for_context(context) and call.name in self._PAPER_SKILL_SELF_WORK_TOOL_NAMES:
                 result = self._build_paper_skill_self_work_block_result(call.name)
             elif selected_tools and call.name not in selected_tools:
                 contract = build_tool_error_contract(
@@ -5880,10 +5837,316 @@ class AgentCore:
 
     @classmethod
     def _tool_ledger_summary(cls, value: str, *, fallback: str = "") -> str:
-        text = cls._truncate_failure_text(value, limit=320)
+        text = cls._truncate_ledger_text(value, limit=320)
         if text:
             return text
-        return cls._truncate_failure_text(fallback, limit=320)
+        return cls._truncate_ledger_text(fallback, limit=320)
+
+    @classmethod
+    def _truncate_ledger_text(cls, value: Any, *, limit: int) -> str:
+        text = cls._normalize_compacted_text(value)
+        if not text or limit <= 0:
+            return ""
+        if len(text) <= limit:
+            return text
+        if limit <= 3:
+            return text[:limit]
+        return text[: limit - 3].rstrip() + "..."
+
+    @classmethod
+    def _truncate_ledger_path_text(cls, value: Any, *, limit: int) -> str:
+        text = cls._normalize_compacted_text(value)
+        if not text or len(text) <= limit:
+            return text
+        if limit < 32:
+            return cls._truncate_ledger_text(text, limit=limit)
+        tail_budget = max(min(limit - 16, 72), 12)
+        prefix_budget = max(limit - tail_budget - 3, 8)
+        prefix = text[:prefix_budget].rstrip("/\\")
+        tail = text[-tail_budget:]
+        return f"{prefix}...{tail}"
+
+    @classmethod
+    def _tool_result_status_label(cls, item: ExecutedToolCall) -> str:
+        if item.permission_required:
+            return "需授权"
+        if item.success:
+            return "成功"
+        return "失败"
+
+    @classmethod
+    def _render_ledger_value(cls, value: Any, *, limit: int = 96) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, list):
+            rendered_items: List[str] = []
+            for entry in value[:8]:
+                if isinstance(entry, dict):
+                    candidate = ""
+                    for key in ("block_id", "relative_path", "path", "paper_key", "id", "title", "name"):
+                        raw = entry.get(key)
+                        if raw is not None and str(raw).strip():
+                            candidate = str(raw).strip()
+                            break
+                    if not candidate:
+                        candidate = json.dumps(entry, ensure_ascii=False, sort_keys=True)
+                elif isinstance(entry, bool):
+                    candidate = "true" if entry else "false"
+                else:
+                    candidate = str(entry or "").strip()
+                if candidate:
+                    rendered_items.append(candidate)
+            text = ",".join(rendered_items)
+            return cls._truncate_ledger_text(text, limit=limit)
+        if isinstance(value, dict):
+            try:
+                text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                text = str(value)
+            return cls._truncate_ledger_text(text, limit=limit)
+        if isinstance(value, str) and ("/" in value or "\\" in value):
+            return cls._truncate_ledger_path_text(value, limit=limit)
+        return cls._truncate_ledger_text(value, limit=limit)
+
+    @classmethod
+    def _nested_tool_result_value(cls, payload: Dict[str, Any], path: str) -> Any:
+        current: Any = payload
+        for segment in str(path or "").split("."):
+            if not segment:
+                continue
+            if not isinstance(current, dict):
+                return None
+            current = current.get(segment)
+        return current
+
+    @classmethod
+    def _first_tool_result_value(
+        cls,
+        payloads: Sequence[Dict[str, Any]],
+        paths: Sequence[str],
+    ) -> Any:
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            for path in paths:
+                value = cls._nested_tool_result_value(payload, path)
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                if isinstance(value, (list, dict)) and not value:
+                    continue
+                return value
+        return None
+
+    @classmethod
+    def _append_tool_result_anchor_part(
+        cls,
+        parts: List[str],
+        seen_labels: set[str],
+        label: str,
+        value: Any,
+        *,
+        limit: int = 96,
+    ) -> None:
+        if label in seen_labels:
+            return
+        rendered = cls._render_ledger_value(value, limit=limit)
+        if not rendered:
+            return
+        parts.append(f"{label}={rendered}")
+        seen_labels.add(label)
+
+    @classmethod
+    def _tool_result_skill_anchor_parts(
+        cls,
+        item: ExecutedToolCall,
+        *,
+        payloads: Sequence[Dict[str, Any]],
+        seen_labels: set[str],
+    ) -> List[str]:
+        tool_name = str(item.tool_name or "").strip()
+        parts: List[str] = []
+
+        def add(label: str, paths: Sequence[str], *, limit: int = 96) -> None:
+            cls._append_tool_result_anchor_part(
+                parts,
+                seen_labels,
+                label,
+                cls._first_tool_result_value(payloads, paths),
+                limit=limit,
+            )
+
+        if (
+            tool_name.startswith("paper_research_")
+            or tool_name.startswith("project_")
+            or tool_name == "project_claude"
+        ):
+            add("paper_id", ("paper_id", "paper.id", "paper.paper_id", "status_summary.paper_id"))
+            add("project_id", ("project_id", "project.id", "project.project_id", "status_summary.project_id"))
+            add("current_stage", ("current_stage", "status_summary.current_stage", "workflow.current_stage", "stage"))
+            add("reference_ready", ("reference_ready", "reference_builder.reference_ready", "status_summary.reference_ready"))
+            add("session_id", ("session_id",))
+            add("exit_code", ("exit_code",))
+            add("is_error", ("is_error",))
+
+        if tool_name.startswith("literature_review_") or tool_name == "review_writer":
+            add("literature_review_id", ("literature_review_id",))
+            add("paper_key", ("paper_key",))
+            add("md_path", ("md_path",), limit=96)
+            add("review_path", ("review_path",), limit=96)
+            add("final_review_path", ("final_review_path",), limit=96)
+            add("review_paths", ("review_files",), limit=160)
+            add("report_path", ("report_path",), limit=96)
+            add("pdf_path", ("pdf_path",), limit=96)
+            add("review_dir", ("review_dir",), limit=96)
+            add("page_count", ("page_count", "report.page_count"))
+            add("character_count", ("character_count", "markdown_chars", "review_chars"))
+            add("review_count", ("review_count",))
+            add("target_paper_count", ("target_paper_count",))
+
+        if tool_name.startswith("document_artifact_"):
+            add("artifact_id", ("artifact_id", "artifact.artifact_id"))
+            add("block_id", ("block_id", "block.block_id"))
+            add("block_ids", ("block_ids", "blocks", "updated_blocks", "updates"), limit=160)
+            add("block_count", ("block_count", "artifact.block_count"))
+            add("block_status", ("status", "block.status"))
+            add("workflow_hint", ("workflow_hint",), limit=120)
+
+        return parts
+
+    @classmethod
+    def _tool_result_anchor_parts(cls, item: ExecutedToolCall) -> List[str]:
+        result_data = dict(item.result_data or {}) if isinstance(item.result_data, dict) else {}
+        metadata = dict(item.metadata or {}) if isinstance(item.metadata, dict) else {}
+        arguments = dict(item.arguments or {}) if isinstance(item.arguments, dict) else {}
+        payloads: Sequence[Dict[str, Any]] = (result_data, metadata, arguments)
+        parts: List[str] = []
+        seen_labels: set[str] = set()
+
+        cls._append_tool_result_anchor_part(parts, seen_labels, "tool", item.tool_name, limit=120)
+        cls._append_tool_result_anchor_part(parts, seen_labels, "status", cls._tool_result_status_label(item), limit=32)
+        parts.extend(cls._tool_result_skill_anchor_parts(item, payloads=payloads, seen_labels=seen_labels))
+
+        for label, paths, limit in (
+            ("relative_path", ("relative_path",), 120),
+            ("repo_relative_path", ("repo_relative_path",), 120),
+            ("path", ("path", "file_path"), 120),
+            ("line_number", ("line_number",), 32),
+            ("line_start", ("line_start",), 32),
+            ("line_end", ("line_end",), 32),
+            ("page", ("page",), 32),
+            ("total_pages", ("total_pages",), 32),
+            ("chunk_index", ("chunk_index",), 32),
+            ("total_chunks", ("total_chunks",), 32),
+            ("content_type", ("content_type",), 64),
+            ("mode", ("mode",), 64),
+            ("result_count", ("result_count",), 32),
+        ):
+            cls._append_tool_result_anchor_part(
+                parts,
+                seen_labels,
+                label,
+                cls._first_tool_result_value(payloads, paths),
+                limit=limit,
+            )
+
+        source_labels = [
+            str(label).strip()
+            for label in list(metadata.get("source_labels") or [])
+            if str(label or "").strip()
+        ]
+        cls._append_tool_result_anchor_part(parts, seen_labels, "source_labels", source_labels[:6], limit=120)
+
+        if item.error:
+            cls._append_tool_result_anchor_part(parts, seen_labels, "error", item.error, limit=120)
+        elif not item.success:
+            cls._append_tool_result_anchor_part(
+                parts,
+                seen_labels,
+                "error",
+                cls._first_tool_result_value(payloads, ("error", "error_code")),
+                limit=120,
+            )
+        if item.permission_required:
+            cls._append_tool_result_anchor_part(parts, seen_labels, "permission_required", True, limit=16)
+        cls._append_tool_result_anchor_part(parts, seen_labels, "success", bool(item.success), limit=16)
+        if item.truncated:
+            cls._append_tool_result_anchor_part(parts, seen_labels, "truncated", True, limit=16)
+        if item.output_tokens_estimate:
+            cls._append_tool_result_anchor_part(parts, seen_labels, "output_tokens_estimate", item.output_tokens_estimate, limit=32)
+        if item.execution_time_ms:
+            execution_time = round(float(item.execution_time_ms), 2)
+            cls._append_tool_result_anchor_part(parts, seen_labels, "execution_time_ms", execution_time, limit=32)
+
+        return parts
+
+    @classmethod
+    def _tool_result_preview_for_ledger(cls, item: ExecutedToolCall, *, limit: int = 260) -> str:
+        if item.permission_required:
+            candidate = item.observation_output or item.error or f"{item.tool_name} 需要授权。"
+        elif not item.success:
+            candidate = item.observation_output or item.error
+        else:
+            candidate = item.observation_output
+        return cls._truncate_ledger_text(candidate, limit=limit)
+
+    @classmethod
+    def _split_tool_ledger_anchor_parts(
+        cls,
+        parts: Sequence[str],
+        *,
+        first_line_limit: int = 220,
+    ) -> tuple[List[str], List[str]]:
+        header_parts: List[str] = []
+        overflow_parts: List[str] = []
+        for part in [str(item or "").strip() for item in list(parts or []) if str(item or "").strip()]:
+            candidate = " | ".join([*header_parts, part])
+            if not header_parts or len(candidate) <= first_line_limit:
+                header_parts.append(part)
+            else:
+                overflow_parts.append(part)
+        if not header_parts and overflow_parts:
+            header_parts.append(cls._truncate_ledger_text(overflow_parts.pop(0), limit=first_line_limit))
+        return header_parts, overflow_parts
+
+    @classmethod
+    def _join_tool_ledger_summary(
+        cls,
+        anchor_parts: Sequence[str],
+        *,
+        detail: str = "",
+        preview: str = "",
+        limit: int = 900,
+        first_line_limit: int = 220,
+    ) -> str:
+        header_parts, overflow_parts = cls._split_tool_ledger_anchor_parts(
+            anchor_parts,
+            first_line_limit=first_line_limit,
+        )
+        lines: List[str] = [" | ".join(header_parts)] if header_parts else []
+        if overflow_parts:
+            lines.append("More: " + cls._truncate_ledger_text(" | ".join(overflow_parts), limit=360))
+        detail_text = str(detail or "").strip()
+        if detail_text:
+            if len(detail_text) > 640:
+                detail_text = detail_text[:637].rstrip() + "..."
+            lines.append("Detail:\n" + detail_text)
+        preview_text = cls._truncate_ledger_text(preview, limit=260)
+        if preview_text:
+            lines.append("Preview:\n" + preview_text)
+        summary = "\n".join(line for line in lines if str(line or "").strip()).strip()
+        if not summary:
+            return ""
+        if len(summary) <= limit:
+            return summary
+        if limit <= 3:
+            return summary[:limit]
+        return summary[: limit - 3].rstrip() + "..."
 
     def _paper_skill_active_for_context(
         self,
@@ -5927,17 +6190,6 @@ class AgentCore:
                 refs.append(f"{relative_path}:{result_data.get('line_number')}")
             else:
                 refs.append(relative_path)
-        execution_id = str(result_data.get("execution_id") or "").strip()
-        if execution_id:
-            refs.append(f"execution:{execution_id}")
-        background_execution = (
-            dict(result_data.get("background_execution") or {})
-            if isinstance(result_data.get("background_execution"), dict)
-            else {}
-        )
-        background_execution_id = str(background_execution.get("execution_id") or "").strip()
-        if background_execution_id:
-            refs.append(f"background:{background_execution_id}")
         return list(dict.fromkeys(refs))
 
     @classmethod
@@ -5951,33 +6203,6 @@ class AgentCore:
             query = cls._compact_debug_text(result_data.get("query") or item.arguments.get("query") or "", 72)
             if query:
                 return f"{status} · Project Zoekt 搜索 `{query}` · 命中 {returned_matches} 处 / {matched_files} 个文件"
-        if tool_name == "paper_research_read_execution":
-            execution_id = str(result_data.get("execution_id") or "").strip()
-            execution_status = str(result_data.get("status") or "").strip()
-            if execution_id or execution_status:
-                return f"{status} · execution={execution_id or '-'} · status={execution_status or '-'}"
-        if tool_name == "paper_research_start_execution":
-            background_execution = (
-                dict(result_data.get("background_execution") or {})
-                if isinstance(result_data.get("background_execution"), dict)
-                else {}
-            )
-            execution_id = str(
-                background_execution.get("execution_id")
-                or result_data.get("execution_id")
-                or ""
-            ).strip()
-            stage = str(background_execution.get("stage") or "").strip()
-            if execution_id:
-                suffix = f" · stage={stage}" if stage else ""
-                return f"{status} · 已启动 execution `{execution_id}`{suffix}"
-        if tool_name in {
-            "paper_research_write_execution_spec",
-            "paper_research_write_execution_script",
-        }:
-            ref = next(iter(cls._tool_workflow_refs(item)), "")
-            if ref:
-                return f"{status} · 已更新 `{ref}`"
         detail = cls._truncate_failure_text(item.error or item.observation_output or "", limit=140)
         if detail:
             return f"{status} · {detail}"
@@ -6003,6 +6228,7 @@ class AgentCore:
             "paper_research_inspect_runtime",
         }
         planning_context = current_stage == "planning" or any(name in planning_tool_names for name in tool_names)
+        legacy_execution_seen = any(name in cls._PAPER_SKILL_LEGACY_EXECUTION_TOOL_NAMES for name in tool_names)
 
         if permission_rows:
             return (
@@ -6017,31 +6243,8 @@ class AgentCore:
         if failed_rows:
             next_action = "report_blocker" if paper_skill_active else "inspect_failure"
             blocked_reason = "tool_failed"
-            if last_tool == "paper_research_write_execution_spec":
-                last_failure = failed_rows[-1]
-                failure_detail = str(
-                    last_failure.observation_output or last_failure.error or ""
-                )
-                if cls._execution_spec_failure_requires_script(failure_detail):
-                    return (
-                        "execution_spec 连续卡在脚本/命令表达；先区分当前入口是 Python repo 文件、可执行 shell 脚本，还是确实需要新 wrapper，再按对应合法形态重写 execution_spec。",
-                        {
-                            "status": "blocked",
-                            "evidence_status": "sufficient",
-                            "next_action": "inspect_execution_spec",
-                            "blocked_reason": "execution_contract_invalid",
-                            "allowed_actions": ["inspect_execution_spec", "write_execution_script"],
-                        },
-                    )
-                next_action = "inspect_execution_spec"
-                blocked_reason = "execution_contract_invalid"
-            elif last_tool == "paper_research_start_execution":
-                last_failure = failed_rows[-1]
-                failure_detail = str(
-                    last_failure.observation_output or last_failure.error or ""
-                )
-                next_action = "inspect_execution_spec"
-                blocked_reason = "execution_contract_invalid"
+            if last_tool in cls._PAPER_SKILL_LEGACY_EXECUTION_TOOL_NAMES:
+                blocked_reason = "legacy_execution_route"
             return (
                 "基于失败 observation 收束原因，不要继续重复同类读搜。",
                 {
@@ -6051,48 +6254,15 @@ class AgentCore:
                     "blocked_reason": blocked_reason,
                 },
             )
-        if last_tool in {"paper_research_start_execution", "paper_research_launch_claude_code"}:
+        if legacy_execution_seen:
             return (
-                "等待 execution 运行，并调用 `paper_research_read_execution` 观察状态。",
+                "旧 execution/workspace 路线不是当前 paper-reproduction 主路径；不要继续沿该路径启动或观察任务。",
                 {
-                    "status": "waiting",
+                    "status": "blocked" if paper_skill_active else "active",
                     "evidence_status": "sufficient",
-                    "next_action": "observe_execution",
-                    "allowed_actions": ["observe_execution"],
-                },
-            )
-        if last_tool == "paper_research_read_execution":
-            last_row = rows[-1] if rows else None
-            result_data = dict(last_row.result_data or {}) if isinstance(last_row, ExecutedToolCall) else {}
-            execution_status = str(result_data.get("status") or "").strip().lower()
-            if execution_status in {"running", "pending"}:
-                return (
-                    "继续观察 execution 状态，等待下一次稳定结果。",
-                    {
-                        "status": "waiting",
-                        "evidence_status": "sufficient",
-                        "next_action": "observe_execution",
-                        "allowed_actions": ["observe_execution"],
-                    },
-                )
-            if execution_status in {"failed", "error"}:
-                return (
-                    "收束失败原因；若当前 skill 不允许改 repo/source，则直接报告 blocker。",
-                    {
-                        "status": "blocked",
-                        "evidence_status": "sufficient",
-                        "next_action": "report_blocker" if paper_skill_active else "inspect_failure",
-                        "blocked_reason": "execution_failed",
-                    },
-                )
-        if last_tool == "paper_research_write_execution_spec":
-            return (
-                "execution_spec 已准备，可启动 execution；如果你决定把 repo 执行交给 Claude Code，也可以直接切到 `paper_research_launch_claude_code`。",
-                {
-                    "status": "ready",
-                    "evidence_status": "sufficient",
-                    "next_action": "start_execution",
-                    "allowed_actions": ["start_execution", "launch_claude_code"],
+                    "next_action": "report_blocker" if paper_skill_active else "synthesize",
+                    "blocked_reason": "legacy_execution_route" if paper_skill_active else "",
+                    "allowed_actions": ["report_blocker", "synthesize"] if paper_skill_active else ["synthesize"],
                 },
             )
         if planning_context and last_tool in {
@@ -6181,10 +6351,6 @@ class AgentCore:
             summary_status = "waiting"
         elif failed_rows:
             summary_status = "blocked"
-        elif any(name in {"paper_research_start_execution", "paper_research_launch_claude_code"} for name in unique_tool_names):
-            summary_status = "progressed"
-        elif any(name.startswith("paper_research_write_") for name in unique_tool_names):
-            summary_status = "ready"
 
         highlights = [
             item
@@ -6227,68 +6393,16 @@ class AgentCore:
 
     @classmethod
     async def _tool_result_ledger_summary_text(cls, item: ExecutedToolCall) -> str:
-        result_data = dict(item.result_data or {}) if isinstance(item.result_data, dict) else {}
-        metadata = dict(item.metadata or {}) if isinstance(item.metadata, dict) else {}
-        status = (
-            "需授权"
-            if item.permission_required
-            else "成功"
-            if item.success
-            else "失败"
+        anchor_parts = cls._tool_result_anchor_parts(item)
+        has_structured_detail = cls._tool_result_has_structured_debug_detail(item)
+        detail = cls._tool_result_detail_for_ledger(item) if has_structured_detail else ""
+        preview = cls._tool_result_preview_for_ledger(item)
+        return cls._join_tool_ledger_summary(
+            anchor_parts,
+            detail=detail,
+            preview=preview,
+            limit=1200 if has_structured_detail else 900,
         )
-
-        parts: List[str] = [f"tool={item.tool_name}", f"status={status}"]
-        for key in ("relative_path", "repo_relative_path", "execution_id", "content_type", "mode"):
-            value = result_data.get(key)
-            if value is not None and str(value).strip():
-                parts.append(f"{key}={str(value).strip()}")
-        for key in ("line_start", "line_end", "page", "total_pages", "chunk_index", "total_chunks"):
-            value = result_data.get(key)
-            if value is not None:
-                parts.append(f"{key}={value}")
-
-        background_execution = (
-            dict(result_data.get("background_execution") or {})
-            if isinstance(result_data.get("background_execution"), dict)
-            else {}
-        )
-        if background_execution:
-            for key in ("execution_id", "stage", "status"):
-                value = background_execution.get(key)
-                if value is not None and str(value).strip():
-                    parts.append(f"background_{key}={str(value).strip()}")
-
-        source_labels = [
-            str(label).strip()
-            for label in list(metadata.get("source_labels") or [])
-            if str(label or "").strip()
-        ]
-        if source_labels:
-            parts.append(f"source_labels={','.join(source_labels[:6])}")
-        if metadata.get("result_count") is not None:
-            parts.append(f"result_count={metadata.get('result_count')}")
-
-        detail = cls._tool_result_detail_for_ledger(item)
-        if detail:
-            if len(detail) > 1600:
-                detail = detail[:1600].rstrip()
-            raw_summary = f"{' | '.join(parts)}\nDetail:\n{detail}"
-        else:
-            raw_summary = " | ".join(parts)
-
-        if cls._tool_result_has_structured_debug_detail(item):
-            return cls._normalize_compacted_text(raw_summary)
-
-        compressed = await cls._compress_text_with_qwen_turbo(
-            raw_summary,
-            target_token_budget=120,
-            source="chat.tool_result_ledger_summary",
-            compression_kind="单次工具结果摘要",
-        )
-        compressed = cls._normalize_compacted_text(compressed)
-        if compressed:
-            return compressed
-        return cls._normalize_compacted_text(" | ".join(parts))
 
     @classmethod
     def _tool_result_has_structured_debug_detail(cls, item: ExecutedToolCall) -> bool:
@@ -7108,6 +7222,7 @@ class AgentCore:
         except (RuntimeError, TypeError, ValueError) as exc:
             logger.warning(f"[AgentCore] pre-turn compact skipped: {exc}")
             pre_turn_compacted = False
+        pre_turn_deferred = bool((context.context_debug or {}).get("pre_turn_compaction_deferred"))
         if pre_turn_compacted:
             prepared_system_prompt = ""
             prepared_llm_messages = []
@@ -7128,6 +7243,14 @@ class AgentCore:
                     thought_event = {
                         "type": "thought",
                         "data": "发送前已压缩较早上下文，并基于替代历史继续当前任务。",
+                    }
+                    self._append_step_from_event(context, thought_event)
+                    context.persist_events.append(thought_event)
+                    yield thought_event
+                elif i == 1 and pre_turn_deferred:
+                    thought_event = {
+                        "type": "thought",
+                        "data": "已将较早上下文压缩交给后台维护，当前任务继续使用现有上下文。",
                     }
                     self._append_step_from_event(context, thought_event)
                     context.persist_events.append(thought_event)
@@ -7227,8 +7350,12 @@ class AgentCore:
                                 answer_emitted = True
                             yield event
                     except Exception as exc:
-                        logger.warning(f"[AgentCore] function-calling failed, fallback={exc}")
-                        if bool(getattr(settings, "agent_function_calling_fallback_xml", True)):
+                        xml_fallback_enabled = bool(getattr(settings, "agent_function_calling_fallback_xml", False))
+                        logger.warning(
+                            f"[AgentCore] function-calling failed, "
+                            f"xml_fallback_enabled={xml_fallback_enabled}: {exc}"
+                        )
+                        if xml_fallback_enabled:
                             events, done = await self._run_iteration_xml(context, llm_messages, system_prompt)
                             emit_events_after_call = True
                         else:

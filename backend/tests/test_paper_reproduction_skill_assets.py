@@ -71,3 +71,28 @@ def test_paper_reproduction_skill_assets_are_consistent():
 
     for relative_path in actual_scripts | actual_references | actual_templates | {declared_interface_metadata}:
         assert (skill_root / relative_path).exists(), f"missing skill asset: {relative_path}"
+
+
+def test_paper_reproduction_skill_assets_do_not_reference_retired_notebook_or_execution_route():
+    skill_root = _paper_reproduction_skill_root()
+    checked_files = [
+        skill_root / "SKILL.md",
+        skill_root / "skill.yaml",
+        skill_root / "agents" / "openai.yaml",
+        skill_root / "scripts" / "render_stage_prompt.py",
+    ]
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in checked_files)
+
+    retired_terms = [
+        "codelab",
+        "notebook",
+        "workspace",
+        "paper_research_write_execution",
+        "paper_research_start_execution",
+        "paper_research_read_execution",
+        "paper_research_launch_claude_code",
+        "execution_spec",
+    ]
+
+    for term in retired_terms:
+        assert term not in combined, f"retired paper-reproduction route leaked into skill assets: {term}"

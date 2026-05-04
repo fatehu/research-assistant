@@ -33,6 +33,26 @@ class ConversationCompactionArtifacts:
     compacted_message_count: int
 
 
+@dataclass(frozen=True)
+class ConversationCompactionTask:
+    conversation_id: int
+    task_kind: str = "full_compaction"
+    mode: str = "auto"
+    trigger: str = "run_completed"
+    source: str = "conversation_context_compaction"
+    requested_at: str = ""
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "conversation_id": int(self.conversation_id),
+            "task_kind": str(self.task_kind or "full_compaction"),
+            "mode": str(self.mode or "auto"),
+            "trigger": str(self.trigger or "run_completed"),
+            "source": str(self.source or "conversation_context_compaction"),
+            "requested_at": str(self.requested_at or ""),
+        }
+
+
 class ConversationItemStreamUnavailableError(RuntimeError):
     def __init__(self, conversation_id: int):
         self.conversation_id = int(conversation_id)
@@ -41,8 +61,9 @@ class ConversationItemStreamUnavailableError(RuntimeError):
 
 class ConversationContextCompactionService:
     def __init__(self) -> None:
-        self._queue: asyncio.Queue[int] = asyncio.Queue()
-        self._queued_ids: set[int] = set()
+        self._queue: asyncio.Queue[ConversationCompactionTask] = asyncio.Queue()
+        self._queued_keys: set[tuple[int, str]] = set()
+        self._running_keys: set[tuple[int, str]] = set()
         self._worker_task: Optional[asyncio.Task] = None
         self._runtime_service: AgentRuntimeService = get_agent_runtime_service()
 
@@ -919,6 +940,7 @@ class ConversationContextCompactionService:
             )
             payload_rows = item_stream.canonical_replay_rows()
             tool_rows = self._item_stream_to_tool_rows([entry.__dict__ for entry in canonical.active_entries])
+            source_fingerprint = AgentRuntimeService.build_item_stream_fingerprint(item_stream_payload)
         current_compacted_history_payload = await self._runtime_service.get_conversation_compacted_history(int(conversation_id))
         current_compacted_history = (
             dict(current_compacted_history_payload)
@@ -964,53 +986,80 @@ class ConversationContextCompactionService:
             )
             if state_payload:
                 state_payload["updated_at"] = state_payload.get("updated_at") or ""
-                await self._runtime_service.upsert_conversation_context_state(conversation_id, state_payload)
                 artifacts.context_state = dict(state_payload)
-        if artifacts.compacted_history:
-            await self._runtime_service.upsert_conversation_compacted_history(
-                conversation_id,
-                dict(artifacts.compacted_history),
-            )
 
-        await self._runtime_service.append_conversation_history_event(
-            int(conversation_id),
-            title=f"{mode}_compact",
-            detail=(
-                f"compacted_messages={artifacts.compacted_message_count}, "
-                f"summary_chars={len(artifacts.summary_text or '')}, "
-                f"up_to_message_id={latest_message_id or 0}"
-            ),
+        compacted_history = dict(artifacts.compacted_history or {})
+        if compacted_history:
+            compacted_history["source_fingerprint"] = dict(source_fingerprint)
+            artifacts.compacted_history = compacted_history
+
+        history_detail = (
+            f"compacted_messages={artifacts.compacted_message_count}, "
+            f"summary_chars={len(artifacts.summary_text or '')}, "
+            f"up_to_message_id={latest_message_id or 0}, "
+            f"source_entry_count={source_fingerprint.get('entry_count')}"
         )
-        await self._runtime_service.append_conversation_context_snapshot(
+        boundary_entry = None
+        if compacted_history:
+            boundary_entry = {
+                "kind": "compact_boundary",
+                "role": "system",
+                "content": artifacts.summary_text,
+                "summary": str(compacted_history.get("history_anchors") or "").strip() or None,
+                "status": mode,
+                "message_id": latest_message_id,
+                "metadata": {
+                    "compact_boundary_message_id": compacted_history.get("compact_boundary_message_id"),
+                    "replacement_history": list(compacted_history.get("replacement_history") or []),
+                    "compacted_message_count": artifacts.compacted_message_count,
+                    "source_fingerprint": dict(source_fingerprint),
+                },
+                "created_at": datetime.utcnow().isoformat(),
+            }
+        commit_result = await self._runtime_service.commit_conversation_compaction_if_current(
             int(conversation_id),
-            build_context_snapshot_payload(
+            source_fingerprint=source_fingerprint,
+            context_state=dict(artifacts.context_state or {}),
+            compacted_history=compacted_history,
+            compact_boundary_entry=boundary_entry,
+            history_event_title=f"{mode}_compact",
+            history_event_detail=history_detail,
+            context_snapshot=build_context_snapshot_payload(
                 mode=mode,
                 context_state=artifacts.context_state,
-                compacted_history=artifacts.compacted_history,
+                compacted_history=compacted_history,
                 summary_text=artifacts.summary_text,
                 compacted_message_count=artifacts.compacted_message_count,
                 up_to_message_id=latest_message_id,
             ),
+            stale_history_event_title=f"{mode}_compact_stale_skipped",
+            stale_history_event_detail=(
+                f"reason=stale_source, "
+                f"source_entry_count={source_fingerprint.get('entry_count')}"
+            ),
         )
-        if artifacts.compacted_history:
-            await self._runtime_service.append_conversation_item_entries(
-                int(conversation_id),
-                [
-                    {
-                        "kind": "compact_boundary",
-                        "role": "system",
-                        "content": artifacts.summary_text,
-                        "summary": str(artifacts.compacted_history.get("history_anchors") or "").strip() or None,
-                        "status": mode,
-                        "message_id": latest_message_id,
-                        "metadata": {
-                            "compact_boundary_message_id": artifacts.compacted_history.get("compact_boundary_message_id"),
-                            "replacement_history": list(artifacts.compacted_history.get("replacement_history") or []),
-                            "compacted_message_count": artifacts.compacted_message_count,
-                        },
-                        "created_at": datetime.utcnow().isoformat(),
-                    }
-                ],
+        if not bool(commit_result.get("committed")):
+            current_fingerprint = dict(commit_result.get("current_fingerprint") or {})
+            latest_context_state = dict(await self._runtime_service.get_conversation_context_state(int(conversation_id)) or {})
+            latest_compacted_history = dict(await self._runtime_service.get_conversation_compacted_history(int(conversation_id)) or {})
+            latest_boundary_message_id = self._coerce_int(
+                latest_compacted_history.get("compact_boundary_message_id")
+                or latest_compacted_history.get("up_to_message_id")
+            )
+            logger.info(
+                "[ConversationCompaction] stale skip conversation_id={} mode={} source_entry_count={} current_entry_count={}",
+                conversation_id,
+                mode,
+                source_fingerprint.get("entry_count"),
+                current_fingerprint.get("entry_count"),
+            )
+            return ConversationCompactionArtifacts(
+                context_state=latest_context_state,
+                compacted_history=latest_compacted_history,
+                summary_text=str(latest_compacted_history.get("history_summary") or "").strip(),
+                up_to_message_id=latest_boundary_message_id,
+                message_count=len(payload_rows),
+                compacted_message_count=0,
             )
 
         logger.info(
@@ -1030,22 +1079,118 @@ class ConversationContextCompactionService:
             raise ValueError(f"conversation not found: {conversation_id}")
         return artifacts
 
+    @staticmethod
+    def _task_key(task: ConversationCompactionTask) -> tuple[int, str]:
+        return (int(task.conversation_id), str(task.task_kind or "full_compaction"))
+
+    @staticmethod
+    def _build_task(
+        conversation_id: Optional[int],
+        *,
+        task_kind: str = "full_compaction",
+        mode: str = "auto",
+        trigger: str = "run_completed",
+        source: str = "conversation_context_compaction",
+    ) -> Optional[ConversationCompactionTask]:
+        if not conversation_id:
+            return None
+        normalized_task_kind = str(task_kind or "full_compaction").strip() or "full_compaction"
+        if normalized_task_kind != "full_compaction":
+            raise ValueError(f"unsupported conversation compaction task kind: {normalized_task_kind}")
+        return ConversationCompactionTask(
+            conversation_id=int(conversation_id),
+            task_kind=normalized_task_kind,
+            mode=str(mode or "auto").strip() or "auto",
+            trigger=str(trigger or "run_completed").strip() or "run_completed",
+            source=str(source or "conversation_context_compaction").strip() or "conversation_context_compaction",
+            requested_at=datetime.utcnow().isoformat(),
+        )
+
+    def enqueue_task(
+        self,
+        conversation_id: Optional[int],
+        *,
+        task_kind: str = "full_compaction",
+        mode: str = "auto",
+        trigger: str = "run_completed",
+        source: str = "conversation_context_compaction",
+    ) -> Dict[str, Any]:
+        if not bool(getattr(settings, "conversation_context_compaction_enabled", True)):
+            return {"queued": False, "reason": "disabled", "enabled": False}
+        task = self._build_task(
+            conversation_id,
+            task_kind=task_kind,
+            mode=mode,
+            trigger=trigger,
+            source=source,
+        )
+        if task is None:
+            return {"queued": False, "reason": "missing_conversation_id", "enabled": True}
+        key = self._task_key(task)
+        if key in self._queued_keys:
+            return {
+                "queued": False,
+                "reason": "duplicate",
+                "duplicate_state": "queued",
+                "task": task.to_payload(),
+            }
+        if key in self._running_keys:
+            return {
+                "queued": False,
+                "reason": "duplicate",
+                "duplicate_state": "running",
+                "task": task.to_payload(),
+            }
+        self._queued_keys.add(key)
+        try:
+            self._queue.put_nowait(task)
+        except asyncio.QueueFull:
+            self._queued_keys.discard(key)
+            raise
+        return {"queued": True, "reason": "queued", "task": task.to_payload()}
+
     async def _worker(self) -> None:
         while True:
-            conversation_id = await self._queue.get()
+            task = await self._queue.get()
+            key = self._task_key(task)
+            self._queued_keys.discard(key)
+            self._running_keys.add(key)
             try:
-                await self._compact_conversation(conversation_id, mode="auto")
+                logger.info(
+                    "[ConversationCompaction] task start conversation_id={} task_kind={} mode={} trigger={} source={}",
+                    task.conversation_id,
+                    task.task_kind,
+                    task.mode,
+                    task.trigger,
+                    task.source,
+                )
+                await self._compact_conversation(task.conversation_id, mode=task.mode)
             except asyncio.CancelledError:
                 raise
             except ConversationItemStreamUnavailableError as exc:
                 logger.warning(
-                    "[ConversationCompaction] skipped conversation_id={} code=conversation_item_stream_missing",
+                    (
+                        "[ConversationCompaction] skipped conversation_id={} task_kind={} mode={} "
+                        "trigger={} source={} code=conversation_item_stream_missing"
+                    ),
                     exc.conversation_id,
+                    task.task_kind,
+                    task.mode,
+                    task.trigger,
+                    task.source,
                 )
             except Exception as exc:
-                logger.exception("[ConversationCompaction] failed for conversation_id={}: {}", conversation_id, exc)
+                logger.exception(
+                    "[ConversationCompaction] failed conversation_id={} task_kind={} mode={} trigger={} source={}: {}",
+                    task.conversation_id,
+                    task.task_kind,
+                    task.mode,
+                    task.trigger,
+                    task.source,
+                    exc,
+                )
             finally:
-                self._queued_ids.discard(int(conversation_id))
+                self._running_keys.discard(key)
                 self._queue.task_done()
 
     def start_background_worker(self) -> Dict[str, Any]:
@@ -1053,24 +1198,36 @@ class ConversationContextCompactionService:
         if not enabled:
             return {"enabled": False, "running": False, "queued": 0}
         if self._worker_task and not self._worker_task.done():
-            return {"enabled": True, "running": True, "queued": self._queue.qsize()}
+            return {
+                "enabled": True,
+                "running": True,
+                "queued": self._queue.qsize(),
+                "active": len(self._running_keys),
+            }
         self._worker_task = asyncio.create_task(self._worker(), name="conversation-context-compaction")
-        return {"enabled": True, "running": True, "queued": self._queue.qsize()}
+        return {
+            "enabled": True,
+            "running": True,
+            "queued": self._queue.qsize(),
+            "active": len(self._running_keys),
+        }
 
-    def enqueue_conversation(self, conversation_id: Optional[int]) -> None:
-        if not bool(getattr(settings, "conversation_context_compaction_enabled", True)):
-            return
-        if not conversation_id:
-            return
-        conv_id = int(conversation_id)
-        if conv_id in self._queued_ids:
-            return
-        self._queued_ids.add(conv_id)
-        try:
-            self._queue.put_nowait(conv_id)
-        except Exception:
-            self._queued_ids.discard(conv_id)
-            raise
+    def enqueue_conversation(
+        self,
+        conversation_id: Optional[int],
+        *,
+        task_kind: str = "full_compaction",
+        mode: str = "auto",
+        trigger: str = "run_completed",
+        source: str = "conversation_context_compaction",
+    ) -> Dict[str, Any]:
+        return self.enqueue_task(
+            conversation_id,
+            task_kind=task_kind,
+            mode=mode,
+            trigger=trigger,
+            source=source,
+        )
 
     async def shutdown(self) -> None:
         task = self._worker_task

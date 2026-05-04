@@ -1,6 +1,5 @@
 import os
 import sys
-import asyncio
 
 import pytest
 
@@ -325,28 +324,26 @@ class _RedundantKnowledgeSearchFCLLM:
 
 
 @pytest.mark.asyncio
-async def test_budget_compression_times_out_instead_of_hanging(monkeypatch):
-    class _HangingCompressionLLM:
+async def test_budget_truncation_is_deterministic_without_llm_service(monkeypatch):
+    class _FailingCompressionLLM:
         def __init__(self, provider):
-            self.provider = provider
-            self.config = {}
+            raise AssertionError("budget message truncation must not call LLMService")
 
-        async def chat(self, *args, **kwargs):
-            await asyncio.sleep(0.2)
-            return {"content": "never"}
+    monkeypatch.setattr(react_agent_module, "LLMService", _FailingCompressionLLM)
 
-    monkeypatch.setattr(react_agent_module, "LLMService", _HangingCompressionLLM)
-    monkeypatch.setattr(settings, "agent_budget_compression_timeout_seconds", 0.01)
-
-    compressed = await ReActAgent._compress_text_with_qwen_turbo(
-        "需要被压缩的长文本" * 100,
-        target_token_budget=120,
-        source="test.timeout",
-        compression_kind="测试压缩",
+    raw = "HEAD_MARKER " + ("需要被确定性裁剪的长文本 " * 200) + "TAIL_MARKER"
+    compressed = await ReActAgent._truncate_message_content_to_token_budget(
+        raw,
+        120,
+        role="tool",
+        kind="observation",
     )
 
     assert compressed
-    assert "需要被压缩的长文本" in compressed
+    assert len(compressed) < len(raw)
+    assert "system-compression-truncated" in compressed
+    assert "HEAD_MARKER" in compressed
+    assert "TAIL_MARKER" in compressed
 
 
 class _NoopTools:
@@ -358,6 +355,30 @@ class _NoopTools:
 
     async def execute(self, tool_name: str, **kwargs):
         raise AssertionError("no tool call expected")
+
+
+class _RejectingTools:
+    def __init__(self):
+        self.calls = []
+
+    def get_tools_description(self, **kwargs):
+        return "- datetime: 时间"
+
+    def list_tools(self, **kwargs):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "datetime",
+                    "description": "datetime",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                },
+            }
+        ]
+
+    async def execute(self, tool_name: str, **kwargs):
+        self.calls.append((tool_name, dict(kwargs)))
+        raise AssertionError("invalid function-call arguments should not reach tool execution")
 
 
 class _ForbiddenRunDraftTools:
@@ -726,6 +747,24 @@ async def test_function_calling_fallback_to_xml(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_function_calling_does_not_fallback_to_xml_by_default(monkeypatch):
+    monkeypatch.setattr(settings, "agent_function_calling_fallback_xml", False)
+    llm = _FallbackLLM()
+    agent = ReActAgent(llm, _FallbackTools(), max_iterations=3)
+
+    events = []
+    async for event in agent.run([{"role": "user", "content": "2+2 等于多少"}], stream=False):
+        events.append(event)
+
+    assert llm.chat_calls == 0
+    assert [event for event in events if event.get("type") == "action"] == []
+    assert [event for event in events if event.get("type") == "observation"] == []
+    error_events = [event for event in events if event.get("type") == "error"]
+    assert len(error_events) == 1
+    assert "provider function-calling failed" in str(error_events[0].get("data") or "")
+
+
+@pytest.mark.asyncio
 async def test_function_calling_direct_answer_emits_thought_step():
     agent = ReActAgent(_DirectAnswerFCLLM(), _NoopTools(), max_iterations=1)
 
@@ -739,6 +778,51 @@ async def test_function_calling_direct_answer_emits_thought_step():
     assert thought_events
     assert "问题分析" in str(thought_events[0].get("data", ""))
     assert done_events and "直接回答" in str(done_events[0]["data"]["answer"])
+
+
+def test_function_calling_marks_invalid_tool_argument_json():
+    agent = ReActAgent(_DirectAnswerFCLLM(), _NoopTools(), max_iterations=1)
+
+    [call] = agent._normalize_tool_calls(
+        [
+            {
+                "id": "call_bad_json",
+                "type": "function",
+                "name": "datetime",
+                "arguments": "{\"query\":",
+            }
+        ]
+    )
+
+    assert call.arguments == {}
+    assert call.arguments_raw == "{\"query\":"
+    assert call.arguments_error
+    assert "JSONDecodeError" in call.arguments_error
+
+
+@pytest.mark.asyncio
+async def test_function_calling_invalid_tool_argument_json_does_not_execute_tool():
+    tools = _RejectingTools()
+    agent = ReActAgent(_DirectAnswerFCLLM(), tools, max_iterations=1)
+    context = AgentContext(messages=[{"role": "user", "content": "现在几点"}])
+    [call] = agent._normalize_tool_calls(
+        [
+            {
+                "id": "call_bad_json",
+                "type": "function",
+                "name": "datetime",
+                "arguments": "{\"query\":",
+            }
+        ]
+    )
+
+    executed = await agent._execute_single_tool_call(context, call, parallel_group="test")
+
+    assert tools.calls == []
+    assert executed.success is False
+    assert executed.error == "invalid_tool_arguments"
+    assert "工具参数不是有效 JSON 对象" in executed.observation_output
+    assert executed.result_data["error_contract"]["code"] == "invalid_tool_arguments"
 
 
 @pytest.mark.asyncio
@@ -998,7 +1082,7 @@ async def test_agent_stops_after_repeated_same_tool_failures(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_agent_stops_repeated_execution_spec_failures_with_script_guidance(monkeypatch):
+async def test_agent_stops_repeated_legacy_execution_spec_failures_without_script_guidance(monkeypatch):
     monkeypatch.setattr(settings, "agent_tool_failure_streak_limit", 3, raising=False)
     agent = ReActAgent(_RepeatedExecutionSpecFailureLLM(), _RepeatedExecutionSpecFailureTools(), max_iterations=8)
 
@@ -1007,14 +1091,13 @@ async def test_agent_stops_repeated_execution_spec_failures_with_script_guidance
         events.append(event)
 
     action_events = [event for event in events if event.get("type") == "action"]
-    thought_events = [event for event in events if event.get("type") == "thought"]
     done_events = [event for event in events if event.get("type") == "done"]
 
     assert len(action_events) == 3
-    assert any("合法路径" in str(event.get("data", "")) or "Python repo 文件" in str(event.get("data", "")) for event in thought_events)
     assert done_events
-    assert "execution_intent.entrypoint_type=\"repo_script\"" in str(done_events[0]["data"]["answer"])
-    assert "command=[\"./classification-results.sh\"]" in str(done_events[0]["data"]["answer"])
+    assert "已停止自动重试" in str(done_events[0]["data"]["answer"])
+    assert "execution_intent.entrypoint_type=\"repo_script\"" not in str(done_events[0]["data"]["answer"])
+    assert "command=[\"./classification-results.sh\"]" not in str(done_events[0]["data"]["answer"])
     assert done_events[0]["data"]["iterations"] == 3
 
 
@@ -1062,7 +1145,7 @@ async def test_execute_tool_calls_persists_tool_ledger_entries():
 
 
 @pytest.mark.asyncio
-async def test_execute_tool_calls_marks_script_followup_after_execution_spec_failure():
+async def test_execute_tool_calls_reports_legacy_execution_spec_failure():
     runtime_service = _ToolLedgerRuntimeService()
 
     class _FailureTools:
@@ -1106,8 +1189,10 @@ async def test_execute_tool_calls_marks_script_followup_after_execution_spec_fai
 
     assert len(executed) == 1
     assert runtime_service.item_entries
-    assert runtime_service.item_entries[0]["metadata"]["workflow_summary"]["decision_state"]["next_action"] == "inspect_execution_spec"
-    assert runtime_service.context_states[0]["decision_state"]["next_action"] == "inspect_execution_spec"
+    workflow_summary = runtime_service.item_entries[0]["metadata"]["workflow_summary"]
+    assert workflow_summary["decision_state"]["next_action"] == "report_blocker"
+    assert workflow_summary["decision_state"]["blocked_reason"] == "legacy_execution_route"
+    assert runtime_service.context_states[0]["decision_state"]["next_action"] == "report_blocker"
 
 
 def test_plain_chat_normalization_strips_tool_protocol_messages():

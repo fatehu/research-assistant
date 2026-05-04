@@ -379,7 +379,12 @@ class ExecutionContinuationManager:
                         "completed_at": assistant_message.created_at.isoformat() if assistant_message.created_at else _utcnow_iso(),
                     },
                 )
-                get_conversation_context_compaction_service().enqueue_conversation(int(record.conversation_id))
+                get_conversation_context_compaction_service().enqueue_conversation(
+                    int(record.conversation_id),
+                    mode="run_completed",
+                    trigger="execution_continuation_completed",
+                    source="execution_continuation",
+                )
             except Exception as exc:
                 await runtime_service.upsert_conversation_turn_entry(
                     int(record.conversation_id),

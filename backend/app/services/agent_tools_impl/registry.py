@@ -3678,6 +3678,18 @@ class ProjectClaudeTool(_PaperResearchToolBase):
                         continue_session=continue_session,
                     ):
                         stream_item_type = str(stream_item.get("type") or "")
+                        if stream_item_type == "heartbeat":
+                            await emit_tool_live_event(
+                                {
+                                    "type": "heartbeat",
+                                    "data": {
+                                        "tool": self.name,
+                                        "source": "runtime-worker",
+                                        "timestamp": stream_item.get("timestamp"),
+                                    },
+                                }
+                            )
+                            continue
                         if stream_item_type == "stream_error":
                             text = str(
                                 stream_item.get("error")
@@ -4427,6 +4439,18 @@ class DocxGenerateWithClaudeTool(ToolBase):
                     continue_session=continue_session,
                 ):
                     stream_item_type = str(stream_item.get("type") or "")
+                    if stream_item_type == "heartbeat":
+                        await emit_tool_live_event(
+                            {
+                                "type": "heartbeat",
+                                "data": {
+                                    "tool": self.name,
+                                    "source": "runtime-worker",
+                                    "timestamp": stream_item.get("timestamp"),
+                                },
+                            }
+                        )
+                        continue
                     if stream_item_type == "stream_error":
                         stream_error_text = str(
                             stream_item.get("error")
@@ -4987,6 +5011,18 @@ class DocxRefineWithClaudeTool(DocxGenerateWithClaudeTool):
                     continue_session=continue_session,
                 ):
                     stream_item_type = str(stream_item.get("type") or "")
+                    if stream_item_type == "heartbeat":
+                        await emit_tool_live_event(
+                            {
+                                "type": "heartbeat",
+                                "data": {
+                                    "tool": self.name,
+                                    "source": "runtime-worker",
+                                    "timestamp": stream_item.get("timestamp"),
+                                },
+                            }
+                        )
+                        continue
                     if stream_item_type == "stream_error":
                         stream_error_text = str(
                             stream_item.get("error")

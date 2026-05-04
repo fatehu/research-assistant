@@ -332,6 +332,248 @@ class AgentRuntimeService:
             return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
     @staticmethod
+    def build_item_stream_fingerprint(
+        item_stream_payload: Optional[Dict[str, Any]],
+        *,
+        fallback_boundary_message_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        payload = dict(item_stream_payload or {}) if isinstance(item_stream_payload, dict) else {}
+        entries = [dict(item) for item in list(payload.get("entries") or []) if isinstance(item, dict)]
+        store = ConversationItemStreamStore.from_payload(
+            {
+                "version": "conversation_item_stream.v1",
+                "updated_at": str(payload.get("updated_at") or "").strip() or None,
+                "entries": entries,
+            }
+        )
+        canonical = store.canonical_history(
+            fallback_boundary_message_id=fallback_boundary_message_id,
+        )
+        latest_message_id: Optional[int] = None
+        for entry in reversed(list(canonical.active_entries or [])):
+            try:
+                if entry.message_id is not None:
+                    latest_message_id = int(entry.message_id)
+                    break
+            except (TypeError, ValueError, OverflowError):
+                continue
+        last_item_id = ""
+        if entries:
+            last_item_id = str(entries[-1].get("item_id") or "").strip()
+        return {
+            "version": "conversation_item_stream_fingerprint.v1",
+            "item_stream_updated_at": str(payload.get("updated_at") or "").strip(),
+            "entry_count": len(entries),
+            "last_item_id": last_item_id,
+            "active_entry_count": len(list(canonical.active_entries or [])),
+            "latest_message_id": latest_message_id,
+            "boundary_message_id": canonical.boundary_message_id,
+            "replacement_checkpoint_item_id": canonical.replacement_checkpoint_item_id,
+        }
+
+    @staticmethod
+    def _item_stream_fingerprint_matches(
+        current: Dict[str, Any],
+        expected: Dict[str, Any],
+    ) -> bool:
+        keys = {
+            "item_stream_updated_at",
+            "entry_count",
+            "last_item_id",
+            "active_entry_count",
+            "latest_message_id",
+            "boundary_message_id",
+            "replacement_checkpoint_item_id",
+        }
+        return all(current.get(key) == expected.get(key) for key in keys)
+
+    @staticmethod
+    def _conversation_item_entry_from_payload(item: Dict[str, Any]) -> Optional[ConversationItemEntry]:
+        if not isinstance(item, dict):
+            return None
+        kind = str(item.get("kind") or "").strip()
+        if not kind:
+            return None
+        role = str(item.get("role") or "").strip() or None
+        if role and role not in {"user", "assistant", "system", "tool"}:
+            role = None
+        try:
+            iteration = int(item.get("iteration") or 0)
+        except (TypeError, ValueError, OverflowError):
+            iteration = 0
+        try:
+            message_id = int(item["message_id"]) if item.get("message_id") is not None else None
+        except (TypeError, ValueError, OverflowError):
+            message_id = None
+        try:
+            execution_time_ms = (
+                float(item.get("execution_time_ms"))
+                if item.get("execution_time_ms") is not None
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            execution_time_ms = None
+        try:
+            output_tokens_estimate = (
+                int(item.get("output_tokens_estimate"))
+                if item.get("output_tokens_estimate") is not None
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            output_tokens_estimate = None
+        return ConversationItemEntry(
+            item_id=str(item.get("item_id") or uuid.uuid4().hex),
+            kind=kind,
+            turn_id=str(item.get("turn_id") or "").strip() or None,
+            role=role,
+            content=str(item.get("content") or "").strip() or None,
+            message_id=message_id,
+            run_id=str(item.get("run_id") or "").strip() or None,
+            iteration=max(0, iteration),
+            tool_name=str(item.get("tool_name") or "").strip() or None,
+            tool_call_id=str(item.get("tool_call_id") or "").strip() or None,
+            status=str(item.get("status") or "").strip() or None,
+            arguments=dict(item.get("arguments") or {}) if isinstance(item.get("arguments"), dict) else None,
+            thought=str(item.get("thought") or "").strip() or None,
+            summary=str(item.get("summary") or "").strip() or None,
+            success=bool(item.get("success")) if item.get("success") is not None else None,
+            error=str(item.get("error") or "").strip() or None,
+            permission_required=bool(item.get("permission_required")),
+            execution_time_ms=execution_time_ms,
+            output_tokens_estimate=output_tokens_estimate,
+            truncated=bool(item.get("truncated")) if item.get("truncated") is not None else None,
+            parallel_group=str(item.get("parallel_group") or "").strip() or None,
+            metadata=dict(item.get("metadata") or {}) if isinstance(item.get("metadata"), dict) else None,
+            created_at=str(item.get("created_at") or "").strip() or datetime.utcnow().isoformat(),
+        )
+
+    @staticmethod
+    def _append_history_event_to_metadata(
+        metadata: Dict[str, Any],
+        *,
+        title: str,
+        detail: str,
+        item_stream: Optional[ConversationItemStreamStore] = None,
+    ) -> None:
+        history_log = HistoryLog.from_payload(
+            metadata.get("history_log") if isinstance(metadata.get("history_log"), dict) else {}
+        )
+        history_log.add(str(title or "").strip() or "event", str(detail or "").strip() or "updated")
+        history_log.compact(max(int(getattr(settings, "agent_context_history_log_keep_events", 48) or 48), 10))
+        metadata["history_log"] = history_log.to_payload()
+        if item_stream is not None:
+            item_stream.append(
+                ConversationItemEntry(
+                    item_id=uuid.uuid4().hex,
+                    kind="history_event",
+                    role="system",
+                    content=str(detail or "").strip() or "updated",
+                    summary=str(title or "").strip() or "event",
+                    created_at=history_log.updated_at or datetime.utcnow().isoformat(),
+                )
+            )
+
+    async def commit_conversation_compaction_if_current(
+        self,
+        conversation_id: int,
+        *,
+        source_fingerprint: Dict[str, Any],
+        context_state: Optional[Dict[str, Any]] = None,
+        compacted_history: Optional[Dict[str, Any]] = None,
+        compact_boundary_entry: Optional[Dict[str, Any]] = None,
+        history_event_title: str,
+        history_event_detail: str,
+        context_snapshot: Optional[Dict[str, Any]] = None,
+        stale_history_event_title: Optional[str] = None,
+        stale_history_event_detail: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        expected_fingerprint = dict(source_fingerprint or {}) if isinstance(source_fingerprint, dict) else {}
+        async with async_session_factory() as db:
+            row = await db.get(Conversation, int(conversation_id))
+            if not row:
+                return {"committed": False, "reason": "conversation_not_found", "current_fingerprint": {}}
+            metadata = dict(row.metadata_ or {})
+            item_stream_payload = (
+                dict(metadata.get("item_stream"))
+                if isinstance(metadata.get("item_stream"), dict)
+                else {}
+            )
+            try:
+                expected_boundary_message_id = (
+                    int(expected_fingerprint["boundary_message_id"])
+                    if expected_fingerprint.get("boundary_message_id") is not None
+                    else None
+                )
+            except (TypeError, ValueError, OverflowError):
+                expected_boundary_message_id = None
+            current_fingerprint = self.build_item_stream_fingerprint(
+                item_stream_payload,
+                fallback_boundary_message_id=expected_boundary_message_id,
+            )
+            item_stream = ConversationItemStreamStore.from_payload(item_stream_payload)
+
+            if not self._item_stream_fingerprint_matches(current_fingerprint, expected_fingerprint):
+                stale_title = str(stale_history_event_title or "compact_stale_skipped").strip()
+                stale_detail = str(stale_history_event_detail or "").strip() or (
+                    "source item_stream changed before compaction commit"
+                )
+                self._append_history_event_to_metadata(
+                    metadata,
+                    title=stale_title,
+                    detail=stale_detail,
+                    item_stream=item_stream,
+                )
+                item_stream.compact(max(int(getattr(settings, "agent_context_item_stream_keep_entries", 320) or 320), 60))
+                metadata["item_stream"] = item_stream.to_payload()
+                row.metadata_ = metadata
+                await db.commit()
+                return {
+                    "committed": False,
+                    "reason": "stale_source",
+                    "source_fingerprint": expected_fingerprint,
+                    "current_fingerprint": current_fingerprint,
+                }
+
+            if isinstance(context_state, dict) and context_state:
+                metadata["context_state"] = dict(context_state)
+            if isinstance(compacted_history, dict) and compacted_history:
+                metadata["compacted_history"] = dict(compacted_history)
+            self._append_history_event_to_metadata(
+                metadata,
+                title=history_event_title,
+                detail=history_event_detail,
+                item_stream=item_stream,
+            )
+            if isinstance(context_snapshot, dict) and context_snapshot:
+                current_snapshots = [
+                    dict(item)
+                    for item in list(metadata.get("context_snapshots") or [])
+                    if isinstance(item, dict)
+                ]
+                current_snapshots.append(dict(context_snapshot))
+                keep_last = max(int(getattr(settings, "agent_context_snapshot_keep_items", 12) or 12), 1)
+                metadata["context_snapshots"] = current_snapshots[-keep_last:]
+
+            boundary_entry = self._conversation_item_entry_from_payload(dict(compact_boundary_entry or {}))
+            if boundary_entry is not None:
+                item_stream.append(boundary_entry)
+            item_stream.compact(max(int(getattr(settings, "agent_context_item_stream_keep_entries", 320) or 320), 60))
+            metadata["item_stream"] = item_stream.to_payload()
+
+            row.metadata_ = metadata
+            await db.commit()
+            committed_fingerprint = self.build_item_stream_fingerprint(
+                metadata.get("item_stream") if isinstance(metadata.get("item_stream"), dict) else item_stream_payload
+            )
+            return {
+                "committed": True,
+                "reason": "committed",
+                "source_fingerprint": expected_fingerprint,
+                "current_fingerprint": current_fingerprint,
+                "committed_fingerprint": committed_fingerprint,
+            }
+
+    @staticmethod
     def _memory_default_channels() -> List[str]:
         raw = str(getattr(settings, "agent_memory_default_channels", "") or "").strip()
         if not raw:

@@ -262,6 +262,8 @@ class Settings(BaseSettings):
     claude_code_default_max_turns: int = 24
     claude_code_dangerously_skip_permissions: bool = True
     claude_code_output_format: Literal["text", "json", "stream-json"] = "stream-json"
+    claude_code_stream_heartbeat_seconds: float = 15.0
+    chat_sse_heartbeat_seconds: float = 15.0
 
     # Project runtime worker for paper reproduction execution.
     # Disabled by default so normal chat/backend startup never pulls the heavy
@@ -302,7 +304,7 @@ class Settings(BaseSettings):
     react_temperature: float = 0.7
     react_output_max_length: int = 500
     agent_function_calling_enabled: bool = True
-    agent_function_calling_fallback_xml: bool = True
+    agent_function_calling_fallback_xml: bool = False
     agent_parallel_tool_calls_enabled: bool = True
     agent_parallel_tool_calls_max_concurrency: int = 4
     agent_tool_failure_streak_limit: int = 3

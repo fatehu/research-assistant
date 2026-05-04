@@ -24,6 +24,15 @@ class _ScalarResult:
     def scalar(self):
         return self._value
 
+    def scalars(self):
+        value = self._value if isinstance(self._value, list) else []
+
+        class _Rows:
+            def all(self):
+                return list(value)
+
+        return _Rows()
+
 
 class _FakeDB:
     def __init__(self, conversation):
@@ -33,6 +42,8 @@ class _FakeDB:
         stmt_text = str(_stmt)
         if "count(messages.id)" in stmt_text.lower():
             return _ScalarResult(len(list(getattr(self._conversation, "messages", []) or [])))
+        if "agent_runs" in stmt_text.lower():
+            return _ScalarResult([])
         return _ScalarResult(self._conversation)
 
 

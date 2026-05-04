@@ -31,9 +31,6 @@ trigger_keywords: []
 blocked_tool_names:
   - project_bash
   - project_write_file
-  - paper_research_write_execution_script
-  - paper_research_write_execution_spec
-  - paper_research_start_execution
 continue_policies:
   - manual
 default_continue_policy: manual

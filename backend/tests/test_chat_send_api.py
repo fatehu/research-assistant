@@ -120,9 +120,12 @@ class _FakeRuntimeService:
 
 
 class _NoopCompactionService:
-    def enqueue_conversation(self, conversation_id):
-        _ = conversation_id
-        return None
+    def __init__(self):
+        self.enqueued = []
+
+    def enqueue_conversation(self, conversation_id, **kwargs):
+        self.enqueued.append((conversation_id, dict(kwargs)))
+        return {"queued": True, "reason": "queued"}
 
 
 class _FakeSaveSession:
@@ -275,6 +278,12 @@ class _FakeSlowStreamingLLMService(_FakeLLMService):
     async def chat_stream(self, *args, **kwargs):
         yield "partial"
         await asyncio.sleep(30)
+
+
+class _FakeDelayedStreamingLLMService(_FakeLLMService):
+    async def chat_stream(self, *args, **kwargs):
+        await asyncio.sleep(0.03)
+        yield "delayed answer"
 
 
 class _User:
@@ -556,6 +565,49 @@ async def test_send_message_stream_emits_phase_events_before_direct_answer(monke
     assert '"event": "done"' in joined
 
 
+@pytest.mark.asyncio
+async def test_send_message_direct_stream_emits_heartbeat_while_waiting_for_model(monkeypatch):
+    conversation = Conversation(
+        id=62,
+        user_id=7,
+        title="测试对话",
+        llm_provider="aliyun",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    conversation.messages = []
+    runtime_service = _FakeRuntimeService()
+
+    import app.services.react_agent as react_agent_module
+
+    monkeypatch.setattr(chat_api, "_chat_sse_heartbeat_seconds", lambda: 0.01)
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: _FakePlanner(runtime_service))
+    monkeypatch.setattr(chat_api, "LLMService", _FakeDelayedStreamingLLMService)
+
+    response = await chat_api.send_message(
+        ChatRequest(
+            message="请直接回答，但模型首 token 会慢。",
+            conversation_id=62,
+            stream=True,
+            use_tools=False,
+        ),
+        current_user=_User(),
+        db=_FakeDB(conversation),
+    )
+
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else str(chunk))
+
+    joined = "".join(chunks)
+    assert '"event": "heartbeat"' in joined
+    assert '"phase": "model_wait"' in joined
+    assert joined.index('"event": "heartbeat"') < joined.index('"event": "content"')
+    assert not [entry for entry in runtime_service.item_entries if entry.get("kind") == "heartbeat"]
+
+
 def test_chat_request_accepts_skill_launch_without_message():
     request = ChatRequest(
         skill_launch=ChatSkillLaunch(
@@ -773,6 +825,78 @@ async def test_send_message_stream_emits_running_workflow_control_on_probe_tool(
     assert '"stage": "planning"' in joined
     assert '"stage_status": "running"' in joined
     assert '"event": "done"' in joined
+
+
+@pytest.mark.asyncio
+async def test_send_message_agent_stream_emits_heartbeat_while_agent_is_silent(monkeypatch):
+    class _ToolPlanner:
+        def __init__(self, runtime_service):
+            self.runtime_service = runtime_service
+
+        async def prepare_direct_response(self, messages, *, force_no_tools=False):
+            _ = messages, force_no_tools
+            return None
+
+    class _SilentAgent:
+        def __init__(self, runtime_service):
+            self.runtime_service = runtime_service
+            self.runtime_context = SimpleNamespace(run_id="run-heartbeat-1")
+
+        async def run(self, agent_messages, stream=True, prepared_plan=None):
+            _ = agent_messages, stream, prepared_plan
+            await asyncio.sleep(0.03)
+            yield {"type": "start", "data": {"provider": "test", "model": "tool-model"}}
+            await asyncio.sleep(0.03)
+            yield {
+                "type": "done",
+                "data": {
+                    "answer": "agent completed after silence",
+                    "run_id": "run-heartbeat-1",
+                },
+            }
+
+    conversation = Conversation(
+        id=63,
+        user_id=7,
+        title="测试 agent heartbeat",
+        llm_provider="aliyun",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    conversation.messages = []
+    runtime_service = _FakeRuntimeService()
+
+    import app.services.react_agent as react_agent_module
+
+    monkeypatch.setattr(chat_api, "_chat_sse_heartbeat_seconds", lambda: 0.01)
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: _ToolPlanner(runtime_service))
+    monkeypatch.setattr(react_agent_module, "create_react_agent", lambda *args, **kwargs: _SilentAgent(runtime_service))
+    monkeypatch.setattr(chat_api, "LLMService", _FakeStreamingLLMService)
+
+    response = await chat_api.send_message(
+        ChatRequest(
+            message="需要工具路径，但 agent 会短暂静默。",
+            conversation_id=63,
+            stream=True,
+            use_tools=True,
+        ),
+        current_user=_User(),
+        db=_FakeDB(conversation),
+    )
+
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else str(chunk))
+
+    joined = "".join(chunks)
+    assert '"event": "heartbeat"' in joined
+    assert '"phase": "model_wait"' in joined
+    assert '"conversation_id": 63' in joined
+    assert '"turn_id": "turn:1000"' in joined
+    assert '"event": "done"' in joined
+    assert not [entry for entry in runtime_service.item_entries if entry.get("kind") == "heartbeat"]
 
 
 @pytest.mark.asyncio

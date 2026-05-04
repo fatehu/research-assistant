@@ -6,9 +6,10 @@ import copy
 import hashlib
 import json
 import re
+from contextlib import suppress
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, AsyncIterator
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -84,6 +85,90 @@ def _safe_json_dumps(payload: Any) -> str:
 
 def _sse_event(event: str, data: Any) -> str:
     return f"data: {_safe_json_dumps({'event': event, 'data': data})}\n\n"
+
+
+def _chat_sse_heartbeat_seconds() -> float:
+    raw_value = getattr(settings, "chat_sse_heartbeat_seconds", 15.0)
+    try:
+        return max(1.0, float(raw_value))
+    except (TypeError, ValueError):
+        return 15.0
+
+
+def _chat_sse_heartbeat_payload(
+    *,
+    phase: str,
+    conversation_id: Optional[int],
+    turn_id: Optional[str],
+    source: str = "chat",
+    data: Any = None,
+) -> dict[str, Any]:
+    payload = dict(data) if isinstance(data, dict) else {}
+    normalized_phase = str(payload.get("phase") or phase or "model_wait").strip() or "model_wait"
+    payload["phase"] = normalized_phase
+    payload.setdefault("source", source)
+    if conversation_id is not None:
+        payload.setdefault("conversation_id", conversation_id)
+    if turn_id:
+        payload.setdefault("turn_id", turn_id)
+    payload.setdefault("timestamp", datetime.utcnow().isoformat())
+    return payload
+
+
+async def _iterate_with_chat_heartbeat(
+    iterator: AsyncIterator[Any],
+    *,
+    phase: str,
+    conversation_id: Optional[int],
+    turn_id: Optional[str],
+) -> AsyncIterator[dict[str, Any]]:
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _pump() -> None:
+        try:
+            async for item in iterator:
+                await queue.put({"type": "item", "data": item})
+        except asyncio.CancelledError as exc:
+            await queue.put({"type": "error", "data": exc})
+        except Exception as exc:
+            await queue.put({"type": "error", "data": exc})
+        finally:
+            await queue.put({"type": "done", "data": None})
+
+    pump_task = asyncio.create_task(_pump())
+    try:
+        while True:
+            try:
+                event = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=_chat_sse_heartbeat_seconds(),
+                )
+            except asyncio.TimeoutError:
+                yield {
+                    "type": "heartbeat",
+                    "data": _chat_sse_heartbeat_payload(
+                        phase=phase,
+                        conversation_id=conversation_id,
+                        turn_id=turn_id,
+                    ),
+                }
+                continue
+
+            event_type = str(event.get("type") or "")
+            if event_type == "item":
+                yield event
+            elif event_type == "error":
+                error = event.get("data")
+                if isinstance(error, BaseException):
+                    raise error
+                raise RuntimeError(str(error))
+            elif event_type == "done":
+                break
+    finally:
+        if not pump_task.done():
+            pump_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await pump_task
 
 
 async def _active_document_artifact_or_none(
@@ -361,13 +446,6 @@ _PAPER_TOOL_STAGE_HINTS = {
     "project_write_file": "planning",
     "paper_research_assess_repo_mainpath": "planning",
     "paper_research_inspect_runtime": "planning",
-    "paper_research_launch_claude_code": "execution",
-    "paper_research_write_execution_script": "execution",
-    "paper_research_write_execution_spec": "execution",
-    "paper_research_read_execution_spec": "execution",
-    "paper_research_start_execution": "execution",
-    "paper_research_read_execution": "execution",
-    "paper_research_cancel_execution": "execution",
 }
 
 _PAPER_STAGE_COMPLETION_TOOLS = {
@@ -631,8 +709,6 @@ def _infer_paper_stage_from_artifact_path(relative_path: object) -> Optional[str
         return None
     if normalized.startswith("reference/") or normalized.startswith("repo/") or normalized.startswith("planning/"):
         return "planning"
-    if normalized.startswith("executions/"):
-        return "execution"
     if normalized.startswith("results/"):
         return "tuning"
     return None
@@ -804,11 +880,6 @@ def _build_tool_event_workflow_control_payload(
             and bool(success)
         ):
             stage_status = "completed"
-        elif normalized_tool_name in {"paper_research_start_execution", "paper_research_read_execution", "paper_research_cancel_execution"}:
-            if tool_status in {"completed", "complete", "success", "done"}:
-                stage_status = "completed"
-            else:
-                stage_status = "running"
 
     return _build_workflow_control_payload(
         request,
@@ -3906,6 +3977,31 @@ async def send_message(
                         }
                     ],
                 )
+
+            async def _emit_llm_content_stream(
+                *,
+                messages: List[Dict[str, Any]],
+                system_prompt: str,
+            ) -> AsyncIterator[str]:
+                nonlocal full_content
+                stream_iterator = llm_service.chat_stream(
+                    messages=messages,
+                    system_prompt=system_prompt,
+                    temperature=settings.react_temperature,
+                    max_tokens=settings.llm_max_tokens,
+                )
+                async for stream_event in _iterate_with_chat_heartbeat(
+                    stream_iterator,
+                    phase="model_wait",
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                ):
+                    if stream_event.get("type") == "heartbeat":
+                        yield _sse_event("heartbeat", stream_event.get("data"))
+                        continue
+                    chunk = stream_event.get("data")
+                    full_content += chunk
+                    yield _sse_event("content", chunk)
             
             try:
                 # 发送开始事件
@@ -3931,14 +4027,11 @@ async def send_message(
                         yield _sse_event("model_info", {"provider": getattr(llm_service, "provider", ""), "model": (getattr(llm_service, "config", {}) or {}).get("model")})
                         context_debug = None
 
-                        async for chunk in llm_service.chat_stream(
+                        async for stream_chunk in _emit_llm_content_stream(
                             messages=[dict(item) for item in list(prepared_send_plan.get("llm_messages") or []) if isinstance(item, dict)],
                             system_prompt=str(prepared_send_plan.get("system_prompt") or ""),
-                            temperature=settings.react_temperature,
-                            max_tokens=settings.llm_max_tokens,
                         ):
-                            full_content += chunk
-                            yield _sse_event("content", chunk)
+                            yield stream_chunk
 
                         logger.info(f"[Chat] 复用直连 send_plan 完成: content_len={len(full_content)}")
                         async with async_session_factory() as save_db:
@@ -3976,7 +4069,12 @@ async def send_message(
                                 assistant_message_id=assistant_message.id,
                                 assistant_content=full_content,
                             )
-                            get_conversation_context_compaction_service().enqueue_conversation(conversation_id)
+                            get_conversation_context_compaction_service().enqueue_conversation(
+                                conversation_id,
+                                mode="run_completed",
+                                trigger="direct_stream_completed",
+                                source="chat.send.direct_stream",
+                            )
                             conversation_context_state = await runtime_service.get_conversation_context_state(
                                 conversation_id
                             )
@@ -4026,14 +4124,11 @@ async def send_message(
                             context_debug = direct_response.context.context_debug
                             yield _sse_event("context_debug", context_debug)
 
-                        async for chunk in llm_service.chat_stream(
+                        async for stream_chunk in _emit_llm_content_stream(
                             messages=direct_response.llm_messages,
                             system_prompt=direct_response.system_prompt,
-                            temperature=settings.react_temperature,
-                            max_tokens=settings.llm_max_tokens,
                         ):
-                            full_content += chunk
-                            yield _sse_event("content", chunk)
+                            yield stream_chunk
 
                         logger.info(f"[Chat] 直连流式完成: content_len={len(full_content)}")
                         async with async_session_factory() as save_db:
@@ -4071,7 +4166,12 @@ async def send_message(
                                 assistant_message_id=assistant_message.id,
                                 assistant_content=full_content,
                             )
-                            get_conversation_context_compaction_service().enqueue_conversation(conversation_id)
+                            get_conversation_context_compaction_service().enqueue_conversation(
+                                conversation_id,
+                                mode="run_completed",
+                                trigger="direct_stream_completed",
+                                source="chat.send.direct_stream",
+                            )
                             conversation_context_state = await runtime_service.get_conversation_context_state(
                                 conversation_id
                             )
@@ -4124,21 +4224,40 @@ async def send_message(
                             await live_event_queue.put({"type": "__agent_done__", "data": None})
 
                     pump_task = asyncio.create_task(_pump_agent_events())
+                    heartbeat_phase = "model_wait"
                     try:
                         while True:
-                            event = await live_event_queue.get()
+                            try:
+                                event = await asyncio.wait_for(
+                                    live_event_queue.get(),
+                                    timeout=_chat_sse_heartbeat_seconds(),
+                                )
+                            except asyncio.TimeoutError:
+                                yield _sse_event(
+                                    "heartbeat",
+                                    _chat_sse_heartbeat_payload(
+                                        phase=heartbeat_phase,
+                                        conversation_id=conversation_id,
+                                        turn_id=turn_id,
+                                    ),
+                                )
+                                continue
                             event_type = str(event.get("type") or "")
                             event_data = event.get("data")
                             if event_type == "__agent_done__":
                                 break
                             if event_type == "start":
+                                heartbeat_phase = "model_wait"
                                 yield _sse_event("model_info", event_data)
                             elif event_type == "thinking_start":
+                                heartbeat_phase = "model_wait"
                                 current_iteration += 1
                                 yield _sse_event("thinking_start", {"iteration": current_iteration})
                             elif event_type == "thinking":
+                                heartbeat_phase = "model_wait"
                                 yield _sse_event("thinking", event_data)
                             elif event_type == "thought":
+                                heartbeat_phase = "model_wait"
                                 thought = event_data
                                 raw_thought = str(event_data or "").strip()
                                 compacted_thought = " ".join(raw_thought.split()).strip()
@@ -4162,6 +4281,7 @@ async def send_message(
                                     )
                                 yield _sse_event("thought", event_data)
                             elif event_type == "action":
+                                heartbeat_phase = "tool_execution"
                                 action_payload = dict(event_data or {}) if isinstance(event_data, dict) else {"value": event_data}
                                 workflow_control = _build_tool_event_workflow_control_payload(
                                     request,
@@ -4174,8 +4294,20 @@ async def send_message(
                                     active_workflow_control = workflow_control
                                 yield _sse_event("action", action_payload)
                             elif event_type == "tool_output":
+                                heartbeat_phase = "tool_execution"
                                 yield _sse_event("tool_output", event_data)
+                            elif event_type == "heartbeat":
+                                yield _sse_event(
+                                    "heartbeat",
+                                    _chat_sse_heartbeat_payload(
+                                        phase="tool_execution" if isinstance(event_data, dict) and event_data.get("tool") else heartbeat_phase,
+                                        conversation_id=conversation_id,
+                                        turn_id=turn_id,
+                                        data=event_data,
+                                    ),
+                                )
                             elif event_type == "observation":
+                                heartbeat_phase = "model_wait"
                                 observation_payload = dict(event_data or {}) if isinstance(event_data, dict) else {"value": event_data}
                                 workflow_control = _build_tool_event_workflow_control_payload(
                                     request,
@@ -4198,13 +4330,16 @@ async def send_message(
                                 if artifact_update_payload:
                                     yield _sse_event("artifact_updated", artifact_update_payload)
                             elif event_type == "context_debug":
+                                heartbeat_phase = "model_wait"
                                 if isinstance(event_data, dict):
                                     context_debug = event_data
                                 yield _sse_event("context_debug", event_data)
                             elif event_type == "content":
+                                heartbeat_phase = "model_wait"
                                 full_content += event_data
                                 yield _sse_event("content", event_data)
                             elif event_type == "answer":
+                                heartbeat_phase = "model_wait"
                                 full_content = event_data
                                 yield _sse_event("content", event_data)
                             elif event_type == "error":
@@ -4306,7 +4441,12 @@ async def send_message(
                                             run_id=str(event_data.get("run_id") or "").strip() or None,
                                             iteration_count=current_iteration,
                                         )
-                                        get_conversation_context_compaction_service().enqueue_conversation(conversation_id)
+                                        get_conversation_context_compaction_service().enqueue_conversation(
+                                            conversation_id,
+                                            mode="run_completed",
+                                            trigger="react_stream_completed",
+                                            source="chat.send.react_stream",
+                                        )
                                         conversation_context_state = await agent.runtime_service.get_conversation_context_state(
                                             conversation_id
                                         )
@@ -4351,7 +4491,10 @@ async def send_message(
                                         )
                                         yield _sse_event("done", done_payload)
                     finally:
-                        await pump_task
+                        if not pump_task.done():
+                            pump_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await pump_task
                 else:
                     yield _sse_event("phase", _phase_payload("loading_context", first_turn=is_first_turn))
                     yield _sse_event("phase", _phase_payload("routing", first_turn=is_first_turn))
@@ -4384,14 +4527,11 @@ async def send_message(
                     if isinstance(context_debug, dict) and context_debug:
                         yield _sse_event("context_debug", context_debug)
 
-                    async for chunk in llm_service.chat_stream(
+                    async for stream_chunk in _emit_llm_content_stream(
                         messages=llm_messages,
                         system_prompt=system_prompt,
-                        temperature=settings.react_temperature,
-                        max_tokens=settings.llm_max_tokens,
                     ):
-                        full_content += chunk
-                        yield _sse_event("content", chunk)
+                        yield stream_chunk
 
                     async with async_session_factory() as save_db:
                         assistant_message = Message(
@@ -4419,7 +4559,12 @@ async def send_message(
                             assistant_message_id=assistant_message.id,
                             assistant_content=full_content,
                         )
-                        get_conversation_context_compaction_service().enqueue_conversation(conversation_id)
+                        get_conversation_context_compaction_service().enqueue_conversation(
+                            conversation_id,
+                            mode="run_completed",
+                            trigger="planner_stream_completed",
+                            source="chat.send.planner_stream",
+                        )
                         conversation_context_state = await planner.runtime_service.get_conversation_context_state(
                             conversation_id
                         )
@@ -4698,7 +4843,12 @@ async def send_message(
                     "completed_at": assistant_message.created_at.isoformat() if assistant_message.created_at else datetime.utcnow().isoformat(),
                 },
             )
-            get_conversation_context_compaction_service().enqueue_conversation(conversation.id)
+            get_conversation_context_compaction_service().enqueue_conversation(
+                conversation.id,
+                mode="run_completed",
+                trigger="non_stream_completed",
+                source="chat.send.non_stream",
+            )
             conversation_context_state = await runtime_service.get_conversation_context_state(conversation.id)
             conversation_turn_store = await runtime_service.get_conversation_turn_store(conversation.id)
             conversation_tool_ledger = await runtime_service.get_conversation_tool_ledger(conversation.id)

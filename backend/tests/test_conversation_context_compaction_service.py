@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -10,7 +11,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import app.services.conversation_context_compaction_service as compaction_module
 from app.config import settings
 from app.models.conversation import Conversation
-from app.services.conversation_context_compaction_service import ConversationContextCompactionService
+from app.services.agent_runtime_service import AgentRuntimeService
+from app.services.conversation_context_compaction_service import (
+    ConversationCompactionTask,
+    ConversationContextCompactionService,
+)
 
 
 class _FakeStateLLM:
@@ -452,6 +457,190 @@ class _FakeRuntimeService:
     async def append_conversation_item_entries(self, conversation_id: int, entries):
         self.item_entries.extend(list(entries or []))
 
+    async def commit_conversation_compaction_if_current(
+        self,
+        conversation_id: int,
+        *,
+        source_fingerprint,
+        context_state=None,
+        compacted_history=None,
+        compact_boundary_entry=None,
+        history_event_title: str,
+        history_event_detail: str,
+        context_snapshot=None,
+        stale_history_event_title=None,
+        stale_history_event_detail=None,
+    ):
+        source_fingerprint = dict(source_fingerprint or {})
+        current_fingerprint = AgentRuntimeService.build_item_stream_fingerprint(
+            self.item_stream_payload,
+            fallback_boundary_message_id=source_fingerprint.get("boundary_message_id"),
+        )
+        if not AgentRuntimeService._item_stream_fingerprint_matches(current_fingerprint, source_fingerprint):
+            self.history_events.append(
+                {
+                    "title": stale_history_event_title or "compact_stale_skipped",
+                    "detail": stale_history_event_detail or "stale_source",
+                }
+            )
+            return {
+                "committed": False,
+                "reason": "stale_source",
+                "current_fingerprint": current_fingerprint,
+            }
+        if isinstance(context_state, dict) and context_state:
+            self.context_state = dict(context_state)
+        if isinstance(compacted_history, dict) and compacted_history:
+            self.compacted_history = dict(compacted_history)
+        self.history_events.append({"title": history_event_title, "detail": history_event_detail})
+        if isinstance(context_snapshot, dict) and context_snapshot:
+            self.snapshots.append(dict(context_snapshot))
+        if isinstance(compact_boundary_entry, dict) and compact_boundary_entry:
+            self.item_entries.append(dict(compact_boundary_entry))
+        return {
+            "committed": True,
+            "reason": "committed",
+            "current_fingerprint": current_fingerprint,
+        }
+
+
+class _StaleCommitRuntimeService(_FakeRuntimeService):
+    async def commit_conversation_compaction_if_current(self, *args, **kwargs):
+        self.item_stream_payload = {
+            **dict(self.item_stream_payload or {}),
+            "updated_at": datetime.utcnow().isoformat(),
+            "entries": [
+                *list((self.item_stream_payload or {}).get("entries") or []),
+                {
+                    "item_id": "assistant-new",
+                    "kind": "assistant_message",
+                    "turn_id": "turn:2",
+                    "role": "assistant",
+                    "content": "压缩生成期间新增的回答。",
+                    "message_id": 12,
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+            ],
+        }
+        return await super().commit_conversation_compaction_if_current(*args, **kwargs)
+
+
+def test_enqueue_conversation_wraps_legacy_id_as_full_compaction_task(monkeypatch):
+    monkeypatch.setattr(settings, "conversation_context_compaction_enabled", True)
+    service = ConversationContextCompactionService()
+
+    result = service.enqueue_conversation(
+        42,
+        mode="run_completed",
+        trigger="react_stream_completed",
+        source="chat.send.react_stream",
+    )
+
+    assert result["queued"] is True
+    task = service._queue.get_nowait()
+    try:
+        assert isinstance(task, ConversationCompactionTask)
+        assert task.conversation_id == 42
+        assert task.task_kind == "full_compaction"
+        assert task.mode == "run_completed"
+        assert task.trigger == "react_stream_completed"
+        assert task.source == "chat.send.react_stream"
+        assert task.requested_at
+        assert service._queued_keys == {(42, "full_compaction")}
+    finally:
+        service._queue.task_done()
+
+
+def test_enqueue_task_dedupes_queued_and_running_tasks(monkeypatch):
+    monkeypatch.setattr(settings, "conversation_context_compaction_enabled", True)
+    service = ConversationContextCompactionService()
+
+    first = service.enqueue_task(42, trigger="first", source="test")
+    queued_duplicate = service.enqueue_task(42, trigger="second", source="test")
+
+    assert first["queued"] is True
+    assert queued_duplicate["queued"] is False
+    assert queued_duplicate["reason"] == "duplicate"
+    assert queued_duplicate["duplicate_state"] == "queued"
+
+    task = service._queue.get_nowait()
+    service._queue.task_done()
+    service._queued_keys.discard(service._task_key(task))
+    service._running_keys.add(service._task_key(task))
+
+    running_duplicate = service.enqueue_task(42, trigger="third", source="test")
+
+    assert running_duplicate["queued"] is False
+    assert running_duplicate["reason"] == "duplicate"
+    assert running_duplicate["duplicate_state"] == "running"
+
+
+def test_enqueue_task_rejects_unsupported_task_kind(monkeypatch):
+    monkeypatch.setattr(settings, "conversation_context_compaction_enabled", True)
+    service = ConversationContextCompactionService()
+
+    with pytest.raises(ValueError, match="unsupported conversation compaction task kind"):
+        service.enqueue_task(42, task_kind="context_refresh")
+
+
+@pytest.mark.asyncio
+async def test_worker_runs_full_compaction_task_and_clears_running_key(monkeypatch):
+    monkeypatch.setattr(settings, "conversation_context_compaction_enabled", True)
+    service = ConversationContextCompactionService()
+    called = asyncio.Event()
+    calls = []
+
+    async def _fake_compact(conversation_id: int, *, mode: str = "auto"):
+        calls.append((conversation_id, mode))
+        called.set()
+
+    monkeypatch.setattr(service, "_compact_conversation", _fake_compact)
+
+    worker = asyncio.create_task(service._worker())
+    try:
+        result = service.enqueue_task(
+            42,
+            mode="pre_turn_deferred",
+            trigger="old_history",
+            source="react_agent.pre_turn",
+        )
+        assert result["queued"] is True
+        await asyncio.wait_for(called.wait(), timeout=1.0)
+        await asyncio.wait_for(service._queue.join(), timeout=1.0)
+        assert calls == [(42, "pre_turn_deferred")]
+        assert service._queued_keys == set()
+        assert service._running_keys == set()
+    finally:
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+
+@pytest.mark.asyncio
+async def test_worker_clears_running_key_after_failure(monkeypatch):
+    monkeypatch.setattr(settings, "conversation_context_compaction_enabled", True)
+    service = ConversationContextCompactionService()
+    called = asyncio.Event()
+
+    async def _fake_compact(conversation_id: int, *, mode: str = "auto"):
+        called.set()
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(service, "_compact_conversation", _fake_compact)
+
+    worker = asyncio.create_task(service._worker())
+    try:
+        result = service.enqueue_task(42, trigger="failure", source="test")
+        assert result["queued"] is True
+        await asyncio.wait_for(called.wait(), timeout=1.0)
+        await asyncio.wait_for(service._queue.join(), timeout=1.0)
+        assert service._queued_keys == set()
+        assert service._running_keys == set()
+    finally:
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
 
 @pytest.mark.asyncio
 async def test_compact_conversation_does_not_append_empty_boundary(monkeypatch):
@@ -501,6 +690,60 @@ async def test_compact_conversation_does_not_append_empty_boundary(monkeypatch):
     assert runtime_service.context_state is not None
     assert runtime_service.compacted_history is None
     assert runtime_service.item_entries == []
+
+
+@pytest.mark.asyncio
+async def test_compact_conversation_skips_stale_source_without_boundary(monkeypatch):
+    monkeypatch.setattr(compaction_module, "LLMService", _FakeStateLLM)
+    _FakeStateLLM.calls = []
+    conversation = Conversation(
+        id=79,
+        user_id=5,
+        title="测试",
+        llm_provider="aliyun",
+        is_archived=0,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    runtime_service = _StaleCommitRuntimeService(
+        {
+            "version": "conversation_item_stream.v1",
+            "updated_at": "2026-04-02T00:00:00",
+            "entries": [
+                {
+                    "item_id": "user-1",
+                    "kind": "user_message",
+                    "turn_id": "turn:1",
+                    "role": "user",
+                    "content": "解释注意力机制。",
+                    "message_id": 10,
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+                {
+                    "item_id": "assistant-1",
+                    "kind": "assistant_message",
+                    "turn_id": "turn:1",
+                    "role": "assistant",
+                    "content": "注意力机制是一种动态聚焦机制。",
+                    "message_id": 11,
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+            ],
+        },
+        context_state={"version": "conversation_context_state.v3", "active_topic": "原状态"},
+    )
+    service = ConversationContextCompactionService()
+    service._runtime_service = runtime_service
+    monkeypatch.setattr(compaction_module, "async_session_factory", lambda: _FakeSession(conversation))
+
+    artifacts = await service.compact_now(79)
+
+    assert artifacts.compacted_message_count == 0
+    assert artifacts.context_state["active_topic"] == "原状态"
+    assert runtime_service.context_state["active_topic"] == "原状态"
+    assert runtime_service.compacted_history is None
+    assert runtime_service.item_entries == []
+    assert runtime_service.history_events[-1]["title"] == "manual_compact_stale_skipped"
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import app.services.conversation_context_compaction_service as compaction_module
 from app.config import settings
+from app.services.agent_runtime_service import AgentRuntimeService
 from app.services.chat_context_store import ConversationItemStreamStore
 from app.services.react_agent import AgentContext, AgentRuntimeContext, ReActAgent
 
@@ -205,6 +206,53 @@ class _MidRunRuntime(_RuntimeRecorder):
         )
         self.item_stream_payload = store.to_payload()
 
+    async def commit_conversation_compaction_if_current(
+        self,
+        conversation_id: int,
+        *,
+        source_fingerprint,
+        context_state=None,
+        compacted_history=None,
+        compact_boundary_entry=None,
+        history_event_title: str,
+        history_event_detail: str,
+        context_snapshot=None,
+        stale_history_event_title=None,
+        stale_history_event_detail=None,
+    ):
+        source_fingerprint = dict(source_fingerprint or {})
+        current_fingerprint = AgentRuntimeService.build_item_stream_fingerprint(
+            self.item_stream_payload,
+            fallback_boundary_message_id=source_fingerprint.get("boundary_message_id"),
+        )
+        if not AgentRuntimeService._item_stream_fingerprint_matches(current_fingerprint, source_fingerprint):
+            self.history_events.append(
+                (
+                    conversation_id,
+                    stale_history_event_title or "compact_stale_skipped",
+                    stale_history_event_detail or "stale_source",
+                )
+            )
+            return {
+                "committed": False,
+                "reason": "stale_source",
+                "current_fingerprint": current_fingerprint,
+            }
+        if isinstance(context_state, dict) and context_state:
+            self.context_states.append((conversation_id, dict(context_state)))
+        if isinstance(compacted_history, dict) and compacted_history:
+            self.compacted_histories.append((conversation_id, dict(compacted_history)))
+        self.history_events.append((conversation_id, history_event_title, history_event_detail))
+        if isinstance(context_snapshot, dict) and context_snapshot:
+            self.snapshots.append((conversation_id, dict(context_snapshot)))
+        if isinstance(compact_boundary_entry, dict) and compact_boundary_entry:
+            await self.append_conversation_item_entries(conversation_id, [compact_boundary_entry])
+        return {
+            "committed": True,
+            "reason": "committed",
+            "current_fingerprint": current_fingerprint,
+        }
+
     async def get_user_memory_control(self, *, user_id: int, channel: str | None = None):
         return {"effective_enabled": False}
 
@@ -216,6 +264,42 @@ class _MidRunRuntime(_RuntimeRecorder):
 
     async def get_user_chat_preferences(self, *, user_id: int):
         return {}
+
+
+class _StaleCommitRuntime(_MidRunRuntime):
+    async def commit_conversation_compaction_if_current(self, *args, **kwargs):
+        self.item_stream_payload = {
+            **dict(self.item_stream_payload or {}),
+            "updated_at": "2026-04-02T00:00:05",
+            "entries": [
+                *list((self.item_stream_payload or {}).get("entries") or []),
+                {
+                    "item_id": "item-new",
+                    "kind": "assistant_message",
+                    "turn_id": "turn:200",
+                    "role": "assistant",
+                    "content": "压缩生成期间新增的回答",
+                    "message_id": 201,
+                },
+            ],
+        }
+        return await super().commit_conversation_compaction_if_current(*args, **kwargs)
+
+
+class _QueuedCompactionService:
+    def __init__(self):
+        self.tasks = []
+
+    def enqueue_task(self, conversation_id, **kwargs):
+        self.tasks.append((conversation_id, dict(kwargs)))
+        return {
+            "queued": True,
+            "reason": "queued",
+            "task": {
+                "conversation_id": conversation_id,
+                **dict(kwargs),
+            },
+        }
 
 
 class _CurrentTurnOnlyRuntime(_MidRunRuntime):
@@ -690,6 +774,51 @@ async def test_mid_run_compaction_appends_boundary_and_refreshes_context(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_mid_run_compaction_skips_stale_source_without_mutating_context(monkeypatch):
+    monkeypatch.setattr(settings, "agent_context_window_turns", 1)
+    monkeypatch.setattr(settings, "agent_context_recently_slid_turns", 0)
+    monkeypatch.setattr(settings, "agent_mid_run_compaction_enabled", True)
+    monkeypatch.setattr(settings, "agent_mid_run_compaction_min_iteration", 2)
+    monkeypatch.setattr(settings, "agent_mid_run_compaction_max_per_run", 2)
+    monkeypatch.setattr(compaction_module, "LLMService", _CompactionLLM)
+
+    runtime = _StaleCommitRuntime()
+    agent = ReActAgent(
+        _SimpleLLM(),
+        _BrokenIntentTools(),
+        max_iterations=2,
+        runtime_context=AgentRuntimeContext(user_id=1, channel="chat", conversation_id=42, turn_id="turn:200"),
+        runtime_service=runtime,
+    )
+
+    run_context = AgentContext(
+        messages=[
+            {"role": "user", "content": "旧问题"},
+            {"role": "assistant", "content": "旧回答"},
+            {"role": "user", "content": "当前问题"},
+        ],
+        conversation_state={"active_topic": "原状态"},
+        turn_id="turn:200",
+        iteration=2,
+        run_id="run-1",
+        context_truncated=True,
+    )
+
+    compacted = await agent._maybe_mid_run_compact(run_context, "system")
+
+    assert compacted is False
+    assert run_context.mid_run_compactions == 0
+    assert runtime.context_states == []
+    assert runtime.compacted_histories == []
+    assert runtime.snapshots == []
+    assert runtime.history_events[-1][1] == "mid_run_compact_stale_skipped"
+    assert run_context.conversation_state == {"active_topic": "原状态"}
+    assert run_context.compacted_history == {}
+    assert run_context.context_debug["mid_run_compaction_skipped"] == "stale_source"
+    assert all(item["kind"] != "compact_boundary" for item in runtime.item_stream_payload["entries"])
+
+
+@pytest.mark.asyncio
 async def test_mid_run_compaction_can_trigger_on_message_pressure_without_trim(monkeypatch):
     monkeypatch.setattr(settings, "agent_context_window_turns", 1)
     monkeypatch.setattr(settings, "agent_context_recently_slid_turns", 0)
@@ -777,11 +906,25 @@ async def test_mid_run_compaction_marks_paper_reproduction_skill_but_still_runs(
 
 
 @pytest.mark.asyncio
-async def test_pre_turn_compaction_persists_boundary_and_refreshes_context(monkeypatch):
+async def test_pre_turn_compaction_defers_full_compaction_without_model_call(monkeypatch):
     monkeypatch.setattr(settings, "agent_pre_turn_compaction_enabled", True)
     monkeypatch.setattr(settings, "agent_context_window_turns", 1)
     monkeypatch.setattr(settings, "agent_context_recently_slid_turns", 0)
-    monkeypatch.setattr(compaction_module, "LLMService", _CompactionLLM)
+    queued_compaction = _QueuedCompactionService()
+    monkeypatch.setattr(
+        compaction_module,
+        "get_conversation_context_compaction_service",
+        lambda: queued_compaction,
+    )
+
+    async def _fail_build_artifacts(*args, **kwargs):
+        raise AssertionError("pre-turn background-first must not build artifacts synchronously")
+
+    monkeypatch.setattr(
+        compaction_module.ConversationContextCompactionService,
+        "build_artifacts",
+        _fail_build_artifacts,
+    )
 
     runtime = _MidRunRuntime()
     agent = ReActAgent(
@@ -800,19 +943,19 @@ async def test_pre_turn_compaction_persists_boundary_and_refreshes_context(monke
 
     compacted = await agent._maybe_pre_turn_compact(context)
 
-    assert compacted is True
-    assert runtime.context_states
-    assert runtime.compacted_histories
-    assert runtime.history_events[-1][1] == "pre_turn_compact"
-    boundary_entry = runtime.item_stream_payload["entries"][-1]
-    assert boundary_entry["kind"] == "compact_boundary"
-    assert boundary_entry["status"] == "pre_turn"
-    assert boundary_entry["metadata"]["keep_turn_id"] == "turn:200"
-    assert context.compacted_history["mode"] == "pre_turn"
-    assert [item["role"] for item in context.history_messages] == ["user"]
-    assert [item["content"] for item in context.history_messages] == ["当前问题"]
-    assert context.context_debug["formal_compaction_applied"] is True
-    assert context.context_debug["formal_compaction_mode"] == "pre_turn"
+    assert compacted is False
+    assert runtime.context_states == []
+    assert runtime.compacted_histories == []
+    assert runtime.history_events == []
+    assert len(queued_compaction.tasks) == 1
+    conversation_id, task_kwargs = queued_compaction.tasks[0]
+    assert conversation_id == 42
+    assert task_kwargs["task_kind"] == "full_compaction"
+    assert task_kwargs["mode"] == "pre_turn_deferred"
+    assert task_kwargs["source"] == "react_agent.pre_turn"
+    assert task_kwargs["trigger"] == "old_history"
+    assert context.context_debug["pre_turn_compaction_deferred"] is True
+    assert context.context_debug["pre_turn_compaction_enqueue_reason"] == "queued"
 
 
 @pytest.mark.asyncio
@@ -850,7 +993,12 @@ async def test_run_emits_pre_turn_compaction_thought(monkeypatch):
     monkeypatch.setattr(settings, "agent_pre_turn_compaction_enabled", True)
     monkeypatch.setattr(settings, "agent_context_window_turns", 1)
     monkeypatch.setattr(settings, "agent_context_recently_slid_turns", 0)
-    monkeypatch.setattr(compaction_module, "LLMService", _CompactionLLM)
+    queued_compaction = _QueuedCompactionService()
+    monkeypatch.setattr(
+        compaction_module,
+        "get_conversation_context_compaction_service",
+        lambda: queued_compaction,
+    )
 
     runtime = _MidRunRuntime()
     agent = ReActAgent(
@@ -866,5 +1014,6 @@ async def test_run_emits_pre_turn_compaction_thought(monkeypatch):
         events.append(event)
 
     thought_messages = [str(event.get("data") or "") for event in events if event.get("type") == "thought"]
-    assert any("发送前已压缩较早上下文" in message for message in thought_messages)
+    assert any("已将较早上下文压缩交给后台维护" in message for message in thought_messages)
+    assert queued_compaction.tasks
     assert any(event.get("type") == "done" for event in events)
