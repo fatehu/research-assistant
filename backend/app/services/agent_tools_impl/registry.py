@@ -4,6 +4,7 @@ Agent 工具定义和执行 - 支持共享知识库搜索
 import asyncio
 import base64
 import contextvars
+import difflib
 import fnmatch
 import httpx
 import json
@@ -1730,145 +1731,6 @@ class _PaperResearchToolBase(ToolBase):
         async with self.db_session_factory() as session:
             return await handler(session)
 
-    async def _load_project_tree_focus_context(
-        self,
-        db: AsyncSession,
-        *,
-        project_payload: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        project_goal = str((project_payload or {}).get("goal") or "").strip()
-        context: Dict[str, Any] = {
-            "project_goal": project_goal,
-            "user_goal": "",
-            "active_topic": "",
-            "current_stage": "",
-            "workflow_binding": {},
-            "latest_user_message": "",
-            "recent_tool_calls": [],
-        }
-        if self.conversation_id is None:
-            return context
-
-        from app.models.conversation import Message, MessageRole
-        from app.services.agent_runtime_service import get_agent_runtime_service
-
-        latest_user_result = await db.execute(
-            select(Message.content)
-            .where(
-                Message.conversation_id == int(self.conversation_id),
-                Message.role == MessageRole.USER,
-            )
-            .order_by(Message.id.desc())
-            .limit(1)
-        )
-        latest_user_message = latest_user_result.scalar_one_or_none()
-        if latest_user_message is not None:
-            context["latest_user_message"] = str(latest_user_message or "").strip()
-
-        runtime_service = get_agent_runtime_service()
-        state = dict(await runtime_service.get_conversation_context_state(int(self.conversation_id)) or {})
-        workflow_binding = (
-            dict(state.get("workflow_binding") or {})
-            if isinstance(state.get("workflow_binding"), dict)
-            else {}
-        )
-        context["user_goal"] = str(state.get("user_goal") or "").strip()
-        context["active_topic"] = str(state.get("active_topic") or "").strip()
-        context["current_stage"] = str(workflow_binding.get("current_stage") or "").strip()
-        context["workflow_binding"] = workflow_binding
-
-        tool_ledger_payload = dict(await runtime_service.get_conversation_tool_ledger(int(self.conversation_id)) or {})
-        raw_entries = [
-            dict(item)
-            for item in list(tool_ledger_payload.get("entries") or [])
-            if isinstance(item, dict)
-        ]
-        recent_calls: List[Dict[str, Any]] = []
-        for item in reversed(raw_entries):
-            if str(item.get("kind") or "").strip() != "tool_call":
-                continue
-            tool_name = str(item.get("tool_name") or "").strip()
-            if not tool_name:
-                continue
-            recent_calls.append(
-                {
-                    "tool_name": tool_name,
-                    "arguments": dict(item.get("arguments") or {}) if isinstance(item.get("arguments"), dict) else {},
-                    "status": str(item.get("status") or "").strip() or None,
-                    "iteration": int(item.get("iteration") or 0),
-                }
-            )
-            if len(recent_calls) >= 8:
-                break
-        context["recent_tool_calls"] = list(reversed(recent_calls))
-        return context
-
-    @classmethod
-    async def _summarize_project_tree_for_agent(
-        cls,
-        *,
-        tree: str,
-        focus_context: Dict[str, Any],
-    ) -> tuple[str, List[str]]:
-        normalized_tree = str(tree or "").strip()
-        if not normalized_tree:
-            return "", []
-
-        provider = str(getattr(settings, "agent_budget_compression_provider", "aliyun") or "aliyun").strip()
-        llm = LLMService(provider)
-        llm.config = dict(llm.config)
-        llm.config["model"] = "qwen-turbo"
-        timeout_seconds = max(
-            float(getattr(settings, "agent_budget_compression_timeout_seconds", 8.0) or 8.0),
-            0.1,
-        )
-        try:
-            response = await asyncio.wait_for(
-                llm.chat(
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                {
-                                    "agent_focus": focus_context,
-                                    "project_tree": normalized_tree,
-                                },
-                                ensure_ascii=False,
-                            ),
-                        }
-                    ],
-                    system_prompt=(
-                        "你是项目目录树整理器。"
-                        "给定当前 agent 的目标、最近工具调用和完整 project tree，"
-                        "请挑出当前最值得继续探索的目录层级和文件。"
-                        "不要编造任何不存在的路径；只能使用输入 tree 中已有的路径。"
-                        "focused_tree 必须保留层级结构，使用纯文本目录树，根节点用 `.`。"
-                        "important_paths 必须是 project 根相对路径列表。"
-                        "返回严格 JSON："
-                        "{\"focused_tree\":\"...\",\"important_paths\":[\"...\"]}"
-                    ),
-                    temperature=0.1,
-                    max_tokens=1200,
-                    source="project_tree.focused_tree",
-                ),
-                timeout=timeout_seconds,
-            )
-        except Exception as exc:
-            logger.warning(f"[ProjectTree] focused tree summarization failed: {exc}")
-            return "", []
-
-        payload = _extract_first_json_object(response.get("content", ""))
-        if not isinstance(payload, dict):
-            return "", []
-
-        focused_tree = str(payload.get("focused_tree") or "").strip()
-        important_paths = [
-            _normalize_relative_path(item)
-            for item in list(payload.get("important_paths") or [])
-            if _normalize_relative_path(item)
-        ]
-        return focused_tree, list(dict.fromkeys(important_paths))
-
     async def _resolve_paper(
         self,
         db: AsyncSession,
@@ -2216,6 +2078,265 @@ class _PaperResearchToolBase(ToolBase):
 
         _walk(root, "")
         return "\n".join(lines)
+
+    @staticmethod
+    def _project_tree_skip_dir(name: str) -> bool:
+        normalized = str(name or "").strip()
+        return normalized in (_REPO_SKIPPED_DIRS | {".zoekt_project", ".ipynb_checkpoints", ".cache"})
+
+    @classmethod
+    def _iter_project_file_paths(cls, project_dir: Path, *, max_files: int = 5000) -> List[str]:
+        root = Path(project_dir)
+        if not root.exists():
+            return []
+        paths: List[str] = []
+        for current, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(
+                [item for item in dirnames if not cls._project_tree_skip_dir(item)],
+                key=lambda item: (item.lower(), item),
+            )
+            rel_dir = Path(current).relative_to(root).as_posix()
+            rel_prefix = "" if rel_dir == "." else f"{rel_dir}/"
+            for filename in sorted(filenames, key=lambda item: (item.lower(), item)):
+                rel_path = _normalize_relative_path(f"{rel_prefix}{filename}")
+                if not rel_path:
+                    continue
+                paths.append(rel_path)
+                if len(paths) >= max_files:
+                    return paths
+        return paths
+
+    @staticmethod
+    def _score_project_candidate_file(relative_path: str) -> int:
+        path = _normalize_relative_path(relative_path)
+        if not path:
+            return -10000
+        lower = path.lower()
+        name = Path(path).name.lower()
+        suffix = Path(name).suffix.lower()
+
+        exact_scores = {
+            "experiment_summary.md": 1200,
+            "reproduction_report.md": 1100,
+            "reproduction_summary.md": 1080,
+            "results.md": 980,
+            "report.md": 950,
+            "readme.md": 760,
+            "reference/paper/paper_interpretation.md": 1120,
+            "reference/paper/paper_pdf2md.md": 900,
+            "reference/repo/readme_intake.json": 860,
+            "repo/source/readme.md": 820,
+        }
+        score = exact_scores.get(lower, 0)
+
+        if "/" not in path:
+            score += 180
+        if lower.startswith("reference/paper/"):
+            score += 520
+        elif lower.startswith("reference/repo/"):
+            score += 380
+        elif lower.startswith("repo/source/"):
+            score += 220
+        elif lower.startswith("data/"):
+            score -= 350
+        elif "/.git/" in f"/{lower}/" or lower.startswith(".git/"):
+            score -= 1000
+
+        if suffix in {".md", ".txt", ".json", ".yaml", ".yml"}:
+            score += 140
+        elif suffix in {".sh", ".py", ".ipynb"}:
+            score += 80
+        elif suffix in {".train", ".test", ".csv", ".tsv", ".gz", ".tar"}:
+            score -= 160
+
+        keyword_scores = {
+            "summary": 260,
+            "report": 240,
+            "result": 220,
+            "results": 220,
+            "reproduction": 220,
+            "experiment": 220,
+            "eval": 120,
+            "metric": 120,
+            "readme": 120,
+            "intake": 90,
+            "classification": 80,
+        }
+        for keyword, value in keyword_scores.items():
+            if keyword in lower:
+                score += value
+
+        return score
+
+    @classmethod
+    def _project_candidate_files(cls, project_dir: Path, *, limit: int = 14) -> List[str]:
+        files = cls._iter_project_file_paths(project_dir)
+        scored = [
+            (cls._score_project_candidate_file(path), path)
+            for path in files
+        ]
+        scored = [item for item in scored if item[0] > 0]
+        scored.sort(key=lambda item: (-item[0], item[1].lower(), item[1]))
+        return list(dict.fromkeys(path for _score, path in scored[:limit]))
+
+    @classmethod
+    def _directory_count_summary(cls, path: Path, *, max_count: int = 10000) -> Dict[str, Any]:
+        dir_count = 0
+        file_count = 0
+        truncated = False
+        for _current, dirnames, filenames in os.walk(path):
+            dirnames[:] = [item for item in dirnames if not cls._project_tree_skip_dir(item)]
+            dir_count += len(dirnames)
+            file_count += len(filenames)
+            if dir_count + file_count >= max_count:
+                truncated = True
+                break
+        return {"dirs": dir_count, "files": file_count, "truncated": truncated}
+
+    @classmethod
+    def _project_directory_summaries(cls, project_dir: Path, *, limit: int = 10) -> List[Dict[str, Any]]:
+        root = Path(project_dir)
+        if not root.exists():
+            return []
+        summaries: List[Dict[str, Any]] = []
+        try:
+            entries = sorted(
+                [item for item in root.iterdir() if item.is_dir() and not item.is_symlink()],
+                key=lambda item: (item.name.lower(), item.name),
+            )
+        except OSError:
+            return []
+        for entry in entries:
+            if cls._project_tree_skip_dir(entry.name):
+                continue
+            counts = cls._directory_count_summary(entry)
+            try:
+                examples = sorted(
+                    [item.name + ("/" if item.is_dir() and not item.is_symlink() else "") for item in entry.iterdir()],
+                    key=lambda item: (item.lower(), item),
+                )[:8]
+            except OSError:
+                examples = []
+            summaries.append(
+                {
+                    "path": f"{entry.name}/",
+                    "dirs": counts["dirs"],
+                    "files": counts["files"],
+                    "truncated": counts["truncated"],
+                    "examples": examples,
+                }
+            )
+            if len(summaries) >= limit:
+                break
+        return summaries
+
+    @staticmethod
+    def _insert_path_into_trie(trie: Dict[str, Any], relative_path: str) -> None:
+        current = trie
+        for part in [item for item in relative_path.split("/") if item]:
+            current = current.setdefault(part, {})
+
+    @classmethod
+    def _render_compact_project_tree(
+        cls,
+        project_dir: Path,
+        *,
+        candidate_files: Sequence[str],
+        directory_summaries: Sequence[Dict[str, Any]],
+        max_lines: int = 80,
+    ) -> str:
+        root = Path(project_dir)
+        trie: Dict[str, Any] = {}
+        for summary in directory_summaries:
+            directory = str(summary.get("path") or "").strip().rstrip("/")
+            if directory:
+                cls._insert_path_into_trie(trie, directory)
+        for path in candidate_files:
+            cls._insert_path_into_trie(trie, path)
+
+        summary_by_dir = {
+            str(item.get("path") or "").strip().rstrip("/"): item
+            for item in directory_summaries
+            if str(item.get("path") or "").strip()
+        }
+        lines = ["."]
+
+        def render_node(node: Dict[str, Any], prefix: str, rel_prefix: str, depth: int) -> None:
+            if len(lines) >= max_lines:
+                return
+            keys = sorted(
+                node.keys(),
+                key=lambda key: (
+                    not ((root / f"{rel_prefix}{key}").is_dir()),
+                    key.lower(),
+                    key,
+                ),
+            )
+            for index, key in enumerate(keys):
+                if len(lines) >= max_lines:
+                    lines.append(f"{prefix}`-- ...")
+                    return
+                rel_path = f"{rel_prefix}{key}"
+                full_path = root / rel_path
+                is_dir = full_path.is_dir()
+                is_last = index == len(keys) - 1
+                branch = "`-- " if is_last else "|-- "
+                label = f"{key}/" if is_dir else key
+                if depth == 0 and is_dir:
+                    summary = summary_by_dir.get(rel_path)
+                    if summary:
+                        suffix = f"  # {summary.get('files', 0)} files, {summary.get('dirs', 0)} dirs"
+                        examples = [str(item) for item in list(summary.get("examples") or [])[:4]]
+                        if examples:
+                            suffix += f"; examples (not candidate files): {', '.join(examples)}"
+                        label += suffix
+                lines.append(f"{prefix}{branch}{label}")
+                child = node.get(key)
+                if isinstance(child, dict) and child and depth < 4:
+                    render_node(child, prefix + ("    " if is_last else "|   "), f"{rel_path}/", depth + 1)
+
+        render_node(trie, "", "", 0)
+        if len(lines) >= max_lines:
+            lines.append("...")
+        return "\n".join(lines)
+
+    @classmethod
+    def _suggest_project_paths(cls, project_dir: Path, requested_path: str, *, limit: int = 5) -> List[str]:
+        requested = _normalize_relative_path(requested_path)
+        if not requested:
+            return []
+        files = cls._iter_project_file_paths(project_dir)
+        if not files:
+            return []
+        requested_lower = requested.lower()
+        requested_name = Path(requested_lower).name
+        requested_tokens = {
+            token
+            for token in re.split(r"[^a-z0-9]+", requested_lower)
+            if len(token) >= 4
+        }
+        high_value = set(cls._project_candidate_files(project_dir, limit=20))
+        scored: List[tuple[float, str]] = []
+        for path in files:
+            lower = path.lower()
+            name = Path(lower).name
+            ratio = difflib.SequenceMatcher(None, requested_lower, lower).ratio()
+            name_ratio = difflib.SequenceMatcher(None, requested_name, name).ratio()
+            path_tokens = {
+                token
+                for token in re.split(r"[^a-z0-9]+", lower)
+                if len(token) >= 4
+            }
+            overlap = len(requested_tokens & path_tokens)
+            score = ratio * 0.45 + name_ratio * 0.45 + min(overlap, 3) * 0.08
+            if path in high_value:
+                score += 0.18
+            if requested_tokens & {"report", "summary", "result", "results", "reproduction", "experiment"} and path in high_value:
+                score += 0.20
+            if score >= 0.32:
+                scored.append((score, path))
+        scored.sort(key=lambda item: (-item[0], item[1].lower(), item[1]))
+        return list(dict.fromkeys(path for _score, path in scored[:limit]))
 
     @staticmethod
     def _read_json_file(path: Path) -> Dict[str, Any]:
@@ -3213,15 +3334,15 @@ class ProjectTreeTool(_PaperResearchToolBase):
     name = "project_tree"
     input_model = ProjectTreeInput
     parallel_safe = True
-    output_max_tokens = 32000
+    output_max_tokens = 3000
     description = (
         _PROJECT_TOOL_SCOPE_DESCRIPTION +
-        "返回指定 Project 根目录的目录树，用来浏览项目结构、确认文件位置和发现可读文件。"
+        "返回指定 Project 根目录的紧凑目录摘要，用来浏览项目结构、确认文件位置和发现可读文件。"
         "根目录就是 `/app/uploads/projects/{project_id}`。"
         "`project_id` 只能传 Project ID，不能传论文 `paper_id`。"
         "如果现在只知道 `paper_id`，先调用 `paper_research_status(paper_id=...)` 或 `paper_research_prepare(paper_id=...)` 去解析对应 Project。"
         "输出中的路径都按 Project 根目录的相对路径展示。"
-        "这个工具会保留完整目录树原文；同时会结合当前 agent 目标和最近工具调用，额外给出一份更聚焦的树整理和重要文件路径。"
+        "observation 默认只返回候选文件、顶层目录统计和紧凑目录树；完整递归目录树只保留在结构化 data 中。"
         "它只显示结构，不显示文件内容。"
     )
     parameters = {
@@ -3241,36 +3362,47 @@ class ProjectTreeTool(_PaperResearchToolBase):
 
             project_dir = self._project_dir_for(project_id)
             tree = self._render_project_tree(project_dir)
-            focus_context = await self._load_project_tree_focus_context(
-                db,
-                project_payload=project_payload,
-            )
-            focused_tree, important_paths = await self._summarize_project_tree_for_agent(
-                tree=tree,
-                focus_context=focus_context,
+            candidate_files = self._project_candidate_files(project_dir)
+            directory_summary = self._project_directory_summaries(project_dir)
+            compact_tree = self._render_compact_project_tree(
+                project_dir,
+                candidate_files=candidate_files,
+                directory_summaries=directory_summary,
             )
             lines = [
-                "已生成 Project 目录树。",
+                "已生成 Project 目录结构摘要。",
                 f"- Project: /projects/{project_id}",
             ]
-            if focused_tree:
+            if candidate_files:
                 lines.extend(
                     [
-                        "Focused tree:",
-                        focused_tree,
+                        "Candidate files (verified exact readable paths):",
+                        *[f"- {path}" for path in candidate_files],
                     ]
                 )
-            if important_paths:
+            if directory_summary:
                 lines.extend(
                     [
-                        "Important paths:",
-                        *[f"- {path}" for path in important_paths],
+                        "Directory summary (examples are not candidate files):",
+                        *[
+                            (
+                                f"- {item.get('path')}: {item.get('files', 0)} files, "
+                                f"{item.get('dirs', 0)} dirs"
+                                + (
+                                    f"; examples (not candidate files): {', '.join(str(example) for example in list(item.get('examples') or [])[:4])}"
+                                    if item.get("examples")
+                                    else ""
+                                )
+                            )
+                            for item in directory_summary
+                        ],
                     ]
                 )
             lines.extend(
                 [
-                    "Tree:",
-                    tree,
+                    "Compact tree:",
+                    compact_tree,
+                    "完整递归树未放入 observation；只有 Candidate files (verified exact readable paths) 下的路径可以作为 Candidate files 报告；Directory summary examples 不是候选文件。",
                 ]
             )
             return ToolResult(
@@ -3279,8 +3411,12 @@ class ProjectTreeTool(_PaperResearchToolBase):
                 data={
                     "project_id": project_id,
                     "tree": tree,
-                    "focused_tree": focused_tree,
-                    "important_paths": important_paths,
+                    "compact_tree": compact_tree,
+                    "candidate_files": candidate_files,
+                    "directory_summary": directory_summary,
+                    "focused_tree": compact_tree,
+                    "important_paths": candidate_files,
+                    "full_tree_in_output": False,
                 },
             )
 
@@ -3336,11 +3472,24 @@ class ProjectReadFileTool(_PaperResearchToolBase):
                     data={"project_id": project_id, "relative_path": relative_path},
                 )
             if not target.exists():
+                suggested_paths = self._suggest_project_paths(project_dir, relative_path)
+                lines = [f"Project 文件不存在: `{relative_path}`。"]
+                if suggested_paths:
+                    lines.extend(
+                        [
+                            "Did you mean:",
+                            *[f"- {path}" for path in suggested_paths],
+                        ]
+                    )
                 return ToolResult(
                     success=False,
-                    output=f"Project 文件不存在: `{relative_path}`。",
+                    output="\n".join(lines),
                     error="project_file_not_found",
-                    data={"project_id": project_id, "relative_path": relative_path},
+                    data={
+                        "project_id": project_id,
+                        "relative_path": relative_path,
+                        "suggested_paths": suggested_paths,
+                    },
                 )
             if not target.is_file():
                 return ToolResult(

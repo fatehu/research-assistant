@@ -122,41 +122,49 @@ async def test_project_tree_tool_returns_project_directory_tree(tmp_path, monkey
         return _project_payload()
 
     (tmp_path / "reference" / "paper").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "reference" / "paper" / "paper_interpretation.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "reference" / "paper" / "paper_interpretation.md").write_text("# paper\n", encoding="utf-8")
+    (tmp_path / "reference" / "repo").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "reference" / "repo" / "readme_intake.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "repo" / "source").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repo" / "source" / "README.md").write_text("# repo\n", encoding="utf-8")
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "data" / "ag_news_real.train").write_text("raw\n", encoding="utf-8")
+    (tmp_path / ".zoekt_project" / "index").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".zoekt_project" / "index" / "segments").write_text("index\n", encoding="utf-8")
+    (tmp_path / "experiment_summary.md").write_text("# summary\n", encoding="utf-8")
     (tmp_path / "notes.md").write_text("# notes\n", encoding="utf-8")
 
     monkeypatch.setattr(tool, "_resolve_project_payload_only", _resolve_project_payload_only)
     monkeypatch.setattr(tool, "_project_dir_for", lambda _project_id: tmp_path)
 
-    async def _load_project_tree_focus_context(_db, *, project_payload):
-        return {"project_goal": "inspect repo structure", "recent_tool_calls": [{"tool_name": "paper_research_status"}]}
+    class _FailingLLMService:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("project_tree should not call LLMService")
 
-    async def _summarize_project_tree_for_agent(*, tree: str, focus_context):
-        assert "reference/" in tree
-        assert focus_context["project_goal"] == "inspect repo structure"
-        return ".\n├── reference/\n│   └── paper/\n│       └── paper_interpretation.json\n└── notes.md", [
-            "reference/paper/paper_interpretation.json",
-            "notes.md",
-        ]
-
-    monkeypatch.setattr(tool, "_load_project_tree_focus_context", _load_project_tree_focus_context)
-    monkeypatch.setattr(tool, "_summarize_project_tree_for_agent", _summarize_project_tree_for_agent)
+    monkeypatch.setattr(agent_tools, "LLMService", _FailingLLMService)
 
     result = await tool._execute(project_id=7)
 
     assert result.success is True
-    assert result.data == {
-        "project_id": 7,
-        "tree": result.data["tree"],
-        "focused_tree": ".\n├── reference/\n│   └── paper/\n│       └── paper_interpretation.json\n└── notes.md",
-        "important_paths": ["reference/paper/paper_interpretation.json", "notes.md"],
-    }
+    assert result.data["project_id"] == 7
     assert "." in result.data["tree"]
     assert "reference/" in result.data["tree"]
-    assert "paper_interpretation.json" in result.data["tree"]
-    assert "notes.md" in result.data["tree"]
-    assert "Focused tree:" in result.output
-    assert "Important paths:" in result.output
+    assert "paper_interpretation.md" in result.data["tree"]
+    assert ".zoekt_project/" in result.data["tree"]
+    assert result.data["full_tree_in_output"] is False
+    assert result.data["focused_tree"] == result.data["compact_tree"]
+    assert result.data["important_paths"] == result.data["candidate_files"]
+    assert "experiment_summary.md" in result.data["candidate_files"]
+    assert "reference/paper/paper_interpretation.md" in result.data["candidate_files"]
+    assert "reference/repo/readme_intake.json" in result.data["candidate_files"]
+    assert "repo/source/README.md" in result.data["candidate_files"]
+    assert "Candidate files (verified exact readable paths):" in result.output
+    assert "Directory summary (examples are not candidate files):" in result.output
+    assert "examples (not candidate files)" in result.output
+    assert "Compact tree:" in result.output
+    assert "只有 Candidate files (verified exact readable paths) 下的路径可以作为 Candidate files 报告" in result.output
+    assert "Tree:" not in result.output
+    assert ".zoekt_project" not in result.output
 
 
 @pytest.mark.asyncio
@@ -197,6 +205,33 @@ async def test_project_read_and_write_file_tools_roundtrip(tmp_path, monkeypatch
     }
     assert "Content:" in read_result.output
     assert '{"status":"draft"}' in read_result.output
+
+
+@pytest.mark.asyncio
+async def test_project_read_file_not_found_returns_suggestions(tmp_path, monkeypatch):
+    read_tool = agent_tools.ProjectReadFileTool(db=object(), user_id=1)
+
+    async def _resolve_project_payload_only(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload()
+
+    (tmp_path / "reference" / "paper").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "reference" / "paper" / "paper_interpretation.md").write_text("# paper\n", encoding="utf-8")
+    (tmp_path / "repo" / "source").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repo" / "source" / "README.md").write_text("# repo\n", encoding="utf-8")
+    (tmp_path / "experiment_summary.md").write_text("# summary\n", encoding="utf-8")
+
+    monkeypatch.setattr(read_tool, "_resolve_project_payload_only", _resolve_project_payload_only)
+    monkeypatch.setattr(read_tool, "_project_dir_for", lambda _project_id: tmp_path)
+
+    result = await read_tool._execute(project_id=7, relative_path="FASTTEXT_REPRODUCTION_REPORT.md")
+
+    assert result.success is False
+    assert result.error == "project_file_not_found"
+    assert result.data["suggested_paths"]
+    assert "experiment_summary.md" in result.data["suggested_paths"]
+    assert "Did you mean:" in result.output
+    assert "- experiment_summary.md" in result.output
 
 
 @pytest.mark.asyncio

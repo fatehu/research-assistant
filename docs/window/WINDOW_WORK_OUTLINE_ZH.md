@@ -82,9 +82,14 @@
   - 阶段：P2。
   - 状态：已实施，Docker focused 与真实 API skill 回归通过。
 
+- `MOD_08_PROJECT_TREE_DETERMINISTIC_COMPACT_ZH.md`
+  - 修改项：`project_tree` 规则化 compact 输出和候选路径，移除目录树 qwen 整理。
+  - 阶段：P2。
+  - 状态：已实施，Docker focused、守卫和真实 Project 10 验证通过。
+
 ## 当前推荐顺序
 
-1. 整理并提交本轮已完成的 MOD 变更。
+1. 整理并提交本轮已完成的 `MOD_08` 变更。
 2. `MOD_05` 暂不实施，只记录观测方向。
 
 ## 决策记录
@@ -112,6 +117,10 @@
 - 2026-05-04：`MOD_07` 已实施：ReAct prompt budget 摘要与消息裁剪改为本地 head/tail 确定性裁剪，移除 `chat.budget.message_summary/message_truncation` 和 `_compress_text_with_qwen_turbo` 源码入口；会话级 compaction 不变。
 - 2026-05-04：`MOD_07` Docker focused 回归通过：budget/FC/ledger 共 44 项、compaction/chat 共 68 项、paper-reproduction skill/grounding 共 40 项；后端 broad-except 与 contract alignment 守卫通过。
 - 2026-05-04：`MOD_07` 真实 API skill 回归通过：`conversation_id=199` 只产生 `paper_research_status` 工具结果，未调用旧 execution 工具，回答包含 Project ID 10 与 `project_claude` 下一步。
+- 2026-05-04：复查 `chat/200`：当前 turn tool observation 未触发 budget 截断，但 `project_tree` 输出约 7335 tokens 且模型仍读取了不存在的 `FASTTEXT_REPRODUCTION_REPORT.md`。用户确认执行 `MOD_08`，将 `project_tree` 改为确定性 compact tree + candidate files，并移除 `project_tree.focused_tree` qwen 调用。
+- 2026-05-04：`MOD_08` 已实施：`project_tree(project_id=10)` observation 降到 448 tokens，候选路径包含真实 `repo/source/FASTTEXT_REPRODUCTION_REPORT.md`；根路径读取失败时 `project_read_file` 会返回 suggested paths。
+- 2026-05-05：真实 chat 页面验证 `project_tree(project_id=10)` 成功且只调用该工具；模型最终回答曾把 `Directory summary` examples 混入 Candidate Files 表达，因此补充字段边界标签，明确 examples 不是 candidate files。
+- 2026-05-05：字段边界强化后，新建 `conversation_id=201` 真实 chat 回归通过：重新调用 `project_tree(project_id=10)`，工具结果 `output_tokens_estimate=518`、`truncated=false`，最终回答未再把 `data/` examples 混入 Candidate files。
 
 ## 下一步
 
