@@ -43,7 +43,7 @@ const roleIcons: Record<UserRole, React.ReactNode> = {
 
 const UsersPage: React.FC = () => {
   const {
-    users, usersLoading, statistics, statisticsLoading,
+    users, usersLoading, usersTotal, statistics, statisticsLoading,
     fetchUsers, fetchStatistics, updateUserRole, toggleUserActive, deleteUser
   } = useRoleStore();
 
@@ -519,8 +519,8 @@ const UsersPage: React.FC = () => {
           size="small"
           pagination={{
             ...pagination,
+            total: usersTotal,
             size: 'small',
-            pageSize: 15,
             showSizeChanger: false,
             showTotal: (total) => `共 ${total} 条`,
             onChange: (page, pageSize) => {

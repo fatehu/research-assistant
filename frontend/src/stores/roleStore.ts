@@ -569,8 +569,21 @@ export const useRoleStore = create<RoleState>()(
       fetchUsers: async (params) => {
         set({ usersLoading: true });
         try {
-          const response = await api.get('/api/v1/admin/users', { params });
-          set({ users: response.data, usersLoading: false });
+          const [usersResponse, countResponse] = await Promise.all([
+            api.get('/api/v1/admin/users', { params }),
+            api.get('/api/v1/admin/users/count', {
+              params: {
+                role: params?.role,
+                search: params?.search,
+                is_active: params?.is_active,
+              },
+            }),
+          ]);
+          set({
+            users: usersResponse.data,
+            usersTotal: Number(countResponse.data?.count || 0),
+            usersLoading: false,
+          });
         } catch (error) {
           console.error('获取用户列表失败:', error);
           set({ usersLoading: false });

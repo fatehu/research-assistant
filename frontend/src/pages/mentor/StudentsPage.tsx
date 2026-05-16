@@ -95,10 +95,15 @@ const StudentsPage: React.FC = () => {
     }
   };
 
+  const safeCount = (value?: number) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+
   // 计算学生活跃度得分
   const getActivityScore = (student: StudentDetail) => {
-    const total = student.conversation_count + student.knowledge_base_count * 5 + 
-                  student.paper_count * 3 + student.notebook_count * 4;
+    const conversationCount = safeCount(student.conversation_count);
+    const knowledgeBaseCount = safeCount(student.knowledge_base_count);
+    const paperCount = safeCount(student.paper_count);
+    const notebookCount = safeCount(student.notebook_count);
+    const total = conversationCount + knowledgeBaseCount * 5 + paperCount * 3 + notebookCount * 4;
     return Math.min(100, total);
   };
 
@@ -171,7 +176,7 @@ const StudentsPage: React.FC = () => {
       render: (_, record) => (
         <Space size={4}>
           <Tooltip title="对话数">
-            <Badge count={record.conversation_count} showZero color="#4A90D9" size="small" overflowCount={999}>
+            <Badge count={safeCount(record.conversation_count)} showZero color="#4A90D9" size="small" overflowCount={999}>
               <div style={{ 
                 width: 24, height: 24, borderRadius: 6, 
                 backgroundColor: '#4A90D915', display: 'flex', 
@@ -182,7 +187,7 @@ const StudentsPage: React.FC = () => {
             </Badge>
           </Tooltip>
           <Tooltip title="知识库">
-            <Badge count={record.knowledge_base_count} showZero color="#13c2c2" size="small" overflowCount={99}>
+            <Badge count={safeCount(record.knowledge_base_count)} showZero color="#13c2c2" size="small" overflowCount={99}>
               <div style={{ 
                 width: 24, height: 24, borderRadius: 6, 
                 backgroundColor: '#13c2c215', display: 'flex', 
@@ -193,7 +198,7 @@ const StudentsPage: React.FC = () => {
             </Badge>
           </Tooltip>
           <Tooltip title="论文数">
-            <Badge count={record.paper_count} showZero color="#eb2f96" size="small" overflowCount={99}>
+            <Badge count={safeCount(record.paper_count)} showZero color="#eb2f96" size="small" overflowCount={99}>
               <div style={{ 
                 width: 24, height: 24, borderRadius: 6, 
                 backgroundColor: '#eb2f9615', display: 'flex', 
@@ -204,7 +209,7 @@ const StudentsPage: React.FC = () => {
             </Badge>
           </Tooltip>
           <Tooltip title="笔记本">
-            <Badge count={record.notebook_count} showZero color="#fa8c16" size="small" overflowCount={99}>
+            <Badge count={safeCount(record.notebook_count)} showZero color="#fa8c16" size="small" overflowCount={99}>
               <div style={{ 
                 width: 24, height: 24, borderRadius: 6, 
                 backgroundColor: '#fa8c1615', display: 'flex', 
@@ -707,7 +712,7 @@ const StudentsPage: React.FC = () => {
                 <Col span={6}>
                   <Statistic 
                     title={<span style={{ color: '#8899A6' }}>对话</span>}
-                    value={selectedStudent.conversation_count}
+                    value={safeCount(selectedStudent.conversation_count)}
                     prefix={<MessageOutlined style={{ color: '#4A90D9' }} />}
                     valueStyle={{ color: '#E8E8E8' }}
                   />
@@ -715,7 +720,7 @@ const StudentsPage: React.FC = () => {
                 <Col span={6}>
                   <Statistic 
                     title={<span style={{ color: '#8899A6' }}>知识库</span>}
-                    value={selectedStudent.knowledge_base_count}
+                    value={safeCount(selectedStudent.knowledge_base_count)}
                     prefix={<BookOutlined style={{ color: '#13c2c2' }} />}
                     valueStyle={{ color: '#E8E8E8' }}
                   />
@@ -723,7 +728,7 @@ const StudentsPage: React.FC = () => {
                 <Col span={6}>
                   <Statistic 
                     title={<span style={{ color: '#8899A6' }}>论文</span>}
-                    value={selectedStudent.paper_count}
+                    value={safeCount(selectedStudent.paper_count)}
                     prefix={<FileTextOutlined style={{ color: '#eb2f96' }} />}
                     valueStyle={{ color: '#E8E8E8' }}
                   />
@@ -731,7 +736,7 @@ const StudentsPage: React.FC = () => {
                 <Col span={6}>
                   <Statistic 
                     title={<span style={{ color: '#8899A6' }}>笔记本</span>}
-                    value={selectedStudent.notebook_count}
+                    value={safeCount(selectedStudent.notebook_count)}
                     prefix={<ExperimentOutlined style={{ color: '#fa8c16' }} />}
                     valueStyle={{ color: '#E8E8E8' }}
                   />
