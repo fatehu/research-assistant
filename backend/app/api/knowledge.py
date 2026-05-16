@@ -730,6 +730,8 @@ async def _run_document_task_with_queue(doc_id: int, chunk_size: int, chunk_over
     semaphore = _get_document_task_run_semaphore()
     queued_at = time.perf_counter()
     async with semaphore:
+        # 调度按文档建任务，但执行使用全局限流，避免批量上传一次性耗尽
+        # 相关 embedding/OCR 资源。
         wait_ms = (time.perf_counter() - queued_at) * 1000
         if wait_ms >= 10:
             logger.info(
@@ -754,6 +756,8 @@ async def _schedule_document_task(doc_id: int, chunk_size: int, chunk_overlap: i
                 return False
             _DOCUMENT_TASK_HANDLES.pop(normalized_doc_id, None)
 
+        # 释放锁前先保存任务句柄，让 retry/cancel/status 接口看到同一个
+        # 文档任务事实源。
         task = asyncio.create_task(
             _run_document_task_with_queue(
                 doc_id=normalized_doc_id,
@@ -2160,6 +2164,8 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     and str(cached_window_extract.get("extract_granularity") or "").strip() == str(requested_extract_granularity or "").strip()
                     and bool(cached_windows)
                 )
+                # 在线多模态摄取可在两层恢复：复用 OCR/模型结果的原始页窗口，
+                # 或在完整抽取配置与当前请求一致时复用最终块。
                 supports_staged_online_mm = all(
                     hasattr(online_mm_service, attr)
                     for attr in ("extract_pdf_blocks", "finalize_blocks")
@@ -3434,6 +3440,8 @@ async def search_knowledge(
     )
     await _ensure_client_connected("access_resolved")
 
+    # 开启 reranker/hybrid 时会刻意放宽候选宽度：向量/文本检索先扩大召回，
+    # 再由后续阶段收敛到 top_k。
     use_reranker = settings.enable_reranker and request.use_reranker
     use_hybrid = settings.enable_hybrid_retrieval and request.use_hybrid
     final_top_k = request.top_k

@@ -171,7 +171,7 @@ const KnowledgePage = () => {
   const [form] = Form.useForm()
 
   // 高级搜索过滤器状态
-  const [searchChunkLevel, setSearchChunkLevel] = useState<string>('paragraph')
+  const searchChunkLevel = 'paragraph'
   const [searchSectionType, setSearchSectionType] = useState<string | undefined>(undefined)
   const [searchIncludeParent, setSearchIncludeParent] = useState(false)
   const [searchUseQueryRewrite, setSearchUseQueryRewrite] = useState(true)
@@ -963,8 +963,7 @@ const KnowledgePage = () => {
                 <FilterOutlined className="mr-1" />
                 高级过滤
                 {(
-                  searchChunkLevel !== 'paragraph'
-                  || searchSectionType
+                  searchSectionType
                   || searchIncludeParent
                   || !searchUseQueryRewrite
                   || !searchUseHybrid
@@ -978,15 +977,6 @@ const KnowledgePage = () => {
             ),
             children: (
               <Row gutter={[16, 12]}>
-                <Col span={8}>
-                  <div className="text-slate-400 text-xs mb-1">分块层级</div>
-                  <Select value={searchChunkLevel} onChange={setSearchChunkLevel} size="small" className="w-full" options={[
-                    { value: 'paragraph', label: '段落级' },
-                    { value: 'section', label: '章节级' },
-                    { value: 'document', label: '文档级' },
-                    { value: 'all', label: '全部层级' },
-                  ]} />
-                </Col>
                 <Col span={8}>
                   <div className="text-slate-400 text-xs mb-1">章节类型</div>
                   <Select value={searchSectionType} onChange={setSearchSectionType} size="small" className="w-full" allowClear placeholder="不限" options={[

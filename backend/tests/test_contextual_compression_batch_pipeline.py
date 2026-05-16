@@ -112,3 +112,49 @@ async def test_react_agent_pipeline_passes_reranker_score_to_compression():
     assert captured["query"] == "query"
     assert len(captured["chunks"]) == 1
     assert captured["chunks"][0].reranker_score == 0.93
+
+
+@pytest.mark.asyncio
+async def test_react_agent_pipeline_omits_compression_score_when_service_disabled():
+    agent = ReActAgent(_DummyLLM(), _DummyTools())
+
+    class _DisabledCompressionService:
+        async def compress_chunks(self, query, chunks, use_contextual_compression=True):
+            return [
+                CompressionResult(
+                    source_id=item.source_id,
+                    source_label=f"来源{item.source_id}",
+                    doc_name=item.doc_name,
+                    chunk_idx=item.chunk_idx,
+                    relevant_content="",
+                    relevance_score=0.0,
+                    used_compression=False,
+                    fallback_reason="disabled",
+                    raw_response=None,
+                )
+                for item in chunks
+            ]
+
+    agent.contextual_compression_service = _DisabledCompressionService()
+
+    result = ToolResult(
+        success=True,
+        output="raw",
+        data={
+            "results": [
+                {
+                    "content": "chunk content",
+                    "score": 0.88,
+                    "document": "doc-1",
+                    "knowledge_base": "kb-1",
+                    "chunk_index": 3,
+                }
+            ]
+        },
+        error=None,
+    )
+
+    observation = await agent._compress_knowledge_observation("query", result, None)
+    assert "Knowledge contexts: 1" in observation
+    assert "Compression score" not in observation
+    assert "[来源1] chunk content" in observation

@@ -26,6 +26,15 @@ def test_extract_json_from_fenced_payload():
     assert "Transformer" in payload["relevant_content"]
 
 
+def test_normalize_relevant_content_moves_source_label_to_front():
+    content = ContextualCompressionService._normalize_relevant_content(
+        "Agentic search enables dynamic search and tool use [来源3]",
+        "来源3",
+    )
+
+    assert content == "[来源3] Agentic search enables dynamic search and tool use"
+
+
 @pytest.mark.asyncio
 async def test_compress_chunk_disabled(monkeypatch):
     service = ContextualCompressionService()

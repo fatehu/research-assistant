@@ -238,6 +238,8 @@ class SmartChunkingService:
             next_text_count = self._embedding_text_count + request_text_count
             next_token_count = self._embedding_token_count + request_token_count
 
+            # 语义分块会把句子批量送入 embedding；先用请求级预算挡住极端长文，
+            # 让上层可以明确降级到固定分块，而不是在 provider 侧超时或限流。
             if next_text_count > int(self.MAX_EMBEDDING_TEXTS):
                 raise EmbeddingLimitExceeded(
                     f"text budget exceeded: next={next_text_count}, "
@@ -764,6 +766,8 @@ class SmartChunkingService:
     ) -> SmartChunk:
         text_len = max(len(text), 1)
         header_path = list(external_chunk.header_path or [])
+        # 第三方 splitter 的 metadata 形态不稳定，这里统一补齐系统自己的
+        # 章节、引擎和相邻块信息，避免 API 层感知不同引擎差异。
         resolved_section_title = (
             section_title
             or self._resolve_external_section_title(external_chunk)
@@ -918,6 +922,8 @@ class SmartChunkingService:
             return []
 
         limits = self._resolved or config.resolve_char_limits(text)
+        # 外部语义边界只决定“哪里适合断开”；最终块大小仍由本系统约束，
+        # 先拆超大块再合并碎片，保证检索召回和 embedding 成本都可控。
         adjusted = self._split_oversized_external_chunks(
             external_chunks=external_chunks,
             text=text,
