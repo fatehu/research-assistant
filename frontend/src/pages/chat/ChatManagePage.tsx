@@ -10,6 +10,8 @@ import {
   MessageOutlined,
   PlusOutlined,
   SearchOutlined,
+  StarFilled,
+  StarOutlined,
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
@@ -49,7 +51,7 @@ const formatRelativeTime = (value?: string | null) => {
 }
 
 type ConversationGroup = {
-  key: 'today' | 'yesterday' | 'week' | 'older'
+  key: 'starred' | 'today' | 'yesterday' | 'week' | 'older'
   title: string
   hint: string
   items: Conversation[]
@@ -57,10 +59,11 @@ type ConversationGroup = {
 
 const ChatManagePage = () => {
   const navigate = useNavigate()
-  const { conversations, isLoadingList, fetchConversations, deleteConversation } = useChatStore()
+  const { conversations, isLoadingList, fetchConversations, deleteConversation, updateConversationStar } = useChatStore()
 
   const [keyword, setKeyword] = useState('')
   const [deletingId, setDeletingId] = useState<number | null>(null)
+  const [starringId, setStarringId] = useState<number | null>(null)
 
   useEffect(() => {
     fetchConversations()
@@ -68,9 +71,17 @@ const ChatManagePage = () => {
 
   const orderedConversations = useMemo(
     () =>
-      [...conversations].sort(
-        (a, b) => dayjs(b.updated_at).valueOf() - dayjs(a.updated_at).valueOf()
-      ),
+      [...conversations].sort((a, b) => {
+        const aStarred = Number(a.is_starred || 0) === 1 ? 1 : 0
+        const bStarred = Number(b.is_starred || 0) === 1 ? 1 : 0
+        if (aStarred !== bStarred) return bStarred - aStarred
+        if (aStarred && bStarred) {
+          const aStarredAt = dayjs(a.starred_at || a.updated_at).valueOf()
+          const bStarredAt = dayjs(b.starred_at || b.updated_at).valueOf()
+          if (aStarredAt !== bStarredAt) return bStarredAt - aStarredAt
+        }
+        return dayjs(b.updated_at).valueOf() - dayjs(a.updated_at).valueOf()
+      }),
     [conversations]
   )
 
@@ -93,8 +104,10 @@ const ChatManagePage = () => {
       const updated = dayjs(conv.updated_at)
       return updated.isValid() && (updated.isAfter(weekBaseline) || updated.isSame(weekBaseline))
     }).length
-    const latestUpdated =
-      orderedConversations.length > 0 ? formatAbsoluteTime(orderedConversations[0].updated_at) : '--'
+    const latestConversation = [...orderedConversations].sort(
+      (a, b) => dayjs(b.updated_at).valueOf() - dayjs(a.updated_at).valueOf()
+    )[0]
+    const latestUpdated = latestConversation ? formatAbsoluteTime(latestConversation.updated_at) : '--'
     return {
       totalConversations,
       totalMessages,
@@ -109,6 +122,7 @@ const ChatManagePage = () => {
     const weekStart = todayStart.subtract(7, 'day')
 
     const groups: ConversationGroup[] = [
+      { key: 'starred', title: '星标置顶', hint: '重要会话', items: [] },
       { key: 'today', title: '今天', hint: '最近 24 小时', items: [] },
       { key: 'yesterday', title: '昨天', hint: '前 1 天', items: [] },
       { key: 'week', title: '近 7 天', hint: '最近一周', items: [] },
@@ -116,24 +130,28 @@ const ChatManagePage = () => {
     ]
 
     filteredConversations.forEach((conv) => {
-      const updated = dayjs(conv.updated_at)
-      if (!updated.isValid()) {
-        groups[3].items.push(conv)
-        return
-      }
-      if (updated.isAfter(todayStart) || updated.isSame(todayStart)) {
+      if (Number(conv.is_starred || 0) === 1) {
         groups[0].items.push(conv)
         return
       }
-      if (updated.isAfter(yesterdayStart) || updated.isSame(yesterdayStart)) {
+      const updated = dayjs(conv.updated_at)
+      if (!updated.isValid()) {
+        groups[4].items.push(conv)
+        return
+      }
+      if (updated.isAfter(todayStart) || updated.isSame(todayStart)) {
         groups[1].items.push(conv)
         return
       }
-      if (updated.isAfter(weekStart) || updated.isSame(weekStart)) {
+      if (updated.isAfter(yesterdayStart) || updated.isSame(yesterdayStart)) {
         groups[2].items.push(conv)
         return
       }
-      groups[3].items.push(conv)
+      if (updated.isAfter(weekStart) || updated.isSame(weekStart)) {
+        groups[3].items.push(conv)
+        return
+      }
+      groups[4].items.push(conv)
     })
 
     return groups.filter((group) => group.items.length > 0)
@@ -158,6 +176,19 @@ const ChatManagePage = () => {
         }
       },
     })
+  }
+
+  const handleToggleStar = async (conv: Conversation) => {
+    const nextIsStarred = Number(conv.is_starred || 0) !== 1
+    try {
+      setStarringId(conv.id)
+      await updateConversationStar(conv.id, nextIsStarred)
+      message.success(nextIsStarred ? '已星标置顶' : '已取消星标')
+    } catch {
+      message.error('星标操作失败，请稍后重试')
+    } finally {
+      setStarringId(null)
+    }
   }
 
   return (
@@ -279,7 +310,11 @@ const ChatManagePage = () => {
                       >
                         <div className="flex items-start gap-3">
                           <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-emerald-500/30 bg-emerald-500/10">
-                            <MessageOutlined className="text-sm text-emerald-200" />
+                            {Number(conv.is_starred || 0) === 1 ? (
+                              <StarFilled className="text-sm text-amber-300" />
+                            ) : (
+                              <MessageOutlined className="text-sm text-emerald-200" />
+                            )}
                           </span>
 
                           <button
@@ -309,6 +344,17 @@ const ChatManagePage = () => {
                           </button>
 
                           <div className="flex shrink-0 items-center gap-1">
+                            <Button
+                              type="text"
+                              size="small"
+                              title={Number(conv.is_starred || 0) === 1 ? '取消星标' : '星标置顶'}
+                              loading={starringId === conv.id}
+                              icon={Number(conv.is_starred || 0) === 1 ? <StarFilled /> : <StarOutlined />}
+                              onClick={() => handleToggleStar(conv)}
+                              className={Number(conv.is_starred || 0) === 1
+                                ? '!text-amber-300 hover:!bg-amber-500/10 hover:!text-amber-200'
+                                : '!text-slate-400 hover:!bg-amber-500/10 hover:!text-amber-200'}
+                            />
                             <Button
                               type="text"
                               size="small"

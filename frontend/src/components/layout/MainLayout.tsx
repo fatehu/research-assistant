@@ -24,6 +24,8 @@ import {
   ReadOutlined,
   ProjectOutlined,
   LoadingOutlined,
+  StarFilled,
+  StarOutlined,
   TeamOutlined,
   CrownOutlined,
   SolutionOutlined,
@@ -45,19 +47,22 @@ dayjs.locale('zh-cn')
 const { Sider, Header, Content } = Layout
 
 // 对话列表项组件
-const ConversationItem = ({ 
-  conv, 
+const ConversationItem = ({
+  conv,
   isActive,
   onClick,
-  onDelete 
-}: { 
+  onDelete,
+  onToggleStar,
+}: {
   conv: Conversation
   isActive: boolean
   onClick: () => void
   onDelete: () => void
+  onToggleStar: () => void
 }) => {
   const [showActions, setShowActions] = useState(false)
-  
+  const isStarred = Number(conv.is_starred || 0) === 1
+
   return (
     <motion.div
       initial={{ opacity: 0, x: -10 }}
@@ -80,7 +85,7 @@ const ConversationItem = ({
       </div>
       
       {/* 标题和时间 */}
-      <div className="flex-1 min-w-0">
+      <div className="flex-1 min-w-0 pr-14">
         <div className={`truncate text-sm ${isActive ? 'font-medium text-white' : 'text-slate-300'}`}>
           {conv.title || '新对话'}
         </div>
@@ -91,38 +96,62 @@ const ConversationItem = ({
       
       {/* 操作按钮 */}
       <AnimatePresence>
-        {showActions && (
+        {(showActions || isStarred) && (
           <motion.div
             initial={{ opacity: 0, scale: 0.8 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.8 }}
-            className="absolute right-2"
+            className="absolute right-2 flex items-center gap-1"
           >
-            <Dropdown
-              menu={{
-                items: [
-                  {
-                    key: 'delete',
-                    icon: <DeleteOutlined />,
-                    label: '删除',
-                    danger: true,
-                    onClick: (e) => {
-                      e.domEvent.stopPropagation()
-                      onDelete()
-                    },
-                  },
-                ],
+            <Button
+              type="text"
+              size="small"
+              title={isStarred ? '取消星标' : '星标置顶'}
+              icon={isStarred ? <StarFilled /> : <StarOutlined />}
+              onClick={(e) => {
+                e.stopPropagation()
+                onToggleStar()
               }}
-              trigger={['click']}
-            >
-              <Button
-                type="text"
-                size="small"
-                icon={<MoreOutlined />}
-                onClick={(e) => e.stopPropagation()}
-                className="!text-slate-500 hover:!bg-white/[0.08] hover:!text-white"
-              />
-            </Dropdown>
+              className={isStarred
+                ? '!text-amber-300 hover:!bg-amber-500/10 hover:!text-amber-200'
+                : '!text-slate-500 hover:!bg-white/[0.08] hover:!text-amber-200'}
+            />
+            {showActions && (
+              <Dropdown
+                menu={{
+                  items: [
+                    {
+                      key: 'star',
+                      icon: isStarred ? <StarFilled /> : <StarOutlined />,
+                      label: isStarred ? '取消星标' : '星标置顶',
+                      onClick: (e) => {
+                        e.domEvent.stopPropagation()
+                        onToggleStar()
+                      },
+                    },
+                    {
+                      key: 'delete',
+                      icon: <DeleteOutlined />,
+                      label: '删除',
+                      danger: true,
+                      onClick: (e) => {
+                        e.domEvent.stopPropagation()
+                        onDelete()
+                      },
+                    },
+                  ],
+                }}
+                trigger={['click']}
+              >
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<MoreOutlined />}
+                  onClick={(e) => e.stopPropagation()}
+                  className="!text-slate-500 hover:!bg-white/[0.08] hover:!text-white"
+                />
+              </Dropdown>
+            )}
           </motion.div>
         )}
       </AnimatePresence>
@@ -232,7 +261,7 @@ const MainLayout = () => {
   const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   
   const { user, logout } = useAuthStore()
-  const { conversations, fetchConversations, deleteConversation } = useChatStore()
+  const { conversations, fetchConversations, deleteConversation, updateConversationStar } = useChatStore()
   
   useEffect(() => {
     fetchConversations()
@@ -500,10 +529,19 @@ const MainLayout = () => {
     setDeleteTarget(convId)
     setDeleteModalVisible(true)
   }
-  
+
+  const handleToggleConversationStar = async (conv: Conversation) => {
+    try {
+      await updateConversationStar(conv.id, Number(conv.is_starred || 0) !== 1)
+    } catch {
+      // 错误提示由 store 统一处理，这里只避免事件处理链抛出未捕获异常。
+    }
+  }
+
   // 按日期分组对话
   const groupedConversations = useMemo(() => {
     const groups: Record<string, Conversation[]> = {
+      '星标': [],
       '今天': [],
       '昨天': [],
       '过去7天': [],
@@ -514,8 +552,12 @@ const MainLayout = () => {
     const today = now.startOf('day')
     const yesterday = today.subtract(1, 'day')
     const weekAgo = today.subtract(7, 'day')
-    
+
     conversations.forEach((conv) => {
+      if (Number(conv.is_starred || 0) === 1) {
+        groups['星标'].push(conv)
+        return
+      }
       const convDate = dayjs(conv.updated_at)
       if (convDate.isAfter(today)) {
         groups['今天'].push(conv)
@@ -530,8 +572,8 @@ const MainLayout = () => {
     
     return groups
   }, [conversations])
-  
-  const groupOrder = ['今天', '昨天', '过去7天', '更早']
+
+  const groupOrder = ['星标', '今天', '昨天', '过去7天', '更早']
   const userRoleLabel = user?.role === 'admin' ? '管理员' : user?.role === 'mentor' ? '导师' : '学生'
   
   // 获取当前选中的菜单键
@@ -787,7 +829,7 @@ const MainLayout = () => {
                             key={group}
                             title={group}
                             count={convs.length}
-                            defaultExpanded={group === '今天' || group === '昨天'}
+                            defaultExpanded={group === '星标' || group === '今天' || group === '昨天'}
                           >
                             {convs.map((conv) => (
                               <ConversationItem
@@ -796,6 +838,7 @@ const MainLayout = () => {
                                 isActive={conversationId ? parseInt(conversationId) === conv.id : false}
                                 onClick={() => navigate(`/chat/${conv.id}`)}
                                 onDelete={() => showDeleteModal(conv.id)}
+                                onToggleStar={() => handleToggleConversationStar(conv)}
                               />
                             ))}
                           </CollapsibleGroup>

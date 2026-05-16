@@ -42,6 +42,8 @@ class Conversation(Base):
     
     # 状态
     is_archived = Column(Integer, default=0)
+    is_starred = Column(Integer, default=0)
+    starred_at = Column(DateTime, nullable=True)
     
     # 时间戳
     created_at = Column(DateTime, default=datetime.utcnow)

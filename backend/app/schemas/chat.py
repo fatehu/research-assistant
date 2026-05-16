@@ -308,6 +308,8 @@ class ConversationResponse(BaseModel):
     llm_provider: str
     llm_model: Optional[str] = None
     is_archived: int
+    is_starred: int = 0
+    starred_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
     messages: List[MessageResponse] = Field(default_factory=list)
@@ -343,10 +345,17 @@ class ConversationListResponse(BaseModel):
     title: str
     llm_provider: str
     is_archived: int
+    is_starred: int = 0
+    starred_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
     last_message: Optional[str] = None
     message_count: int = 0
+
+
+class ConversationStarUpdate(BaseModel):
+    """对话星标更新请求"""
+    is_starred: bool
 
 
 class ChatSkillLaunch(BaseModel):

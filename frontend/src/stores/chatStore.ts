@@ -47,6 +47,8 @@ const appendRollingToolOutput = (existing: string | undefined, incoming: string,
   if (!next) return String(existing || '')
   const merged = `${String(existing || '')}${next}`
   const lines = merged.split('\n')
+  // 工具流可能很长；前端临时 UI 状态只保留最新几行，
+  // 完整日志仍以后端为准。
   const kept = lines.slice(-maxLines)
   return kept.join('\n').trimStart()
 }
@@ -81,6 +83,8 @@ const formatClaudeStreamLine = (rawLine: string): string[] => {
     return [truncateToolLine(normalized, 180)]
   }
 
+  // 来自 Claude 的流会输出多种事件类型的 JSONL envelope；这里转成紧凑的
+  // 可读 trace，而不是直接倾倒原始协议 payload。
   const eventType = String(parsed?.type || '').trim()
   const message = parsed?.message && typeof parsed.message === 'object' ? parsed.message : null
   const content = Array.isArray(message?.content) ? message.content : []
@@ -274,6 +278,8 @@ const buildDoneAssistantMessage = ({
 
   if (!content.trim()) return null
 
+  // 完成事件后优先使用 item_stream/turn_store 数据，因为流式 fallback 文本
+  // 可能落后于最终持久化的 metadata 和 message ID。
   return {
     id: resolvedMessageId || Date.now() + 1,
     conversation_id: conversationId,
@@ -291,16 +297,16 @@ const buildDoneAssistantMessage = ({
 
 const resolveConversationWorkflowControl = (messages: Message[] | undefined): ChatWorkflowControl | null => {
   const candidates = Array.isArray(messages) ? messages : []
-  for (let index = candidates.length - 1; index >= 0; index -= 1) {
-    const message = candidates[index]
-    const workflowControl =
-      message?.role === 'assistant' &&
-      message.metadata &&
-      typeof message.metadata === 'object' &&
-      (message.metadata.workflow_control as ChatWorkflowControl | undefined)
-    if (workflowControl && typeof workflowControl === 'object') {
-      return workflowControl
-    }
+  const latestMessage = candidates[candidates.length - 1]
+  if (!latestMessage || latestMessage.role !== 'assistant') {
+    return null
+  }
+  const workflowControl =
+    latestMessage.metadata &&
+    typeof latestMessage.metadata === 'object' &&
+    (latestMessage.metadata.workflow_control as ChatWorkflowControl | undefined)
+  if (workflowControl && typeof workflowControl === 'object') {
+    return workflowControl
   }
   return null
 }
@@ -311,6 +317,8 @@ const applySpanRewriteToConversation = (
 ): Conversation | null => {
   if (!conversation) return conversation
   const messageId = response.message.id
+  // 片段改写会同时 patch item_stream 和 turn_store，使历史视图和实时轮次摘要
+  // 与已编辑的 assistant 消息保持一致。
   const nextItemStream = conversation.item_stream
     ? {
         ...conversation.item_stream,
@@ -417,6 +425,24 @@ const applyDocumentArtifactUpdateToConversation = (
   }
 }
 
+const isConversationStarred = (conversation: Conversation | null | undefined): boolean =>
+  Number(conversation?.is_starred || 0) === 1
+
+const sortConversationList = (conversations: Conversation[]): Conversation[] =>
+  [...conversations].sort((a, b) => {
+    const aStarred = isConversationStarred(a) ? 1 : 0
+    const bStarred = isConversationStarred(b) ? 1 : 0
+    if (aStarred !== bStarred) return bStarred - aStarred
+
+    if (aStarred && bStarred) {
+      const aStarredAt = new Date(a.starred_at || a.updated_at || 0).getTime()
+      const bStarredAt = new Date(b.starred_at || b.updated_at || 0).getTime()
+      if (aStarredAt !== bStarredAt) return bStarredAt - aStarredAt
+    }
+
+    return new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime()
+  })
+
 const upsertConversationListItem = (
   conversations: Conversation[],
   conversation: Conversation | null,
@@ -428,14 +454,14 @@ const upsertConversationListItem = (
   }
   const existingIndex = conversations.findIndex((item) => item.id === updatedConversation.id)
   if (existingIndex < 0) {
-    return [updatedConversation, ...conversations]
+    return sortConversationList([updatedConversation, ...conversations])
   }
   const next = [...conversations]
   next[existingIndex] = {
     ...next[existingIndex],
     ...updatedConversation,
   }
-  return next
+  return sortConversationList(next)
 }
 
 interface ChatState {
@@ -479,6 +505,7 @@ interface ChatState {
   selectConversation: (conversationId: number) => Promise<void>
   resumeBackgroundRun: (runId: string, conversationId: number) => Promise<void>
   deleteConversation: (conversationId: number) => Promise<void>
+  updateConversationStar: (conversationId: number, isStarred: boolean) => Promise<void>
   archiveConversation: (conversationId: number) => Promise<void>
   compactConversationContext: () => Promise<void>
   rewriteMessageSpan: (
@@ -547,7 +574,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         skip += pageSize
       }
 
-      set({ conversations, isLoadingList: false })
+      set({ conversations: sortConversationList(conversations), isLoadingList: false })
     } catch (error) {
       handleApiError(error, '获取对话列表')
       set({ isLoadingList: false })
@@ -558,7 +585,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       const conversation = await chatApi.createConversation(title || '新对话')
       set((state) => ({
-        conversations: [conversation, ...state.conversations],
+        conversations: sortConversationList([conversation, ...state.conversations]),
         currentConversation: conversation,
         messages: [],
         lastRunContextDebug: null,
@@ -1043,6 +1070,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
       sendPhaseLabel: currentConversation?.id === conversationId ? null : state.sendPhaseLabel,
       sendPhaseHint: currentConversation?.id === conversationId ? null : state.sendPhaseHint,
     }))
+  },
+
+  updateConversationStar: async (conversationId: number, isStarred: boolean) => {
+    try {
+      const response = await chatApi.updateConversationStar(conversationId, isStarred)
+      set((state) => {
+        const patch = (conversation: Conversation): Conversation =>
+          conversation.id === conversationId
+            ? {
+                ...conversation,
+                is_starred: response.is_starred,
+                starred_at: response.starred_at || null,
+              }
+            : conversation
+        return {
+          conversations: sortConversationList(state.conversations.map(patch)),
+          currentConversation:
+            state.currentConversation?.id === conversationId
+              ? patch(state.currentConversation)
+              : state.currentConversation,
+        }
+      })
+    } catch (error) {
+      handleApiError(error, isStarred ? '星标对话' : '取消星标')
+      throw error
+    }
   },
 
   archiveConversation: async (conversationId: number) => {

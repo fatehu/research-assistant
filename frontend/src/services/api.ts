@@ -1,11 +1,11 @@
 import axios, { AxiosError } from 'axios'
 
-// API base configuration
+// 接口基础配置集中在这里，方便本地开发、Docker 和部署环境共享同一套客户端入口。
 const VITE_ENV = ((import.meta as any).env || {}) as Record<string, string | undefined>
 const API_BASE_URL = VITE_ENV.VITE_API_BASE_URL || 'http://localhost:8888'
 export const SHOW_RAG_METRICS = VITE_ENV.VITE_SHOW_RAG_METRICS === 'true'
-// Let long-running reader/workbench v2 builds be bounded by backend/runtime policy
-// instead of a browser-side hard timeout that aborts valid cold-start executions.
+// 阅读器和 workbench v2 构建可能触发冷启动；由后端/runtime 控制超时，
+// 不在浏览器侧硬中断有效请求。
 const LONG_RUNNING_READER_TIMEOUT_MS = 0
 const CHAT_CONTEXT_PREVIEW_TIMEOUT_MS = 90000
 
@@ -29,7 +29,7 @@ export type TaskStatus =
   | 'timeout'
   | 'cancelled'
 
-// Create axios instance
+// 默认 axios 实例负责普通 JSON 请求；流式接口使用 fetch 单独处理。
 const api = axios.create({
   baseURL: API_BASE_URL,
   timeout: 30000, // 30s timeout
@@ -46,6 +46,8 @@ function reuseInflightRequest<T>(
   key: string,
   factory: () => Promise<T>,
 ): Promise<T> {
+  // 同一个缓存型阅读器请求在短时间内可能被多个组件同时触发；复用进行中的 Promise，
+  // 避免重复占用后端构建资源。
   const cached = inflight.get(key)
   if (cached) return cached
   const request = factory().finally(() => {
@@ -57,7 +59,7 @@ function reuseInflightRequest<T>(
   return request
 }
 
-// Request interceptor - attach token
+// 请求拦截器负责从 zustand 持久化状态取 token，并附加到所有普通 API 请求。
 api.interceptors.request.use((config) => {
   const authStorage = localStorage.getItem('auth-storage')
   if (authStorage) {
@@ -136,7 +138,7 @@ const readJsonSseResponse = async (
         const data = JSON.parse(line.slice(5).trim())
         onEvent?.(data.event, data.data)
       } catch {
-        // ignore malformed stream chunk
+        // 忽略被网络分片截断或后端调试输出污染的异常流片段。
       }
     }
 
@@ -147,7 +149,7 @@ const readJsonSseResponse = async (
           const data = JSON.parse(trailing.slice(5).trim())
           onEvent?.(data.event, data.data)
         } catch {
-          // ignore malformed trailing chunk
+          // 忽略收尾阶段仍不完整的异常片段。
         }
       }
       return ''
@@ -167,7 +169,7 @@ const readJsonSseResponse = async (
   }
 }
 
-// Response interceptor - normalize errors
+// 响应拦截器统一错误消息，并在 401 时清理本地登录态。
 api.interceptors.response.use(
   (response) => response,
   (error: AxiosError<ApiErrorResponsePayload>) => {
@@ -288,6 +290,8 @@ export interface Conversation {
   llm_provider: string
   llm_model?: string
   is_archived: number
+  is_starred?: number
+  starred_at?: string | null
   created_at: string
   updated_at: string
   messages?: Message[]
@@ -303,6 +307,13 @@ export interface Conversation {
   document_artifact?: DocumentArtifact | null
 }
 
+export interface ConversationStarResponse {
+  message: string
+  is_starred: number
+  starred_at?: string | null
+}
+
+// 会话上下文相关类型与后端压缩/证据账本保持同构，聊天页、调试窗口和历史恢复都会读取。
 export interface ConversationEvidenceLedgerEntry {
   entry_id: string
   origin_kind: 'tool_result' | 'assistant_summary' | 'llm_inferred'
@@ -384,6 +395,7 @@ export interface ChatRagOverrides {
   use_contextual_compression?: boolean
 }
 
+// 聊天运行记录是新的流式执行入口：先创建 run，再单独订阅事件流，便于恢复/取消。
 export interface ChatRunResponse {
   run_id: string
   user_id?: number
@@ -441,6 +453,7 @@ export interface ConversationToolLedgerEntry {
   created_at?: string
 }
 
+// 工具账本和条目流都是后端持久化的执行轨迹；前者偏审计，后者偏 UI 渲染。
 export interface ConversationToolLedger {
   version: string
   updated_at?: string
@@ -729,6 +742,7 @@ export interface ChatContextDebug {
   model_tool_schemas_raw?: Record<string, unknown>[]
 }
 
+// 消息 metadata 中的引用索引服务于前端引用解释，不参与模型上下文本身。
 export interface ReasoningSummary {
   summary: string
 }
@@ -922,11 +936,11 @@ export interface SearchResult {
   score: number
   chunk_index: number
   metadata: Record<string, unknown>
-  // [Fix 12] Hierarchical retrieval fields
-  chunk_level?: string // paragraph / section / document
-  section_type?: string // abstract / methodology / results ...
+  // 分层检索字段由后端补充，用于展示父级章节和段落层级。
+  chunk_level?: string // 段落 / 章节 / 文档
+  section_type?: string // 摘要 / 方法 / 结果等
   section_title?: string
-  parent_context?: string // parent chunk preview
+  parent_context?: string // 父级 chunk 预览
 }
 
 export interface SearchResponse {
@@ -974,6 +988,8 @@ async function streamJsonSse<TEvent extends string = string>(
   onEvent?: SseEventHandler<TEvent>,
   abortController?: AbortController,
 ): Promise<void> {
+  // 通用 SSE 订阅工具用于知识库/文献状态流；网络瞬断时做轻量重连，
+  // 非重试型业务错误仍向上抛出。
   const sleep = async (ms: number): Promise<void> => {
     if (abortController?.signal.aborted) return
     await new Promise<void>((resolve) => {
@@ -1005,7 +1021,7 @@ async function streamJsonSse<TEvent extends string = string>(
           const err = (await response.json()) as { detail?: ApiErrorDetail }
           detail = extractApiErrorMessage(err?.detail, detail)
         } catch {
-          // ignore json parse error for non-json body
+          // 非 JSON 错误体保留默认错误文案。
         }
         const retryableStatus = response.status >= 500
         if (!retryableStatus) {
@@ -1044,7 +1060,7 @@ async function streamJsonSse<TEvent extends string = string>(
             if (!event) continue
             onEvent?.(event as TEvent, parsed?.data)
           } catch {
-            // ignore malformed chunk
+            // 忽略异常流片段，等待后续心跳或业务事件修正 UI 状态。
           }
         }
       }
@@ -1162,6 +1178,8 @@ export const userApi = {
   },
 }
 
+// 聊天 API 同时保留旧 sendMessageStream 和新 run/stream 两套入口；
+// 新页面优先使用 run 模式，便于停止、恢复和读取持久化执行轨迹。
 export const chatApi = {
   getConversations: async (
     skip = 0,
@@ -1252,6 +1270,8 @@ export const chatApi = {
     chatPreferenceOverrides?: Partial<ChatUserPreferences>,
     ragOverrides?: ChatRagOverrides | null,
   ): Promise<ChatContextPreviewResponse> => {
+    // 完整上下文预演会组装模型请求、工具 schema、偏好和临时 RAG 设置，
+    // 因此给它独立的较长超时。
     const response = await api.post(
       '/api/v1/chat/context-preview',
       {
@@ -1277,6 +1297,16 @@ export const chatApi = {
     await api.delete(`/api/v1/chat/conversations/${conversationId}`)
   },
 
+  updateConversationStar: async (
+    conversationId: number,
+    isStarred: boolean,
+  ): Promise<ConversationStarResponse> => {
+    const response = await api.put(`/api/v1/chat/conversations/${conversationId}/star`, {
+      is_starred: isStarred,
+    })
+    return response.data
+  },
+
   getMessages: async (
     conversationId: number,
     skip = 0,
@@ -1298,6 +1328,7 @@ export const chatApi = {
     skillLaunch?: ChatSkillLaunchRequest | null,
     documentArtifactBlockIds?: string[],
   ): Promise<ChatRunResponse> => {
+    // 创建 run 时只提交本轮输入和覆盖项；实际 token/工具事件通过 streamChatRun 返回。
     const response = await api.post('/api/v1/chat/runs', {
       message,
       conversation_id: conversationId,
@@ -1319,6 +1350,7 @@ export const chatApi = {
     abortController?: AbortController,
   ): Promise<void> => {
     try {
+      // 运行记录事件流使用 fetch，而不是 axios，这样可以逐块读取 SSE。
       const response = await fetch(`${API_BASE_URL}/api/v1/chat/runs/${encodeURIComponent(runId)}/stream`, {
         method: 'GET',
         headers: {
@@ -1371,6 +1403,7 @@ export const chatApi = {
     documentArtifactBlockIds?: string[],
   ): Promise<void> => {
     try {
+      // 兼容旧聊天入口：直接发送并订阅响应流，新 run 模式稳定后仍可作为回退。
       const response = await fetch(`${API_BASE_URL}/api/v1/chat/send`, {
         method: 'POST',
         headers: {
@@ -1499,6 +1532,7 @@ export const knowledgeApi = {
     file: File,
     options: DocumentUploadOptions = {},
   ): Promise<Document> => {
+    // 上传文档时把摄取模式和抽取配置一起放入 multipart，后端据此选择本地/在线解析链路。
     const formData = new FormData()
     formData.append('file', file)
     if (options.ingestMode) {
@@ -1552,6 +1586,7 @@ export const knowledgeApi = {
     onEvent?: (event: 'connected' | 'heartbeat' | 'document_status', data: any) => void,
     abortController?: AbortController,
   ): Promise<void> => {
+    // 文档摄取状态走 SSE；页面可订阅单个知识库，也可订阅全局状态变化。
     const query = new URLSearchParams()
     if (params?.kb_id && params.kb_id > 0) {
       query.set('kb_id', String(params.kb_id))
@@ -1578,6 +1613,7 @@ export const knowledgeApi = {
     includeParentContext = false,
     options: KnowledgeSearchOptions = {},
   ): Promise<SearchResponse> => {
+    // 搜索选项直接映射后端 RAG 流水线开关，调用方可以按场景覆盖重排、混合检索和压缩。
     const {
       useReranker = true,
       useHybrid = true,
@@ -1591,6 +1627,7 @@ export const knowledgeApi = {
       timeoutMs = 300000,
       signal,
     } = options
+    // 相邻 chunk 窗口限制在小范围内，避免一次检索把上下文膨胀到不可控。
     const normalizedAdjacentWindow = Math.max(1, Math.min(3, adjacentWindow))
 
     const response = await api.post('/api/v1/knowledge/search', {
@@ -3476,6 +3513,7 @@ export const literatureApi = {
     ) => void,
     abortController?: AbortController,
   ): Promise<void> => {
+    // 旧版生成式阅读器仍保留独立流式入口，供需要逐步渲染页面结构的界面使用。
     const response = await fetch(`${API_BASE_URL}/api/v1/literature/papers/${paperId}/reader/generative/stream`, {
       method: 'POST',
       headers: {
@@ -3492,7 +3530,7 @@ export const literatureApi = {
         const err = (await response.json()) as { detail?: ApiErrorDetail }
         detail = extractApiErrorMessage(err?.detail, detail)
       } catch {
-        // ignore json parse error for non-json body
+        // 非 JSON 错误体保留默认错误文案。
       }
       throw new Error(detail)
     }
@@ -3522,7 +3560,7 @@ export const literatureApi = {
           if (!event) continue
           onEvent?.(event, parsed.data as ReaderGenerativeStreamEventMap[ReaderGenerativeStreamEvent])
         } catch {
-          // ignore malformed stream chunk
+          // 忽略异常流片段，等待后续事件继续驱动渲染。
         }
       }
     }
@@ -3545,6 +3583,7 @@ export const literatureApi = {
     ) => void,
     abortController?: AbortController,
   ): Promise<void> => {
+    // 组合阅读器流式返回结构化组件计划，事件类型由 ReaderComposeStreamEventMap 约束。
     const response = await fetch(`${API_BASE_URL}/api/v1/literature/papers/${paperId}/reader/composed/stream`, {
       method: 'POST',
       headers: {
@@ -3561,7 +3600,7 @@ export const literatureApi = {
         const err = (await response.json()) as { detail?: ApiErrorDetail }
         detail = extractApiErrorMessage(err?.detail, detail)
       } catch {
-        // ignore json parse error for non-json body
+        // 非 JSON 错误体保留默认错误文案。
       }
       throw new Error(detail)
     }
@@ -3591,7 +3630,7 @@ export const literatureApi = {
           if (!event) continue
           onEvent?.(event, parsed.data as ReaderComposeStreamEventMap[ReaderComposeStreamEvent])
         } catch {
-          // ignore malformed stream chunk
+          // 忽略异常流片段，避免单个坏包中断整个阅读器构建。
         }
       }
     }
@@ -3638,6 +3677,7 @@ export const literatureApi = {
     payload: ReaderExperiencePlanRequest,
   ): Promise<ReaderExperiencePlanResponse> => {
     const requestKey = JSON.stringify(['experience_plan_cached', paperId, payload])
+    // 缓存读取可能被多个 tab/panel 同时触发；同 key 请求在前端层面合并。
     return reuseInflightRequest(inflightCachedExperienceRequests, requestKey, async () => {
       const response = await api.post(
         `/api/v1/literature/papers/${paperId}/experience/plan/cached`,
@@ -3653,6 +3693,7 @@ export const literatureApi = {
     payload: ReaderExperienceV2Request,
   ): Promise<ReaderExperienceV2Response> => {
     const requestKey = JSON.stringify(['experience_v2_cached', paperId, payload])
+    // 第二版阅读体验构建更重，复用进行中的缓存请求可以减少后端排队压力。
     return reuseInflightRequest(inflightCachedExperienceV2Requests, requestKey, async () => {
       const response = await api.post(
         `/api/v1/literature/papers/${paperId}/experience-v2/cached`,
@@ -3805,6 +3846,7 @@ export const literatureApi = {
     ) => void,
     abortController?: AbortController,
   ): Promise<void> => {
+    // 内联问答绑定具体阅读节点，使用独立事件类型，避免和整页 composed 流混淆。
     const response = await fetch(`${API_BASE_URL}/api/v1/literature/papers/${paperId}/reader/composed/inline-query/stream`, {
       method: 'POST',
       headers: {
@@ -3821,7 +3863,7 @@ export const literatureApi = {
         const err = (await response.json()) as { detail?: ApiErrorDetail }
         detail = extractApiErrorMessage(err?.detail, detail)
       } catch {
-        // ignore json parse error for non-json body
+        // 非 JSON 错误体保留默认错误文案。
       }
       throw new Error(detail)
     }
@@ -3851,7 +3893,7 @@ export const literatureApi = {
           if (!event) continue
           onEvent?.(event, parsed.data as ReaderInlineQueryEventMap[ReaderInlineQueryEvent])
         } catch {
-          // ignore malformed stream chunk
+          // 忽略异常流片段，避免局部问答因单个坏包失败。
         }
       }
     }
@@ -3944,6 +3986,7 @@ export const literatureApi = {
     onEvent?: (event: 'connected' | 'heartbeat' | 'paper_link_status' | 'reader_page_ready', data: any) => void,
     abortController?: AbortController,
   ): Promise<void> => {
+    // 文献状态流复用通用 SSE 工具，用于论文入库、知识库链接和 reader ready 通知。
     const query = new URLSearchParams()
     if (params?.paper_id && params.paper_id > 0) {
       query.set('paper_id', String(params.paper_id))
@@ -3977,6 +4020,7 @@ export const literatureApi = {
     onEvent?: (event: LiteratureAskEvent['event'], data: any) => void,
     abortController?: AbortController
   ): Promise<void> => {
+    // 文献问答是范围化流式接口，scope 可指向单篇论文、合集或知识库。
     const response = await fetch(`${API_BASE_URL}/api/v1/literature/ask`, {
       method: 'POST',
       headers: {
@@ -3993,7 +4037,7 @@ export const literatureApi = {
         const err = (await response.json()) as { detail?: ApiErrorDetail }
         detail = extractApiErrorMessage(err?.detail, detail)
       } catch {
-        // ignore json parse error for non-json body
+        // 非 JSON 错误体保留默认错误文案。
       }
       throw new Error(detail)
     }
@@ -4020,7 +4064,7 @@ export const literatureApi = {
           const parsed = JSON.parse(line.slice(6)) as LiteratureAskEvent
           onEvent?.(parsed.event, parsed.data)
         } catch {
-          // ignore malformed chunk
+          // 忽略异常流片段，后续 token/完成事件会继续推进 UI。
         }
       }
     }
@@ -4032,6 +4076,7 @@ export const literatureApi = {
     onEvent?: (event: ReaderExperienceBlockExplainEvent['event'], data: any) => void,
     abortController?: AbortController,
   ): Promise<void> => {
+    // 块解释针对第二版阅读体验里的单个块做解释，仍然采用 SSE 以便展示增量回答。
     const response = await fetch(`${API_BASE_URL}/api/v1/literature/papers/${paperId}/experience-v2/block-explain/stream`, {
       method: 'POST',
       headers: {
@@ -4048,7 +4093,7 @@ export const literatureApi = {
         const err = (await response.json()) as { detail?: ApiErrorDetail }
         detail = extractApiErrorMessage(err?.detail, detail)
       } catch {
-        // ignore json parse error for non-json body
+        // 非 JSON 错误体保留默认错误文案。
       }
       throw new Error(detail)
     }
@@ -4075,7 +4120,7 @@ export const literatureApi = {
           const parsed = JSON.parse(line.slice(6)) as ReaderExperienceBlockExplainEvent
           onEvent?.(parsed.event, parsed.data)
         } catch {
-          // ignore malformed chunk
+          // 忽略异常流片段，避免解释面板被单个坏包打断。
         }
       }
     }
@@ -4463,6 +4508,7 @@ export const codelabApi = {
   },
 
   executeCell: async (notebookId: string, data: ExecuteRequest): Promise<ExecuteResponse> => {
+    // 单元格执行可能运行用户实验代码，超时由后端沙箱/后台执行策略控制。
     const response = await api.post(`/api/v1/codelab/notebooks/${notebookId}/execute`, data, {
       timeout: 0,
     })
@@ -4470,6 +4516,7 @@ export const codelabApi = {
   },
 
   executeCode: async (data: ExecuteRequest): Promise<ExecuteResponse> => {
+    // 临时代码执行同样不设置浏览器侧超时，避免长任务被前端提前切断。
     const response = await api.post('/api/v1/codelab/execute', data, {
       timeout: 0,
     })
@@ -4684,19 +4731,17 @@ export interface AgentChatEvent {
   output?: string
   error_contract?: ApiErrorContract
   iteration?: number
-  action?: string // action requiring approval
+  action?: string // 需要用户确认的操作
   provider?: string
   model?: string
-  notebook_updated?: boolean // whether notebook content changed
-  cell_id?: string // new cell id
-  new_cell?: Cell // created cell payload
-  updated_cell?: Cell // updated cell payload
+  notebook_updated?: boolean // 笔记本内容是否变更
+  cell_id?: string // 新单元格 ID
+  new_cell?: Cell // 新建单元格内容
+  updated_cell?: Cell // 更新后的单元格内容
 }
 
-// ========== Notebook Agent API ==========
-
+// 笔记本 Agent 接口：围绕单个 notebook 提供上下文、历史、流式聊天和同步回退。
 export const agentApi = {
-  // Get notebook context
   getContext: async (notebookId: string): Promise<AgentContextResponse> => {
     const response = await api.get(`/api/v1/codelab/notebooks/${notebookId}/agent/context`)
     return response.data
@@ -4723,6 +4768,7 @@ export const agentApi = {
     onEvent: (event: AgentChatEvent) => void,
     abortController?: AbortController
   ): Promise<void> => {
+    // 笔记本 agent 的流式协议直接返回 AgentChatEvent，而不是通用 event/data 包装。
     const response = await fetch(
       `${API_BASE_URL}/api/v1/codelab/notebooks/${notebookId}/agent/chat`,
       {
@@ -4785,6 +4831,7 @@ export const agentApi = {
     suggested_code?: string
     suggested_action?: string
   }> => {
+    // 同步模式用于不需要增量事件的简单场景；请求体强制 stream=false。
     const response = await api.post(
       `/api/v1/codelab/notebooks/${notebookId}/agent/chat`,
       { ...request, stream: false }
@@ -4824,7 +4871,7 @@ export const agentApi = {
     return response.data
   },
 
-  // Analyze data
+  // 分析数据。
   analyzeData: async (
     notebookId: string,
     variableName: string,
@@ -5466,10 +5513,10 @@ export const shareApi = {
     return response.data
   },
 
-  // Share a resource
+  // 分享单个资源。
   shareResource: async (data: {
     resource_type: string
-    resource_id: number | string // supports numeric id or string id (e.g. notebook UUID)
+    resource_id: number | string // 支持数字 ID 或字符串 ID，例如 notebook UUID
     shared_with_type: 'user' | 'group' | 'all_students'
     shared_with_id?: number
     permission?: string
@@ -5479,10 +5526,10 @@ export const shareApi = {
     return response.data
   },
 
-  // Batch share
+  // 批量分享资源。
   batchShare: async (data: {
     resource_type: string
-    resource_ids: (number | string)[] // supports numeric id or string id
+    resource_ids: (number | string)[] // 支持数字 ID 或字符串 ID
     shared_with_type: 'user' | 'group' | 'all_students'
     shared_with_id?: number
     permission?: string
@@ -5703,7 +5750,7 @@ export const mentorshipApi = {
     return studentApi.getReceivedInvitations()
   },
 
-  // Compatibility methods used by Team/Mentorship stores
+  // 团队和导师关系 store 使用的兼容方法。
   getMentors: async (query: string = ''): Promise<UserBrief[]> => {
     const mentors = await studentApi.searchMentors(query)
     return mentors

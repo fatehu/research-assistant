@@ -13,7 +13,7 @@ from typing import Optional, List, Dict, Any, AsyncIterator
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, update
 from sqlalchemy.orm import selectinload
 from loguru import logger
 
@@ -27,6 +27,7 @@ from app.models.knowledge import KnowledgeBase
 from app.models.literature import Paper
 from app.schemas.chat import (
     ConversationBranchRequest, ConversationCreate, ConversationResponse, ConversationListResponse,
+    ConversationStarUpdate,
     MessageResponse, ChatRequest, SaveStoppedMessageRequest, ConversationCompactResponse,
     ChatContextPreviewRequest, ChatContextPreviewResponse,
     MessageSpanRewriteRequest, MessageSpanRewriteResponse,
@@ -707,6 +708,8 @@ def _infer_paper_stage_from_artifact_path(relative_path: object) -> Optional[str
     normalized = str(relative_path or "").strip().lower()
     if not normalized:
         return None
+    if normalized.startswith("reference/reports/"):
+        return None
     if normalized.startswith("reference/") or normalized.startswith("repo/") or normalized.startswith("planning/"):
         return "planning"
     if normalized.startswith("results/"):
@@ -898,6 +901,24 @@ def _attach_workflow_control(
     if workflow_control:
         done_payload["workflow_control"] = workflow_control
     return done_payload
+
+
+def _build_final_workflow_control_payload(
+    request: ChatRequest,
+    *,
+    active_workflow_control: Optional[dict] = None,
+) -> Optional[dict]:
+    if not active_workflow_control:
+        return _build_workflow_control_payload(request)
+    stage_status = str(active_workflow_control.get("stage_status") or "").strip().lower()
+    if stage_status == "blocked":
+        return active_workflow_control
+    stage = str(active_workflow_control.get("stage") or "").strip()
+    return _build_workflow_control_payload(
+        request,
+        stage_override=stage,
+        stage_status="completed",
+    ) or active_workflow_control
 
 
 def _normalized_workflow_control_payload(payload: object) -> Optional[dict]:
@@ -2353,6 +2374,8 @@ async def _consume_streaming_response_events(
             if event == "done" and isinstance(data, dict):
                 done_payload = dict(data)
             if event:
+                # 解析后的 SSE 事件立即转发；start/done payload 保留到流结束后，
+                # 用于最终的数据库记账。
                 await publish(event, data)
 
     payloads, _ = _iter_sse_payloads_from_buffer(buffer, flush=True)
@@ -2480,7 +2503,11 @@ async def list_conversations(
             Conversation.user_id == current_user.id,
             Conversation.is_archived == (1 if archived else 0)
         )
-        .order_by(desc(Conversation.updated_at))
+        .order_by(
+            desc(func.coalesce(Conversation.is_starred, 0)),
+            desc(Conversation.starred_at),
+            desc(Conversation.updated_at),
+        )
         .offset(skip)
         .limit(limit)
     )
@@ -2496,6 +2523,8 @@ async def list_conversations(
             "title": conv.title,
             "llm_provider": conv.llm_provider,
             "is_archived": conv.is_archived,
+            "is_starred": conv.is_starred or 0,
+            "starred_at": conv.starred_at,
             "created_at": conv.created_at,
             "updated_at": conv.updated_at,
             "last_message": row[1][:100] if row[1] else None,
@@ -2599,6 +2628,8 @@ async def create_conversation(
         llm_provider=conversation.llm_provider,
         llm_model=conversation.llm_model,
         is_archived=conversation.is_archived,
+        is_starred=conversation.is_starred or 0,
+        starred_at=conversation.starred_at,
         created_at=conversation.created_at,
         updated_at=conversation.updated_at,
         context_state=conversation_context_state_from_metadata(conversation.metadata_),
@@ -2675,6 +2706,8 @@ async def get_conversation(
         llm_provider=conversation.llm_provider,
         llm_model=conversation.llm_model,
         is_archived=conversation.is_archived,
+        is_starred=conversation.is_starred or 0,
+        starred_at=conversation.starred_at,
         created_at=conversation.created_at,
         updated_at=conversation.updated_at,
         context_state=conversation_context_state_from_metadata(conversation.metadata_),
@@ -3032,6 +3065,8 @@ async def branch_conversation(
         llm_provider=branch.llm_provider,
         llm_model=branch.llm_model,
         is_archived=branch.is_archived,
+        is_starred=branch.is_starred or 0,
+        starred_at=branch.starred_at,
         created_at=branch.created_at,
         updated_at=branch.updated_at,
         context_state=conversation_context_state_from_metadata(branch.metadata_),
@@ -3100,6 +3135,56 @@ async def archive_conversation(
     await db.commit()
     
     return {"message": "操作成功", "is_archived": conversation.is_archived}
+
+
+@router.put("/conversations/{conversation_id}/star")
+async def update_conversation_star(
+    conversation_id: int,
+    data: ConversationStarUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """更新对话星标状态"""
+    result = await db.execute(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == current_user.id,
+        )
+    )
+    conversation = result.scalar_one_or_none()
+
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="对话不存在",
+        )
+
+    next_is_starred = 1 if data.is_starred else 0
+    next_starred_at = datetime.utcnow() if next_is_starred else None
+    await db.execute(
+        update(Conversation)
+        .where(Conversation.id == int(conversation.id))
+        .values(
+            is_starred=next_is_starred,
+            starred_at=next_starred_at,
+            updated_at=Conversation.updated_at,
+        )
+    )
+    await db.commit()
+    await db.refresh(conversation)
+
+    logger.info(
+        "更新对话星标: conversation={} starred={} by {}",
+        conversation_id,
+        bool(next_is_starred),
+        current_user.username,
+    )
+
+    return {
+        "message": "操作成功",
+        "is_starred": next_is_starred,
+        "starred_at": conversation.starred_at.isoformat() if conversation.starred_at else None,
+    }
 
 
 @router.post("/conversations/{conversation_id}/compact", response_model=ConversationCompactResponse)
@@ -3733,6 +3818,8 @@ async def send_message(
         conversation_revision=pre_send_conversation_revision,
     )
 
+    # 持久化用户可见消息；技能启动时可以把更完整的 effective_agent_message
+    # 传给模型，同时保持聊天历史可读。
     # 保存用户消息
     if request.conversation_id:
         existing_message_count_result = await db.execute(
@@ -3835,6 +3922,8 @@ async def send_message(
             if isinstance(prepared_send_plan, dict)
             else request.rag_overrides
         )
+        # 运行时上下文（Runtime context）是 API 状态和 agent 执行之间的交接对象；本轮覆盖项
+        # 集中放在这里，避免写入全局状态。
         return AgentRuntimeContext(
             user_id=current_user.id,
             channel="chat",
@@ -4389,7 +4478,10 @@ async def send_message(
                                             message_metadata["rag_metrics"] = rag_metrics
                                         if isinstance(citation_index, dict):
                                             message_metadata["citation_index"] = citation_index
-                                        workflow_control = active_workflow_control or _build_workflow_control_payload(request)
+                                        workflow_control = _build_final_workflow_control_payload(
+                                            request,
+                                            active_workflow_control=active_workflow_control,
+                                        )
                                         if workflow_control:
                                             message_metadata["workflow_control"] = workflow_control
                                         persisted_message_metadata = _sanitized_persisted_chat_metadata(message_metadata) or {}
@@ -4487,7 +4579,7 @@ async def send_message(
                                         done_payload = _attach_workflow_control(
                                             done_payload,
                                             request,
-                                            workflow_control=active_workflow_control,
+                                            workflow_control=workflow_control,
                                         )
                                         yield _sse_event("done", done_payload)
                     finally:
