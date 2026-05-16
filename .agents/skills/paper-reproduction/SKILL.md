@@ -36,6 +36,14 @@ The prepare step is expected to build these project reference files:
 - `reference/paper/paper_interpretation.json`
 - `reference/repo/readme_intake.json`
 
+During research, tuning, or handoff planning, persist durable Markdown reports under `reference/reports/`:
+
+- `reference/reports/tuning_research.md`
+- `reference/reports/worker_handoff.md`
+- `reference/reports/execution_report.md`
+
+Use `project_write_report` for those report artifacts. It only writes Markdown under `reference/reports/*.md`. It is not a code-editing or command-execution tool.
+
 Prefer the project-scoped tools for inspection and file work:
 
 - `paper_search`
@@ -43,7 +51,7 @@ Prefer the project-scoped tools for inspection and file work:
 - `paper_research_status`
 - `project_tree`
 - `project_read_file`
-- `project_write_file`
+- `project_write_report`
 - `project_claude`
 - `paper_research_search_project_zoekt`
 - `paper_research_probe_repo`
@@ -56,7 +64,8 @@ Use the inspection tools with clear roles:
 - `paper_research_status` is for checking whether the Project and its `reference/` bundle are already ready. It only reads state; it does not refresh anything.
 - `project_tree` is for browsing directory structure and confirming where files live.
 - `project_read_file` is for reading a specific known file by relative path.
-- `project_write_file` writes the complete final contents of one file. It overwrites the file; it is not an append tool.
+- `project_write_report` writes the complete final contents of one Markdown report under `reference/reports/*.md`. It overwrites the report; it is not an append tool.
+- Generic Project file writes are not available in this skill. Code, scripts, data, and repo files must be handled by `project_claude`.
 - `project_claude` is the default worker for reproduction work after `prepare` is done. Use it to talk to Claude Code inside the current Project directory so it can edit code, run commands, debug errors, and continue the reproduction attempt. It automatically reuses the existing Claude session for the current Project directory when one exists, otherwise it starts a new one.
 - `paper_research_search_project_zoekt` is for fast text search across the whole project after you already know what concept, symbol, filename, path pattern, or phrase you want to find.
 - `paper_research_probe_repo` is for checking whether an official remote repo URL is still reachable and cloneable.

@@ -14,6 +14,7 @@ session_system_prompt: |-
   Paper reproduction session contract:
   - 你是策划者和决策者，不是实施 worker。
   - 你负责论文解读、复现准备、Project/reference readiness 检查、实验策略、调优方向、风险判断，以及确定下一条给 worker 的具体指令。
+  - 你可以用 `project_write_report` 把调研、调优计划和 worker handoff 持久化到 `reference/reports/*.md`；这只用于写文档，不用于修改代码。
   - 代码修改、命令执行、调试、训练运行和复现交付都交给 Claude Code，通过 `project_claude` 在当前 Project 内完成。
   - bash/命令类工具只用于了解情况、探测环境、检查路径和状态、收集准备信息；不能作为 Claude Code 不可用或失败后的实施 fallback。
   - 如果 Claude Code 不可用，直接报告实施被 Claude Code/runtime-worker 阻塞，并等待用户重试或修复运行时；不要自行改文件、跑训练或写执行脚本。
@@ -42,19 +43,25 @@ stages:
     title: Planning
     continue_policy: manual
     reads: []
-    writes: []
+    writes:
+      - reference/reports/worker_handoff.md
   - id: execution
     title: Execution
     continue_policy: manual
     reads: []
-    writes: []
+    writes:
+      - reference/reports/execution_report.md
   - id: tuning
     title: Tuning
     continue_policy: manual
     reads: []
-    writes: []
+    writes:
+      - reference/reports/tuning_research.md
 artifacts:
   - path: reference/paper/paper_pdf2md.md
   - path: reference/paper/paper_interpretation.md
   - path: reference/paper/paper_interpretation.json
   - path: reference/repo/readme_intake.json
+  - path: reference/reports/tuning_research.md
+  - path: reference/reports/worker_handoff.md
+  - path: reference/reports/execution_report.md

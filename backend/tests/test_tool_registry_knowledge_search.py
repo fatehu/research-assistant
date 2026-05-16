@@ -42,6 +42,7 @@ def test_tool_registry_registers_knowledge_search_only_when_db_available(monkeyp
         "paper_search",
         "project_tree",
         "project_read_file",
+        "project_write_report",
         "project_write_file",
         "project_bash",
         "project_claude",
@@ -61,6 +62,67 @@ def test_tool_registry_registers_knowledge_search_only_when_db_available(monkeyp
     assert "knowledge_search" in codelab._tools
     assert paper_tool_names.isdisjoint(set(codelab._tools))
 
+
+@pytest.mark.asyncio
+async def test_project_write_report_only_writes_reference_report_markdown(monkeypatch, tmp_path):
+    from app.services import project_paths, project_service
+
+    class _ProjectService:
+        def __init__(self, db):
+            self.db = db
+
+        async def get_project_payload(self, project_id, user_id):
+            return {"id": int(project_id), "user_id": int(user_id)}
+
+    monkeypatch.setattr(project_service, "ProjectService", _ProjectService)
+    monkeypatch.setattr(project_paths, "get_project_root_dir", lambda project_id: tmp_path / str(project_id))
+
+    tool = agent_tools.ProjectWriteReportTool(db=object(), user_id=1)
+    result = await tool.execute(
+        project_id=7,
+        relative_path="tuning_research.md",
+        content="# Tuning research\n\n- finding",
+    )
+
+    assert result.success is True
+    assert result.data["relative_path"] == "reference/reports/tuning_research.md"
+    assert (tmp_path / "7" / "reference" / "reports" / "tuning_research.md").read_text(encoding="utf-8") == (
+        "# Tuning research\n\n- finding"
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_write_report_rejects_repo_or_non_markdown_paths(monkeypatch, tmp_path):
+    from app.services import project_paths, project_service
+
+    class _ProjectService:
+        def __init__(self, db):
+            self.db = db
+
+        async def get_project_payload(self, project_id, user_id):
+            return {"id": int(project_id), "user_id": int(user_id)}
+
+    monkeypatch.setattr(project_service, "ProjectService", _ProjectService)
+    monkeypatch.setattr(project_paths, "get_project_root_dir", lambda project_id: tmp_path / str(project_id))
+
+    tool = agent_tools.ProjectWriteReportTool(db=object(), user_id=1)
+    repo_result = await tool.execute(
+        project_id=7,
+        relative_path="repo/source/TUNING-PLAN.md",
+        content="# should not land here",
+    )
+    json_result = await tool.execute(
+        project_id=7,
+        relative_path="reference/reports/tuning_research.json",
+        content="{}",
+    )
+
+    assert repo_result.success is False
+    assert repo_result.error == "project_report_path_out_of_scope"
+    assert json_result.success is False
+    assert json_result.error == "project_report_path_out_of_scope"
+    assert not (tmp_path / "7" / "repo" / "source" / "TUNING-PLAN.md").exists()
+    assert not (tmp_path / "7" / "reference" / "reports" / "tuning_research.json").exists()
 
 
 def test_paper_research_tool_parameters_expose_input_model_constraints():

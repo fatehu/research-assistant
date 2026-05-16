@@ -345,6 +345,8 @@ class ToolBase(Tool, ABC):
         last_result: ToolResult = ToolResult(success=False, output="工具执行失败", error="unknown_error")
 
         for attempt in range(1, max_attempts + 1):
+            # 所有具体工具都经过这个包装层，确保 timeout/retry 语义和错误契约
+            # 在不同 provider 间保持一致。
             try:
                 maybe_awaitable = self._execute(**validated_kwargs)
                 if timeout_seconds is None:
@@ -1440,6 +1442,12 @@ class ProjectWriteFileInput(BaseModel):
     content: str
 
 
+class ProjectWriteReportInput(BaseModel):
+    project_id: int = Field(ge=1)
+    relative_path: str = Field(min_length=1, max_length=400)
+    content: str = Field(min_length=1, max_length=200000)
+
+
 class ProjectBashInput(BaseModel):
     project_id: int = Field(ge=1)
     command: str = Field(min_length=1, max_length=20000)
@@ -2133,6 +2141,8 @@ class _PaperResearchToolBase(ToolBase):
             score += 180
         if lower.startswith("reference/paper/"):
             score += 520
+        elif lower.startswith("reference/reports/"):
+            score += 500
         elif lower.startswith("reference/repo/"):
             score += 380
         elif lower.startswith("repo/source/"):
@@ -3589,6 +3599,114 @@ class ProjectWriteFileTool(_PaperResearchToolBase):
                 data={
                     "project_id": project_id,
                     "relative_path": relative_path,
+                    "written": True,
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class ProjectWriteReportTool(_PaperResearchToolBase):
+    name = "project_write_report"
+    input_model = ProjectWriteReportInput
+    output_max_tokens = 3000
+    description = (
+        _PROJECT_TOOL_SCOPE_DESCRIPTION +
+        "把主 agent 的调研报告、调优计划或 worker handoff 写成 Project 文档。"
+        "它只允许写入 `reference/reports/*.md`，不会写入 repo/source、data、脚本或代码文件。"
+        "`relative_path` 可以是 `reference/reports/tuning_research.md`，也可以是简单文件名如 `tuning_research.md`。"
+        "`content` 会作为该 Markdown 报告的完整最终内容写入；这是整文件覆盖，不是追加写入。"
+        "代码修改、命令执行、训练运行仍必须交给 `project_claude`。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "Project ID。"},
+            "relative_path": {
+                "type": "string",
+                "description": "报告路径。只允许 `reference/reports/*.md`，例如 `reference/reports/tuning_plan.md`。",
+            },
+            "content": {"type": "string", "description": "要写入 Markdown 报告的完整最终内容。"},
+        },
+        "required": ["project_id", "relative_path", "content"],
+    }
+
+    @classmethod
+    def _normalize_report_relative_path(cls, value: Any) -> str:
+        relative_path = cls._normalize_relative_path(value)
+        if not relative_path:
+            return ""
+        if "/" not in relative_path:
+            relative_path = f"reference/reports/{relative_path}"
+        elif relative_path.startswith("reports/"):
+            relative_path = f"reference/{relative_path}"
+        return relative_path
+
+    @staticmethod
+    def _report_path_out_of_scope_result(project_id: int, relative_path: str) -> ToolResult:
+        return ToolResult(
+            success=False,
+            output=(
+                "project_write_report 只能写入 `reference/reports/*.md`。"
+                f"请把 `{relative_path}` 改写为 `reference/reports/<name>.md`；"
+                "代码、脚本、数据和 repo/source 文件仍交给 project_claude。"
+            ),
+            error="project_report_path_out_of_scope",
+            data={
+                "project_id": int(project_id),
+                "relative_path": relative_path,
+                "allowed_prefix": "reference/reports/",
+                "allowed_extension": ".md",
+            },
+        )
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            project_id = int(kwargs["project_id"])
+            original_path = str(kwargs.get("relative_path") or "")
+            relative_path = self._normalize_report_relative_path(original_path)
+            if not relative_path:
+                return ToolResult(
+                    success=False,
+                    output="relative_path 无效。",
+                    error="invalid_relative_path",
+                    data={"project_id": project_id, "relative_path": original_path},
+                )
+            if not relative_path.startswith("reference/reports/") or Path(relative_path).suffix.lower() != ".md":
+                return self._report_path_out_of_scope_result(project_id, relative_path)
+
+            project_payload = await self._resolve_project_payload_only(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+
+            project_dir = self._project_dir_for(project_id)
+            target = self._resolve_project_path(project_dir, relative_path, require_exists=False)
+            if target is None:
+                return self._report_path_out_of_scope_result(project_id, relative_path)
+            if target.exists() and not target.is_file():
+                return ToolResult(
+                    success=False,
+                    output=f"目标不是文件，不能写入报告: `{relative_path}`。",
+                    error="project_path_not_file",
+                    data={"project_id": project_id, "relative_path": relative_path},
+                )
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(kwargs.get("content") or ""), encoding="utf-8")
+            return ToolResult(
+                success=True,
+                output="\n".join(
+                    [
+                        "已写入 Project 报告。",
+                        f"- Project: /projects/{project_id}",
+                        f"- Relative path: {relative_path}",
+                    ]
+                ),
+                data={
+                    "project_id": project_id,
+                    "relative_path": relative_path,
+                    "artifact_kind": "project_report",
+                    "allowed_prefix": "reference/reports/",
                     "written": True,
                 },
             )
@@ -7875,6 +7993,8 @@ class KnowledgeSearchTool(ToolBase):
     ) -> ToolResult:
         """执行知识库搜索（自动选择会话策略）"""
         if self.db is not None:
+            # 聊天请求会传入作用域内 session；后台/工具调用也可以只传 factory，
+            # 由工具为每次调用创建短生命周期 session。
             return await self._execute_with_db(
                 self.db,
                 query,
@@ -7945,6 +8065,8 @@ class KnowledgeSearchTool(ToolBase):
                 use_hybrid=use_hybrid,
             )
 
+            # 明确保留流水线阶段：rewrite 扩大召回，retrieve 收集候选，
+            # 再由 rerank 排序、compression 裁剪最终返回给 agent 的上下文。
             # 1) Rewrite
             rewrite_kwargs: dict[str, Any] = {
                 "use_query_rewrite": use_query_rewrite,
@@ -8113,6 +8235,8 @@ class KnowledgeSearchTool(ToolBase):
         if not normalized_requested_document_ids:
             return resolved_kb_ids, set()
 
+        # 文档过滤仍必须与可访问知识库求交；只有原始 document ID 不足以扩大
+        # 用户的检索范围。
         docs_query = select(Document.id, Document.knowledge_base_id).where(
             Document.id.in_(normalized_requested_document_ids)
         )
@@ -11687,6 +11811,11 @@ class DefaultToolProvider:
                             int(ctx.user_id),
                             db_session_factory=ctx.db_session_factory,
                         ),
+                        ProjectWriteReportTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
                         ProjectWriteFileTool(
                             ctx.db,
                             int(ctx.user_id),
@@ -12354,6 +12483,8 @@ class ToolRegistry:
         last_result = None
 
         for attempt in range(1, retry_attempts + 1):
+            # 远程 MCP 调用是尽力路径；失败会记录给熔断器，但本地工具仍可继续
+            # 处理请求。
             try:
                 maybe_awaitable = self._mcp_client_manager.call_tool(route_key, arguments)
                 result = await asyncio.wait_for(maybe_awaitable, timeout=timeout_seconds)
