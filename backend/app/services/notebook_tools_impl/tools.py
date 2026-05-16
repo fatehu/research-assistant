@@ -255,6 +255,8 @@ This action requires user authorization."""
             and recent_error_cell is not None
             and cls._looks_like_fix(code, recent_error_cell.get("source", ""), description=description)
         ):
+            # 自动模式只会在新代码明显像修复时覆盖最近的错误单元格；
+            # 否则追加为新的草稿。
             return recent_error_cell, recent_error_index, recent_error_cell.get("id"), None
         if normalized_write_mode in {"auto", "replace"}:
             draft_cell, draft_index = cls._find_recent_ai_draft_cell(notebook, code)
@@ -309,6 +311,8 @@ This action requires user authorization."""
             return False
         lowered = f"{description or ''}\n{code or ''}".lower()
         fit_count = lowered.count(".fit(")
+        # 启发式会刻意把长训练/搜索任务倾向放到后台执行，让 notebook UI
+        # 显示占位状态，而不是卡死等待。
         background_tokens = (
             "gridsearchcv",
             "randomizedsearchcv",
@@ -2037,6 +2041,8 @@ class WebScrapeTool(Tool):
         if min_interval <= 0:
             return None
 
+        # 限流按域名划分且只在当前进程内生效；它避免 agent 循环意外快速重试，
+        # 同时不引入持久状态。
         now = time.monotonic()
         async with self._domain_rate_lock:
             last = self._domain_last_request_ts.get(domain, 0.0)

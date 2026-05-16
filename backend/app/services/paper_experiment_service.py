@@ -261,6 +261,8 @@ class PaperExperimentService:
         if workspace is not None:
             return workspace
 
+        # 工作区首次创建时先产出论文理解和实验规格，再创建笔记本，
+        # 避免笔记本中出现与后续持久化状态不一致的占位内容。
         bundle = await self._build_workspace_bundle(paper, user_id=user_id)
         summary = dict(bundle.get("summary") or {})
         experiment_spec = self._build_experiment_spec(paper, summary)
@@ -298,6 +300,8 @@ class PaperExperimentService:
         self.db.add(workspace)
         await self.db.flush()
 
+        # 适配器会把论文摄取结果、仓库索引和模板文件落到笔记本工作区，
+        # 后续代码单元只读取这些受控资产，不直接假设仓库结构。
         adapter_manifest = await self._materialize_workspace_assets(
             paper=paper,
             notebook_id=str(notebook["id"]),
@@ -509,7 +513,7 @@ class PaperExperimentService:
                 "paper_experiment_run_id": int(run.id),
             },
         )
-        _ = notebook  # keep explicit: markdown cell persisted before code cell
+        _ = notebook  # 明确保留：先持久化说明单元，再追加代码单元。
 
         code_source = self._build_run_code(workspace, run)
         notebook_after_code = await self.notebook_service.add_cell(
@@ -568,6 +572,7 @@ class PaperExperimentService:
             for cell in intro_cells
             if str(dict(cell.get("metadata") or {}).get("slot") or "").strip()
         }
+        # 介绍单元按 slot 覆盖系统生成区，用户后来新增的实验单元会保留原位。
         existing_cells = list(notebook.get("cells") or [])
         slot_to_id: Dict[str, str] = {}
         filtered_cells: List[Dict[str, Any]] = []
@@ -646,6 +651,8 @@ class PaperExperimentService:
         }
 
         intake_payload = await self._build_paper_intake_payload(paper, user_id=user_id)
+        # 论文 Markdown 可能很长；summary 只保存元数据，正文放入材料包，
+        # 供适配器按需写入工作区文件。
         summary["paper_llm_input"] = {
             key: value
             for key, value in intake_payload.items()
@@ -677,6 +684,8 @@ class PaperExperimentService:
             try:
                 paper_intake = await self._extract_paper_intake_json(intake_payload)
             except Exception as exc:  # noqa: BLE001 - intake must fail open; workspace scaffold should still be created
+                # 大模型摄取失败不能阻断工作区创建；后续仍可基于论文元数据和
+                # 适配器脚手架继续人工补全。
                 logger.warning(f"[PaperExperiment] paper intake LLM failed paper_id={paper.id}: {exc}")
                 summary["paper_intake_error"] = f"{type(exc).__name__}: {exc}"
 
@@ -731,6 +740,7 @@ class PaperExperimentService:
                 "baseline",
             ]
         )
+        # 第一版 spec 只表达“论文给出的假设和线索”，不把它们直接升级成可执行命令。
         optimization_candidates = self._as_list(intake.get("optimization_candidates"))
         safe_knobs = self._normalize_safe_knobs(intake.get("safe_knobs"))
         risky_knobs = self._as_list(intake.get("risky_knobs"))

@@ -1819,6 +1819,7 @@ class ProjectRuntimeService:
             if bool(item.get("required", True)) and not bool(item.get("ok"))
         ]
         if required_preflight_failures:
+            # 必需的外部依赖会在任何文件落盘前阻断执行，方便检查和重试失败复现。
             payload = {
                 "execution_id": str(spec.get("execution_id") or execution_id),
                 "runtime_type": str(spec.get("runtime_type") or ""),
@@ -1837,6 +1838,8 @@ class ProjectRuntimeService:
             return payload
 
         if ProjectRuntimeWorkerClient.enabled():
+            # 容器/环境执行（Docker/devcontainer/repo2docker）交给运行时 worker；
+            # 当前 API 容器只运行轻量本地模式。
             try:
                 return await ProjectRuntimeWorkerClient().start(
                     project_id=project_id,
@@ -1929,6 +1932,8 @@ class ProjectRuntimeService:
         worker_payload: Optional[Dict[str, Any]] = None
         worker_error: Optional[str] = None
         if ProjectRuntimeWorkerClient.enabled():
+            # 先读取 worker 结果，再合并本地结果文件；两种模式都会把 logs/results
+            # 写入项目 workspace。
             try:
                 worker_payload = await ProjectRuntimeWorkerClient().get(
                     project_id=project_id,
@@ -1997,6 +2002,8 @@ class ProjectRuntimeService:
         execution_root = self.execution_dir(workspace_dir, execution_id)
         execution_root.mkdir(parents=True, exist_ok=True)
         log_path = execution_root / "execution.log"
+        # 启动进程前先写入生成文件，使 spec 可以创建小型 runner 脚本，
+        # 而不修改用户已纳入版本控制的源码。
         generated_file_paths = self._materialize_generated_files(workspace_dir=workspace_dir, spec=spec)
 
         if runtime_type == "papermill":
