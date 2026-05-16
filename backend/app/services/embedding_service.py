@@ -530,6 +530,8 @@ class LocalEmbeddingModel:
                 convert_to_numpy=True,
             )
         except Exception as exc:
+            # 在 GPU/MPS 上推理可能在模型加载成功后失败；此时转 CPU 重试一次，
+            # 避免整次请求直接失败。
             allow_runtime_cpu_fallback = bool(
                 getattr(settings, "local_embedding_allow_runtime_cpu_fallback", True)
             )
@@ -622,6 +624,8 @@ class LocalEmbeddingModel:
                         device=device,
                         torch_module=torch,
                     )
+                    # 同一模型在不同缓存内容和 sentence-transformers 版本下，
+                    # 可能需要不同的加载参数。
                     last_error: Optional[Exception] = None
                     for profile_name, init_kwargs in load_profiles:
                         try:
@@ -1137,6 +1141,8 @@ class EmbeddingService:
         if len(embedding) <= target_dim:
             return embedding
 
+        # 采用 Matryoshka 风格截断，可以复用同一个基础模型，同时支持调用方请求更小的
+        # 持久化向量维度。
         clipped = np.array(embedding[:target_dim], dtype=np.float32)
         if settings.local_embedding_normalize:
             norm = np.linalg.norm(clipped)

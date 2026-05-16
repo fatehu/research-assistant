@@ -611,6 +611,7 @@ async def create_user(
 @router.get("/users/count")
 async def get_user_count(
     role: UserRole = None,
+    search: str = None,
     is_active: bool = None,
     current_user: User = Depends(get_admin_user),
     db: AsyncSession = Depends(get_db)
@@ -622,6 +623,15 @@ async def get_user_count(
         query = query.where(User.role == role)
     if is_active is not None:
         query = query.where(User.is_active == is_active)
+    if search:
+        search_pattern = f"%{search}%"
+        query = query.where(
+            or_(
+                User.username.ilike(search_pattern),
+                User.email.ilike(search_pattern),
+                User.full_name.ilike(search_pattern)
+            )
+        )
     
     count = await db.scalar(query)
     return {"count": count}

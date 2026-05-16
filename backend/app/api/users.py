@@ -71,6 +71,30 @@ async def get_llm_providers(current_user: User = Depends(get_current_user)):
     
     providers = [
         {
+            "id": "aliyun_qwen35_flash",
+            "name": "阿里云通义",
+            "model": settings.aliyun_qwen35_flash_model,
+            "available": bool(settings.aliyun_api_key),
+        },
+        {
+            "id": "aliyun_qwen35_plus",
+            "name": "阿里云通义",
+            "model": settings.aliyun_qwen35_plus_model,
+            "available": bool(settings.aliyun_api_key),
+        },
+        {
+            "id": "aliyun_qwen_plus",
+            "name": "阿里云通义",
+            "model": settings.aliyun_qwen_plus_model,
+            "available": bool(settings.aliyun_api_key),
+        },
+        {
+            "id": "aliyun_qwen_max",
+            "name": "阿里云通义",
+            "model": settings.aliyun_qwen_max_model,
+            "available": bool(settings.aliyun_api_key),
+        },
+        {
             "id": "deepseek",
             "name": "DeepSeek",
             "model": settings.deepseek_model,

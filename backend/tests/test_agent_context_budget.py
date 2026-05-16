@@ -6,6 +6,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.config import settings
+import app.services.react_agent as react_agent_module
 from app.services.react_agent import AgentContext, ReActAgent
 
 
@@ -111,6 +112,15 @@ async def test_context_budget_trims_observation_after_first_user_turn(monkeypatc
     assert context.context_truncated is True
     assert context.context_debug["context_truncated"] is True
     assert context.context_debug["message_count_sent"] == len(trimmed)
+    assert context.context_debug["context_observability_version"] == "context_observability.v1"
+    assert context.context_debug["message_tokens_before_trim"] > context.context_debug["message_tokens_after_trim"]
+    assert context.context_debug["deterministic_truncation_applied"] is True
+    assert "token_budget_overflow" in context.context_debug["deterministic_truncation_reasons"]
+    assert any(
+        event.get("kind") == "deterministic_content_truncation"
+        and event.get("phase") == "prepare_llm_messages"
+        for event in context.context_debug["context_observability_events"]
+    )
 
 
 @pytest.mark.asyncio
@@ -258,6 +268,31 @@ def test_summarize_messages_prefers_thought_for_assistant_history():
     assert "先检索知识库定义" in summary
 
 
+@pytest.mark.asyncio
+async def test_system_budget_summary_is_deterministic_without_llm_service(monkeypatch):
+    class _FailingLLMService:
+        def __init__(self, provider):
+            raise AssertionError("budget summary must not call LLMService")
+
+    monkeypatch.setattr(react_agent_module, "LLMService", _FailingLLMService)
+
+    long_tail = "关键事实路径 project_id=10 paper_id=113 " * 80
+    message = await ReActAgent._build_system_compression_message(
+        [
+            {"role": "user", "content": f"第{i}轮问题：{long_tail}"}
+            for i in range(8)
+        ],
+        title="更早历史系统压缩",
+        max_lines=4,
+    )
+
+    assert message is not None
+    content = message["content"]
+    assert content.startswith("更早历史系统压缩：")
+    assert "system-compression-summary-truncated" in content
+    assert "project_id=10" in content
+
+
 def test_context_window_uses_deepseek_test_alias_window(monkeypatch):
     monkeypatch.setattr(settings, "deepseek_test_model_alias", "deepseek-chat-test")
     monkeypatch.setattr(settings, "deepseek_test_model_window", 4096)
@@ -274,6 +309,38 @@ def test_context_window_uses_deepseek_test_alias_window(monkeypatch):
     agent = ReActAgent(llm, _BudgetTools(), max_iterations=1)
 
     assert agent._current_model_context_window() == 4096
+
+
+def test_context_window_uses_current_deepseek_and_qwen35_flash_windows():
+    llm = _BudgetLLM()
+    llm.provider = "deepseek"
+    llm.config = {"model": "deepseek-chat"}
+    agent = ReActAgent(llm, _BudgetTools(), max_iterations=1)
+    assert agent._current_model_context_window() == 128000
+
+    llm.provider = "aliyun_qwen35_flash"
+    llm.config = {
+        "model": "qwen3.5-flash",
+        "context_window_model": "qwen3.5-flash",
+        "provider_family": "aliyun",
+    }
+    agent = ReActAgent(llm, _BudgetTools(), max_iterations=1)
+    assert agent._current_model_context_window() == 1000000
+
+
+def test_context_budget_cap_can_follow_model_window_when_unconfigured(monkeypatch):
+    monkeypatch.setattr(settings, "agent_context_max_input_tokens", 0)
+
+    llm = _BudgetLLM()
+    llm.provider = "aliyun_qwen35_flash"
+    llm.config = {
+        "model": "qwen3.5-flash",
+        "context_window_model": "qwen3.5-flash",
+        "provider_family": "aliyun",
+    }
+    agent = ReActAgent(llm, _BudgetTools(), max_iterations=1)
+
+    assert agent._resolve_system_budget_cap(model_context_window=agent._current_model_context_window()) == 1000000
 
 @pytest.mark.asyncio
 async def test_prepare_llm_messages_includes_conversation_context_state_prefix(monkeypatch):
@@ -358,14 +425,15 @@ async def test_prepare_llm_messages_supports_nested_model_window_overrides(monke
 
 
 @pytest.mark.asyncio
-async def test_run_prefers_reasoning_summary_as_done_thought(monkeypatch):
+async def test_run_does_not_block_done_on_reasoning_summary(monkeypatch):
     monkeypatch.setattr(settings, "agent_reasoning_summary_enabled", True)
+    monkeypatch.setattr(settings, "agent_reasoning_summary_min_iterations", 1)
 
     llm = _BudgetLLM()
     agent = ReActAgent(llm, _BudgetTools(), max_iterations=1)
 
     async def _fake_reasoning_summary(context):
-        return "先基于已有上下文确认问题，再直接收束为最终结论。"
+        raise AssertionError("reasoning summary must not run before done")
 
     monkeypatch.setattr(agent, "_generate_reasoning_summary", _fake_reasoning_summary)
 
@@ -374,5 +442,6 @@ async def test_run_prefers_reasoning_summary_as_done_thought(monkeypatch):
         events.append(event)
 
     done_event = next(event for event in events if event.get("type") == "done")
-    assert done_event["data"]["thought"] == "先基于已有上下文确认问题，再直接收束为最终结论。"
-    assert done_event["data"]["reasoning_summary"] == "先基于已有上下文确认问题，再直接收束为最终结论。"
+    assert done_event["data"]["reasoning_summary"] is None
+    assert done_event["data"]["reasoning_summary_pending"] is True
+    assert done_event["data"]["_reasoning_trace"]

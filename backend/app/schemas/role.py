@@ -393,6 +393,10 @@ class StudentResponse(BaseModel):
     research_direction: Optional[str] = None
     joined_at: Optional[datetime] = None
     last_login: Optional[datetime] = None
+    conversation_count: int = 0
+    knowledge_base_count: int = 0
+    paper_count: int = 0
+    notebook_count: int = 0
 
 
 class StudentProgressResponse(BaseModel):

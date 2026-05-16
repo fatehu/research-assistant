@@ -30,6 +30,7 @@ class PdfRagIngestService:
         self._fast_pipeline = fast_pipeline
         self._hybrid_pipeline = hybrid_pipeline
         self._ingest_renderer = ingest_renderer or LocalPdfIngestMarkdownRenderer()
+        self._ingest_semaphore = asyncio.Semaphore(1)
 
     async def ingest_pdf(
         self,
@@ -40,6 +41,22 @@ class PdfRagIngestService:
     ) -> dict[str, Any]:
         selected_mode = self._normalize_mode(mode or settings.pdf_rag_structured_mode)
         extractor_name = f"local_structured_pdf_{selected_mode}"
+        async with self._ingest_semaphore:
+            return await self._ingest_pdf_locked(
+                file_path=file_path,
+                document_name=document_name,
+                selected_mode=selected_mode,
+                extractor_name=extractor_name,
+            )
+
+    async def _ingest_pdf_locked(
+        self,
+        *,
+        file_path: str,
+        document_name: str,
+        selected_mode: str,
+        extractor_name: str,
+    ) -> dict[str, Any]:
         try:
             document, execution = await self._parse_structured_document(
                 file_path=file_path,

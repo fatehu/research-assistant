@@ -5,6 +5,7 @@ import {
 import type {
   ConversationItemStream,
   ConversationItemStreamEntry,
+  ToolWorkflowSummary,
   ConversationToolLedger,
   ConversationTurnEntry,
   ConversationTurnStore,
@@ -103,6 +104,14 @@ const sortItems = (entries: ConversationItemStreamEntry[]): ConversationItemStre
     return (a.iteration || 0) - (b.iteration || 0)
   })
 
+const sortLedgerEntries = (entries: ConversationToolLedger['entries']): ConversationToolLedger['entries'] =>
+  [...entries].sort((a, b) => {
+    const aTime = new Date(a.created_at || 0).getTime()
+    const bTime = new Date(b.created_at || 0).getTime()
+    if (aTime !== bTime) return aTime - bTime
+    return (a.iteration || 0) - (b.iteration || 0)
+  })
+
 const turnStatusLabel = (value: string): string => {
   const normalized = String(value || '').trim().toLowerCase()
   if (normalized === 'completed') return '已完成'
@@ -123,41 +132,63 @@ const normalizeToolInput = (value: Record<string, any> | undefined | null): stri
 const hasRenderableAssistantMessage = (message: Message | undefined): boolean => {
   if (!message) return false
   if (String(message.content || '').trim()) return true
-  if (String(message.thought || '').trim()) return true
   return false
 }
 
-const buildHistorySteps = (
-  items: ConversationItemStreamEntry[],
-): Array<{
+type HistoryStep = {
   type: string
   iteration: number
   content?: string
   tool?: string
+  toolCallId?: string
   input?: Record<string, unknown>
   output?: string
   success?: boolean
-}> => {
-  const steps: Array<{
-    type: string
-    iteration: number
-    content?: string
-    tool?: string
-    input?: Record<string, unknown>
-    output?: string
-    success?: boolean
-  }> = []
+  workflowSummary?: ToolWorkflowSummary
+  rawContent?: string
+}
+
+const buildHistorySteps = (
+  items: ConversationItemStreamEntry[],
+): HistoryStep[] => {
+  const steps: HistoryStep[] = []
 
   for (const item of items) {
     const kind = String(item.kind || '').trim().toLowerCase()
-    if (kind === 'reasoning_summary' || kind === 'tool_use_summary' || kind === 'permission_denial') {
+    if (kind === 'tool_use_summary') {
+      steps.push({
+        type: 'workflow',
+        iteration: item.iteration || 0,
+        content: item.summary || item.content || '',
+        rawContent: item.content || item.summary || '',
+        workflowSummary:
+          item.metadata?.workflow_summary && typeof item.metadata.workflow_summary === 'object'
+            ? (item.metadata.workflow_summary as ToolWorkflowSummary)
+            : undefined,
+      })
+      continue
+    }
+    if (kind === 'permission_denial') {
+      steps.push({
+        type: 'workflow',
+        iteration: item.iteration || 0,
+        content: item.summary || item.content || '',
+        rawContent: item.content || item.summary || '',
+        workflowSummary: {
+          version: 'tool_workflow_summary.v1',
+          headline: '权限受限，流程已等待',
+          status: 'waiting',
+          highlights: [item.summary || item.content || '当前步骤需要额外授权后才能继续。'],
+          next_action: '等待授权或调整执行路径',
+        },
+      })
+      continue
+    }
+    if (kind === 'reasoning_summary' || kind === 'thought') {
       steps.push({
         type: 'thought',
         iteration: item.iteration || 0,
-        content:
-          kind === 'permission_denial'
-            ? `权限限制：${item.summary || item.content || ''}`
-            : item.summary || item.content || '',
+        content: item.content || item.summary || item.thought || '',
       })
       continue
     }
@@ -166,6 +197,7 @@ const buildHistorySteps = (
         type: 'action',
         iteration: item.iteration || 0,
         tool: item.tool_name,
+        toolCallId: item.tool_call_id,
         input: item.arguments,
       })
       continue
@@ -175,6 +207,7 @@ const buildHistorySteps = (
         type: 'observation',
         iteration: item.iteration || 0,
         tool: item.tool_name,
+        toolCallId: item.tool_call_id,
         output: item.summary || item.error || '',
         success: item.success,
       })
@@ -183,6 +216,39 @@ const buildHistorySteps = (
 
   return steps
 }
+
+const buildHistoryStepsFromToolLedger = (entries: ConversationToolLedger['entries']): HistoryStep[] => {
+  const steps: HistoryStep[] = []
+
+  for (const item of entries) {
+    const kind = String(item.kind || '').trim().toLowerCase()
+    if (kind === 'tool_call') {
+      steps.push({
+        type: 'action',
+        iteration: item.iteration || 0,
+        tool: item.tool_name,
+        toolCallId: item.tool_call_id,
+        input: item.arguments,
+      })
+      continue
+    }
+    if (kind === 'tool_result') {
+      steps.push({
+        type: 'observation',
+        iteration: item.iteration || 0,
+        tool: item.tool_name,
+        toolCallId: item.tool_call_id,
+        output: item.summary || item.error || '',
+        success: item.success,
+      })
+    }
+  }
+
+  return steps
+}
+
+const hasToolLaneDetails = (steps: HistoryStep[]): boolean =>
+  steps.some((step) => step.type === 'action' || step.type === 'observation')
 
 const CompactBoundaryPanel = ({ item }: { item: ConversationItemStreamEntry }) => {
   const replacementHistory = Array.isArray(item.metadata?.replacement_history)
@@ -213,6 +279,18 @@ const CompactBoundaryPanel = ({ item }: { item: ConversationItemStreamEntry }) =
     </div>
   )
 }
+
+const ArchivedToolDetailsPanel = ({
+  callCount,
+  resultCount,
+}: {
+  callCount: number
+  resultCount: number
+}) => (
+  <div className="rounded-2xl border border-white/[0.06] bg-slate-900/60 px-4 py-3 text-sm leading-6 text-slate-300">
+    工具明细已归档；当前仅保留调用统计：tool {callCount}/{resultCount}。
+  </div>
+)
 
 const PendingTurnPanel = ({
   phase = 'submitting',
@@ -297,6 +375,13 @@ const TurnTimeline = ({
     current.push(entry)
     itemsByTurn.set(entry.turn_id, current)
   }
+  const ledgerByTurn = new Map<string, ConversationToolLedger['entries']>()
+  for (const entry of toolLedger?.entries || []) {
+    if (!entry.turn_id) continue
+    const current = ledgerByTurn.get(entry.turn_id) || []
+    current.push(entry)
+    ledgerByTurn.set(entry.turn_id, current)
+  }
 
   return (
     <div className="space-y-6">
@@ -308,20 +393,32 @@ const TurnTimeline = ({
         const compactBoundaryItems = turnItems.filter(
           (entry) => String(entry.kind || '').trim().toLowerCase() === 'compact_boundary',
         )
-        const reactHistorySteps = buildHistorySteps(
+        const itemHistorySteps = buildHistorySteps(
           turnItems.filter((entry) => String(entry.kind || '').trim().toLowerCase() !== 'compact_boundary'),
         )
+        const ledgerTurnEntries = sortLedgerEntries(ledgerByTurn.get(turn.turn_id) || [])
+        // item_stream 可能被压缩裁剪；此时用 tool_ledger 的事实记录兜底恢复历史工具轨道。
+        const ledgerHistorySteps = !hasToolLaneDetails(itemHistorySteps)
+          ? buildHistoryStepsFromToolLedger(ledgerTurnEntries)
+          : []
+        const reactHistorySteps = ledgerHistorySteps.length
+          ? [...itemHistorySteps, ...ledgerHistorySteps]
+          : itemHistorySteps
         const userMessage = turn.user_message_id ? messageMap.get(turn.user_message_id) : undefined
         const assistantMessage = turn.assistant_message_id ? messageMap.get(turn.assistant_message_id) : undefined
         const renderableAssistantMessage = hasRenderableAssistantMessage(assistantMessage)
         const turnTime = formatTime(turn.started_at || turn.completed_at)
         const isRunningTurn = String(turn.status || '').trim().toLowerCase() === 'running'
+        const usedLedgerFallback = ledgerHistorySteps.length > 0
+        const hasToolCounts = (turn.tool_call_count || 0) > 0 || (turn.tool_result_count || 0) > 0
+        const hasArchivedToolDetails = hasToolCounts && !hasToolLaneDetails(reactHistorySteps)
         const shouldRenderTurnPending =
           isRunningTurn &&
           !assistantMessage &&
           !turn.assistant_summary &&
           reactHistorySteps.length === 0 &&
-          compactBoundaryItems.length === 0
+          compactBoundaryItems.length === 0 &&
+          !hasArchivedToolDetails
 
         return (
           <div
@@ -346,6 +443,7 @@ const TurnTimeline = ({
               </span>
               <span className="rounded-full border border-white/[0.08] bg-white/[0.04] px-2.5 py-1 text-[11px] text-slate-400">
                 tool {turn.tool_call_count}/{turn.tool_result_count}
+                {usedLedgerFallback ? ' · 账本恢复' : hasArchivedToolDetails ? ' · 明细已归档' : ''}
               </span>
             </div>
 
@@ -367,6 +465,13 @@ const TurnTimeline = ({
               ) : null}
 
               {reactHistorySteps.length ? <HistoryReActPanel steps={reactHistorySteps} defaultExpanded embedded /> : null}
+
+              {hasArchivedToolDetails ? (
+                <ArchivedToolDetailsPanel
+                  callCount={turn.tool_call_count || 0}
+                  resultCount={turn.tool_result_count || 0}
+                />
+              ) : null}
 
               {compactBoundaryItems.length ? (
                 <div className="space-y-3">

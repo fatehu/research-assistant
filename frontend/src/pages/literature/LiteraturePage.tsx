@@ -1,7 +1,8 @@
-import { useDeferredValue, useEffect, useMemo, useState } from 'react'
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   Input,
+  InputNumber,
   Button,
   Select,
   Spin,
@@ -10,6 +11,7 @@ import {
   Form,
   Badge,
   Tooltip,
+  Switch,
 } from 'antd'
 import {
   SearchOutlined,
@@ -22,11 +24,12 @@ import {
   LinkOutlined,
   ArrowRightOutlined,
   CloseOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons'
 import { useLiteratureStore } from '@/stores/literatureStore'
 import type { Paper, PaperSearchResult } from '@/services/api'
 import PaperDetailPanel from './PaperDetailPanel'
-import { getSourceInfo, SOURCES } from './constants'
+import { getSearchSortOptions, getSourceInfo, SEARCH_SOURCES } from './constants'
 import {
   PaperCard,
   PaperListItem,
@@ -144,19 +147,27 @@ export default function LiteraturePage() {
 
   const [activeTab, setActiveTab] = useState<'library' | 'search'>('library')
   const [searchValue, setSearchValue] = useState('')
-  const [selectedSource, setSelectedSource] = useState('multi')
+  const [selectedSource, setSelectedSource] = useState('openalex')
+  const [selectedSort, setSelectedSort] = useState('relevance')
+  const [searchYearStart, setSearchYearStart] = useState<number | null>(null)
+  const [searchYearEnd, setSearchYearEnd] = useState<number | null>(null)
+  const [searchOpenAccessOnly, setSearchOpenAccessOnly] = useState(false)
   const [createModalOpen, setCreateModalOpen] = useState(false)
   const [linkImportModalOpen, setLinkImportModalOpen] = useState(false)
   const [linkImportSubmitting, setLinkImportSubmitting] = useState(false)
   const [savingPaperKeys, setSavingPaperKeys] = useState<Record<string, true>>({})
   const [createCollectionForm] = Form.useForm()
   const [linkImportForm] = Form.useForm()
+  const autoSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const lastRemoteSearchSignatureRef = useRef('')
 
   const selectedCollection =
     collections.find((collection) => collection.id === selectedCollectionId) || null
   const deferredSearchValue = useDeferredValue(searchValue.trim().toLowerCase())
   const showDetailPane = detailPanelOpen && !!selectedPaper
   const currentSource = getSourceInfo(selectedSource)
+  const currentSortOptions = useMemo(() => getSearchSortOptions(selectedSource), [selectedSource])
+  const currentSortOption = currentSortOptions.find((option) => option.key === selectedSort) || currentSortOptions[0]
 
   const filteredPapers = useMemo(
     () => papers.filter((paper) => matchPaper(paper, deferredSearchValue)),
@@ -171,10 +182,85 @@ export default function LiteraturePage() {
     init()
   }, [init])
 
-  const handleRemoteSearch = async () => {
-    if (!searchValue.trim()) return
+  useEffect(() => {
+    if (!currentSortOptions.some((option) => option.key === selectedSort)) {
+      setSelectedSort(currentSortOptions[0]?.key || 'relevance')
+    }
+  }, [currentSortOptions, selectedSort])
+
+  const runRemoteSearch = useCallback(async (options: { force?: boolean } = {}) => {
+    const query = searchValue.trim()
+    if (!query) return
+    const searchOptions = {
+      year_start: searchYearStart ?? undefined,
+      year_end: searchYearEnd ?? undefined,
+      open_access: searchOpenAccessOnly,
+      sort_by: selectedSort,
+    }
+    const signature = JSON.stringify({
+      query,
+      source: selectedSource,
+      ...searchOptions,
+    })
+    if (!options.force && signature === lastRemoteSearchSignatureRef.current) {
+      return
+    }
+    lastRemoteSearchSignatureRef.current = signature
     setActiveTab('search')
-    await searchPapers(searchValue.trim(), selectedSource, {})
+    try {
+      await searchPapers(query, selectedSource, searchOptions)
+    } catch (error) {
+      if (lastRemoteSearchSignatureRef.current === signature) {
+        lastRemoteSearchSignatureRef.current = ''
+      }
+      throw error
+    }
+  }, [
+    searchOpenAccessOnly,
+    searchPapers,
+    searchValue,
+    searchYearEnd,
+    searchYearStart,
+    selectedSort,
+    selectedSource,
+  ])
+
+  useEffect(() => () => {
+    if (autoSearchTimerRef.current) {
+      clearTimeout(autoSearchTimerRef.current)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (activeTab !== 'search' || !searchValue.trim()) return
+    if (!currentSortOptions.some((option) => option.key === selectedSort)) return
+    if (searchYearStart !== null && searchYearStart < 1900) return
+    if (searchYearEnd !== null && searchYearEnd < 1900) return
+
+    if (autoSearchTimerRef.current) {
+      clearTimeout(autoSearchTimerRef.current)
+    }
+    autoSearchTimerRef.current = setTimeout(() => {
+      void runRemoteSearch()
+    }, 450)
+
+    return () => {
+      if (autoSearchTimerRef.current) {
+        clearTimeout(autoSearchTimerRef.current)
+      }
+    }
+  }, [
+    activeTab,
+    currentSortOptions,
+    runRemoteSearch,
+    searchValue,
+    searchYearEnd,
+    searchYearStart,
+    selectedSort,
+  ])
+
+  const handleRemoteSearch = async () => {
+    await runRemoteSearch({ force: true })
   }
 
   const handleSearchValueChange = (value: string) => {
@@ -504,21 +590,23 @@ export default function LiteraturePage() {
                 </div>
 
                 <div className="min-w-[180px]">
-                  <Select
-                    value={selectedSource}
-                    onChange={setSelectedSource}
-                    style={{ width: 180 }}
-                    className="[&_.ant-select-selector]:!h-11 [&_.ant-select-selector]:!rounded-2xl [&_.ant-select-selector]:!border-white/10 [&_.ant-select-selector]:!bg-white/[0.04] [&_.ant-select-selector]:!px-4 [&_.ant-select-selector]:!shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] [&_.ant-select-arrow]:!text-slate-400 [&_.ant-select-arrow]:!opacity-70"
-                  >
-                    {SOURCES.map((source) => (
-                      <Option key={source.key} value={source.key}>
-                        <span className="flex items-center gap-2">
-                          <span>{source.icon}</span>
-                          <span>{source.name}</span>
-                        </span>
-                      </Option>
-                    ))}
-                  </Select>
+                  <Tooltip title="选择调用哪个外部论文 API。不同数据源支持的排序和筛选能力不同。">
+                    <Select
+                      value={selectedSource}
+                      onChange={setSelectedSource}
+                      style={{ width: 180 }}
+                      className="[&_.ant-select-selector]:!h-11 [&_.ant-select-selector]:!rounded-2xl [&_.ant-select-selector]:!border-white/10 [&_.ant-select-selector]:!bg-white/[0.04] [&_.ant-select-selector]:!px-4 [&_.ant-select-selector]:!shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] [&_.ant-select-arrow]:!text-slate-400 [&_.ant-select-arrow]:!opacity-70"
+                    >
+                      {SEARCH_SOURCES.map((source) => (
+                        <Option key={source.key} value={source.key}>
+                          <span className="flex items-center gap-2">
+                            <span>{source.icon}</span>
+                            <span>{source.name}</span>
+                          </span>
+                        </Option>
+                      ))}
+                    </Select>
+                  </Tooltip>
                 </div>
 
                 <div className="min-w-[260px] flex-[1_1_360px]">
@@ -574,10 +662,86 @@ export default function LiteraturePage() {
                       onClick={() => setViewMode('list')}
                     >
                       <UnorderedListOutlined />
-                    </button>
+                      </button>
                   </Tooltip>
                 </div>
               </div>
+
+              {activeTab === 'search' ? (
+                <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-white/[0.06] pt-3">
+                  <Tooltip title="这些条件会随请求传给外部 API，由数据源远程筛选；修改后会自动重新搜索，不是在当前结果里本地过滤。">
+                    <span className="flex items-center gap-1 text-xs font-medium uppercase tracking-[0.2em] text-slate-500">
+                      筛选
+                      <InfoCircleOutlined className="text-[11px]" />
+                    </span>
+                  </Tooltip>
+                  <Tooltip title="限制论文发表年份下界。支持 OpenAlex、Semantic Scholar、PubMed、Crossref；arXiv 使用提交日期范围近似。">
+                    <InputNumber
+                      value={searchYearStart}
+                      onChange={(value) => setSearchYearStart(typeof value === 'number' ? value : null)}
+                      placeholder="起始年份"
+                      min={1900}
+                      max={2100}
+                      controls={false}
+                      style={{ width: 120 }}
+                      className="[&_.ant-input-number-input]:!text-slate-100"
+                    />
+                  </Tooltip>
+                  <Tooltip title="限制论文发表年份上界。为空时表示不设上界。">
+                    <InputNumber
+                      value={searchYearEnd}
+                      onChange={(value) => setSearchYearEnd(typeof value === 'number' ? value : null)}
+                      placeholder="结束年份"
+                      min={1900}
+                      max={2100}
+                      controls={false}
+                      style={{ width: 120 }}
+                      className="[&_.ant-input-number-input]:!text-slate-100"
+                    />
+                  </Tooltip>
+                  <Tooltip title="只返回外部 API 标记为开放获取或含公开全文/许可证的结果。arXiv 默认就是开放论文源。">
+                    <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-300">
+                      <Switch
+                        checked={searchOpenAccessOnly}
+                        onChange={setSearchOpenAccessOnly}
+                        size="small"
+                      />
+                      <span>仅开放获取</span>
+                    </div>
+                  </Tooltip>
+                  <Tooltip title={`当前使用 ${currentSource.name} 的原生排序能力；修改后会自动重新搜索。${currentSortOption?.description || '相关性排序'}`}>
+                    <span className="ml-1 flex items-center gap-1 text-xs font-medium uppercase tracking-[0.2em] text-slate-500">
+                      排序
+                      <InfoCircleOutlined className="text-[11px]" />
+                    </span>
+                  </Tooltip>
+                  <Select
+                    value={selectedSort}
+                    onChange={setSelectedSort}
+                    style={{ width: 152 }}
+                    className="[&_.ant-select-selector]:!h-10 [&_.ant-select-selector]:!rounded-2xl [&_.ant-select-selector]:!border-white/10 [&_.ant-select-selector]:!bg-white/[0.04] [&_.ant-select-selector]:!px-3 [&_.ant-select-arrow]:!text-slate-400"
+                  >
+                    {currentSortOptions.map((option) => (
+                      <Option key={option.key} value={option.key}>
+                        <Tooltip title={option.description} placement="right">
+                          <span>{option.label}</span>
+                        </Tooltip>
+                      </Option>
+                    ))}
+                  </Select>
+                  <Button
+                    className={controlButtonClass}
+                    onClick={() => {
+                      setSearchYearStart(null)
+                      setSearchYearEnd(null)
+                      setSearchOpenAccessOnly(false)
+                      setSelectedSort('relevance')
+                    }}
+                  >
+                    重置条件
+                  </Button>
+                </div>
+              ) : null}
             </div>
           </div>
 

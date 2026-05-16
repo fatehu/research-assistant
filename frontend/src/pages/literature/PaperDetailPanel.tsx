@@ -8,11 +8,12 @@ import {
   TeamOutlined, StarOutlined, EditOutlined, SaveOutlined,
   CopyOutlined, CheckOutlined, FileTextOutlined,
   FolderAddOutlined, EyeOutlined, TagsOutlined, FireOutlined,
-  CloseOutlined
+  CloseOutlined, DownOutlined, UpOutlined
 } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import { Paper } from '@/services/api'
 import { useLiteratureStore } from '@/stores/literatureStore'
+import PaperProjectLauncherCard from './PaperProjectLauncherCard'
 
 const { TextArea } = Input
 
@@ -334,6 +335,11 @@ export default function PaperDetailPanel({ paper }: PaperDetailPanelProps) {
       {/* 分割线 */}
       <div className="h-px bg-slate-700/50" />
 
+      <PaperProjectLauncherCard paper={paper} />
+
+      {/* 分割线 */}
+      <div className="h-px bg-slate-700/50" />
+
       {/* 摘要 */}
       <div className="space-y-2">
         <div className="text-slate-500 text-sm">摘要</div>
@@ -343,10 +349,16 @@ export default function PaperDetailPanel({ paper }: PaperDetailPanelProps) {
               {paper.abstract}
             </p>
             {paper.abstract.length > 200 && (
-              <button 
+              <button
+                type="button"
                 onClick={() => setAbstractExpanded(!abstractExpanded)}
-                className="text-emerald-400 text-sm mt-2 hover:text-emerald-300"
+                className="mt-3 inline-flex h-8 items-center gap-1.5 rounded-full border border-emerald-400/20 bg-emerald-500/10 px-3 text-xs font-medium text-emerald-200 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] transition-all duration-200 hover:border-emerald-300/35 hover:bg-emerald-500/15 hover:text-emerald-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/35"
               >
+                {abstractExpanded ? (
+                  <UpOutlined className="text-[10px]" />
+                ) : (
+                  <DownOutlined className="text-[10px]" />
+                )}
                 {abstractExpanded ? '收起' : '展开全部'}
               </button>
             )}

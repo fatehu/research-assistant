@@ -83,6 +83,23 @@ class AgentRuntimeService:
         return text
 
     @staticmethod
+    def _parse_optional_iso_datetime(value: Any) -> Optional[datetime]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        normalized = text.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except Exception:
+            return None
+        if parsed.tzinfo is not None:
+            try:
+                return parsed.astimezone(tz=None).replace(tzinfo=None)
+            except Exception:
+                return parsed.replace(tzinfo=None)
+        return parsed
+
+    @staticmethod
     def _normalize_chat_preferences(raw: Any) -> Dict[str, Any]:
         payload = dict(raw or {}) if isinstance(raw, dict) else {}
         language = str(payload.get("response_language") or "auto").strip()
@@ -315,6 +332,254 @@ class AgentRuntimeService:
             return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
     @staticmethod
+    def build_item_stream_fingerprint(
+        item_stream_payload: Optional[Dict[str, Any]],
+        *,
+        fallback_boundary_message_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        payload = dict(item_stream_payload or {}) if isinstance(item_stream_payload, dict) else {}
+        entries = [dict(item) for item in list(payload.get("entries") or []) if isinstance(item, dict)]
+        store = ConversationItemStreamStore.from_payload(
+            {
+                "version": "conversation_item_stream.v1",
+                "updated_at": str(payload.get("updated_at") or "").strip() or None,
+                "entries": entries,
+            }
+        )
+        canonical = store.canonical_history(
+            fallback_boundary_message_id=fallback_boundary_message_id,
+        )
+        latest_message_id: Optional[int] = None
+        for entry in reversed(list(canonical.active_entries or [])):
+            try:
+                if entry.message_id is not None:
+                    latest_message_id = int(entry.message_id)
+                    break
+            except (TypeError, ValueError, OverflowError):
+                continue
+        last_item_id = ""
+        if entries:
+            last_item_id = str(entries[-1].get("item_id") or "").strip()
+        return {
+            "version": "conversation_item_stream_fingerprint.v1",
+            "item_stream_updated_at": str(payload.get("updated_at") or "").strip(),
+            "entry_count": len(entries),
+            "last_item_id": last_item_id,
+            "active_entry_count": len(list(canonical.active_entries or [])),
+            "latest_message_id": latest_message_id,
+            "boundary_message_id": canonical.boundary_message_id,
+            "replacement_checkpoint_item_id": canonical.replacement_checkpoint_item_id,
+        }
+
+    @staticmethod
+    def _item_stream_fingerprint_matches(
+        current: Dict[str, Any],
+        expected: Dict[str, Any],
+    ) -> bool:
+        keys = {
+            "item_stream_updated_at",
+            "entry_count",
+            "last_item_id",
+            "active_entry_count",
+            "latest_message_id",
+            "boundary_message_id",
+            "replacement_checkpoint_item_id",
+        }
+        return all(current.get(key) == expected.get(key) for key in keys)
+
+    @staticmethod
+    def _conversation_item_entry_from_payload(item: Dict[str, Any]) -> Optional[ConversationItemEntry]:
+        if not isinstance(item, dict):
+            return None
+        kind = str(item.get("kind") or "").strip()
+        if not kind:
+            return None
+        role = str(item.get("role") or "").strip() or None
+        if role and role not in {"user", "assistant", "system", "tool"}:
+            role = None
+        try:
+            iteration = int(item.get("iteration") or 0)
+        except (TypeError, ValueError, OverflowError):
+            iteration = 0
+        try:
+            message_id = int(item["message_id"]) if item.get("message_id") is not None else None
+        except (TypeError, ValueError, OverflowError):
+            message_id = None
+        try:
+            execution_time_ms = (
+                float(item.get("execution_time_ms"))
+                if item.get("execution_time_ms") is not None
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            execution_time_ms = None
+        try:
+            output_tokens_estimate = (
+                int(item.get("output_tokens_estimate"))
+                if item.get("output_tokens_estimate") is not None
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            output_tokens_estimate = None
+        return ConversationItemEntry(
+            item_id=str(item.get("item_id") or uuid.uuid4().hex),
+            kind=kind,
+            turn_id=str(item.get("turn_id") or "").strip() or None,
+            role=role,
+            content=str(item.get("content") or "").strip() or None,
+            message_id=message_id,
+            run_id=str(item.get("run_id") or "").strip() or None,
+            iteration=max(0, iteration),
+            tool_name=str(item.get("tool_name") or "").strip() or None,
+            tool_call_id=str(item.get("tool_call_id") or "").strip() or None,
+            status=str(item.get("status") or "").strip() or None,
+            arguments=dict(item.get("arguments") or {}) if isinstance(item.get("arguments"), dict) else None,
+            thought=str(item.get("thought") or "").strip() or None,
+            summary=str(item.get("summary") or "").strip() or None,
+            success=bool(item.get("success")) if item.get("success") is not None else None,
+            error=str(item.get("error") or "").strip() or None,
+            permission_required=bool(item.get("permission_required")),
+            execution_time_ms=execution_time_ms,
+            output_tokens_estimate=output_tokens_estimate,
+            truncated=bool(item.get("truncated")) if item.get("truncated") is not None else None,
+            parallel_group=str(item.get("parallel_group") or "").strip() or None,
+            metadata=dict(item.get("metadata") or {}) if isinstance(item.get("metadata"), dict) else None,
+            created_at=str(item.get("created_at") or "").strip() or datetime.utcnow().isoformat(),
+        )
+
+    @staticmethod
+    def _append_history_event_to_metadata(
+        metadata: Dict[str, Any],
+        *,
+        title: str,
+        detail: str,
+        item_stream: Optional[ConversationItemStreamStore] = None,
+    ) -> None:
+        history_log = HistoryLog.from_payload(
+            metadata.get("history_log") if isinstance(metadata.get("history_log"), dict) else {}
+        )
+        history_log.add(str(title or "").strip() or "event", str(detail or "").strip() or "updated")
+        history_log.compact(max(int(getattr(settings, "agent_context_history_log_keep_events", 48) or 48), 10))
+        metadata["history_log"] = history_log.to_payload()
+        if item_stream is not None:
+            item_stream.append(
+                ConversationItemEntry(
+                    item_id=uuid.uuid4().hex,
+                    kind="history_event",
+                    role="system",
+                    content=str(detail or "").strip() or "updated",
+                    summary=str(title or "").strip() or "event",
+                    created_at=history_log.updated_at or datetime.utcnow().isoformat(),
+                )
+            )
+
+    async def commit_conversation_compaction_if_current(
+        self,
+        conversation_id: int,
+        *,
+        source_fingerprint: Dict[str, Any],
+        context_state: Optional[Dict[str, Any]] = None,
+        compacted_history: Optional[Dict[str, Any]] = None,
+        compact_boundary_entry: Optional[Dict[str, Any]] = None,
+        history_event_title: str,
+        history_event_detail: str,
+        context_snapshot: Optional[Dict[str, Any]] = None,
+        stale_history_event_title: Optional[str] = None,
+        stale_history_event_detail: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        expected_fingerprint = dict(source_fingerprint or {}) if isinstance(source_fingerprint, dict) else {}
+        async with async_session_factory() as db:
+            row = await db.get(Conversation, int(conversation_id))
+            if not row:
+                return {"committed": False, "reason": "conversation_not_found", "current_fingerprint": {}}
+            metadata = dict(row.metadata_ or {})
+            item_stream_payload = (
+                dict(metadata.get("item_stream"))
+                if isinstance(metadata.get("item_stream"), dict)
+                else {}
+            )
+            try:
+                expected_boundary_message_id = (
+                    int(expected_fingerprint["boundary_message_id"])
+                    if expected_fingerprint.get("boundary_message_id") is not None
+                    else None
+                )
+            except (TypeError, ValueError, OverflowError):
+                expected_boundary_message_id = None
+            current_fingerprint = self.build_item_stream_fingerprint(
+                item_stream_payload,
+                fallback_boundary_message_id=expected_boundary_message_id,
+            )
+            item_stream = ConversationItemStreamStore.from_payload(item_stream_payload)
+
+            if not self._item_stream_fingerprint_matches(current_fingerprint, expected_fingerprint):
+                stale_title = str(stale_history_event_title or "compact_stale_skipped").strip()
+                stale_detail = str(stale_history_event_detail or "").strip() or (
+                    "source item_stream changed before compaction commit"
+                )
+                if "event=" not in stale_detail:
+                    stale_detail = f"event=model_compaction_skipped, reason=stale_source, {stale_detail}"
+                if "current_entry_count=" not in stale_detail:
+                    stale_detail = (
+                        f"{stale_detail}, current_entry_count={current_fingerprint.get('entry_count')}"
+                    )
+                self._append_history_event_to_metadata(
+                    metadata,
+                    title=stale_title,
+                    detail=stale_detail,
+                    item_stream=item_stream,
+                )
+                item_stream.compact(max(int(getattr(settings, "agent_context_item_stream_keep_entries", 320) or 320), 60))
+                metadata["item_stream"] = item_stream.to_payload()
+                row.metadata_ = metadata
+                await db.commit()
+                return {
+                    "committed": False,
+                    "reason": "stale_source",
+                    "source_fingerprint": expected_fingerprint,
+                    "current_fingerprint": current_fingerprint,
+                }
+
+            if isinstance(context_state, dict) and context_state:
+                metadata["context_state"] = dict(context_state)
+            if isinstance(compacted_history, dict) and compacted_history:
+                metadata["compacted_history"] = dict(compacted_history)
+            self._append_history_event_to_metadata(
+                metadata,
+                title=history_event_title,
+                detail=history_event_detail,
+                item_stream=item_stream,
+            )
+            if isinstance(context_snapshot, dict) and context_snapshot:
+                current_snapshots = [
+                    dict(item)
+                    for item in list(metadata.get("context_snapshots") or [])
+                    if isinstance(item, dict)
+                ]
+                current_snapshots.append(dict(context_snapshot))
+                keep_last = max(int(getattr(settings, "agent_context_snapshot_keep_items", 12) or 12), 1)
+                metadata["context_snapshots"] = current_snapshots[-keep_last:]
+
+            boundary_entry = self._conversation_item_entry_from_payload(dict(compact_boundary_entry or {}))
+            if boundary_entry is not None:
+                item_stream.append(boundary_entry)
+            item_stream.compact(max(int(getattr(settings, "agent_context_item_stream_keep_entries", 320) or 320), 60))
+            metadata["item_stream"] = item_stream.to_payload()
+
+            row.metadata_ = metadata
+            await db.commit()
+            committed_fingerprint = self.build_item_stream_fingerprint(
+                metadata.get("item_stream") if isinstance(metadata.get("item_stream"), dict) else item_stream_payload
+            )
+            return {
+                "committed": True,
+                "reason": "committed",
+                "source_fingerprint": expected_fingerprint,
+                "current_fingerprint": current_fingerprint,
+                "committed_fingerprint": committed_fingerprint,
+            }
+
+    @staticmethod
     def _memory_default_channels() -> List[str]:
         raw = str(getattr(settings, "agent_memory_default_channels", "") or "").strip()
         if not raw:
@@ -420,6 +685,25 @@ class AgentRuntimeService:
             await db.commit()
         return run_id
 
+    async def bind_run_to_conversation(
+        self,
+        run_id: str,
+        *,
+        conversation_id: Optional[int],
+    ) -> None:
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id or conversation_id is None:
+            return
+        async with async_session_factory() as db:
+            result = await db.execute(select(AgentRun).where(AgentRun.id == normalized_run_id))
+            record = result.scalar_one_or_none()
+            if not record:
+                return
+            if record.conversation_id == int(conversation_id):
+                return
+            record.conversation_id = int(conversation_id)
+            await db.commit()
+
     async def complete_run(
         self,
         run_id: str,
@@ -447,6 +731,321 @@ class AgentRuntimeService:
                 merged.update(metadata)
                 record.metadata_ = merged
             await db.commit()
+
+    async def cleanup_stale_runs(
+        self,
+        *,
+        older_than_seconds: Optional[int] = None,
+        only_channels: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        timeout_seconds = max(int(older_than_seconds or getattr(settings, "agent_run_stale_timeout_seconds", 900) or 900), 60)
+        threshold = datetime.utcnow() - timedelta(seconds=timeout_seconds)
+        channels = [str(item or "").strip() for item in list(only_channels or []) if str(item or "").strip()]
+
+        async with async_session_factory() as db:
+            stmt = select(AgentRun).where(
+                AgentRun.status == "running",
+                AgentRun.started_at <= threshold,
+            )
+            if channels:
+                stmt = stmt.where(AgentRun.channel.in_(channels))
+            result = await db.execute(stmt)
+            rows = list(result.scalars().all())
+            cleaned: List[Dict[str, Any]] = []
+            for record in rows:
+                record.status = "error"
+                record.finished_at = datetime.utcnow()
+                merged = dict(record.metadata_ or {})
+                merged.update(
+                    {
+                        "error": "stale_run_cleanup",
+                        "cleanup_reason": "stale_running_run",
+                        "cleanup_threshold_seconds": timeout_seconds,
+                        "cleanup_at": datetime.utcnow().isoformat(),
+                    }
+                )
+                record.metadata_ = merged
+                cleaned.append(
+                    {
+                        "id": str(record.id),
+                        "channel": str(record.channel or ""),
+                        "conversation_id": int(record.conversation_id) if record.conversation_id is not None else None,
+                        "started_at": str(record.started_at),
+                    }
+                )
+            await db.commit()
+        return {
+            "timeout_seconds": timeout_seconds,
+            "cleaned_count": len(cleaned),
+            "cleaned_runs": cleaned,
+        }
+
+    async def cleanup_stale_conversation_turns(
+        self,
+        *,
+        older_than_seconds: Optional[int] = None,
+        conversation_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        timeout_seconds = max(int(older_than_seconds or getattr(settings, "agent_run_stale_timeout_seconds", 900) or 900), 60)
+        threshold = datetime.utcnow() - timedelta(seconds=timeout_seconds)
+
+        async with async_session_factory() as db:
+            stmt = select(Conversation)
+            if conversation_id is not None:
+                stmt = stmt.where(Conversation.id == int(conversation_id))
+            result = await db.execute(stmt)
+            conversations = list(result.scalars().all())
+            cleaned: List[Dict[str, Any]] = []
+            for row in conversations:
+                run_result = await db.execute(
+                    select(AgentRun).where(AgentRun.conversation_id == int(row.id))
+                )
+                conversation_runs = list(run_result.scalars().all())
+                running_run_ids = {
+                    str(item.id)
+                    for item in conversation_runs
+                    if str(item.status or "").strip().lower() == "running"
+                }
+                non_running_run_ids = {
+                    str(item.id)
+                    for item in conversation_runs
+                    if str(item.status or "").strip().lower() != "running"
+                }
+                metadata = dict(row.metadata_ or {})
+                turn_payload = metadata.get("turn_store")
+                turn_store = ConversationTurnStore.from_payload(turn_payload if isinstance(turn_payload, dict) else None)
+                changed = False
+                for index, entry in enumerate(list(turn_store.entries or [])):
+                    if str(entry.status or "").strip().lower() != "running":
+                        continue
+                    started_at = self._parse_optional_iso_datetime(entry.started_at)
+                    if started_at is not None and started_at > threshold:
+                        continue
+                    turn_store.entries[index] = ConversationTurnEntry(
+                        turn_id=entry.turn_id,
+                        status="error",
+                        user_message_id=entry.user_message_id,
+                        assistant_message_id=entry.assistant_message_id,
+                        run_id=entry.run_id,
+                        user_content=entry.user_content,
+                        assistant_summary=entry.assistant_summary,
+                        iteration_count=entry.iteration_count,
+                        tool_call_count=entry.tool_call_count,
+                        tool_result_count=entry.tool_result_count,
+                        error_message=entry.error_message or "stale_turn_cleanup",
+                        started_at=entry.started_at,
+                        completed_at=datetime.utcnow().isoformat(),
+                    )
+                    changed = True
+                    cleaned.append(
+                        {
+                            "conversation_id": int(row.id),
+                            "turn_id": str(entry.turn_id),
+                            "run_id": str(entry.run_id or ""),
+                            "started_at": str(entry.started_at or ""),
+                        }
+                    )
+                if not changed:
+                    metadata, closed_tool_calls = self._close_dangling_conversation_tool_calls(
+                        metadata,
+                        running_run_ids=running_run_ids,
+                        non_running_run_ids=non_running_run_ids,
+                        cleanup_at=datetime.utcnow(),
+                    )
+                    if closed_tool_calls:
+                        changed = True
+                        cleaned.extend(
+                            {
+                                "conversation_id": int(row.id),
+                                "turn_id": str(item.get("turn_id") or ""),
+                                "run_id": str(item.get("run_id") or ""),
+                                "tool_call_id": str(item.get("tool_call_id") or ""),
+                            }
+                            for item in closed_tool_calls
+                        )
+                    if not changed:
+                        continue
+                    row.metadata_ = metadata
+                    continue
+                turn_store.updated_at = datetime.utcnow().isoformat()
+                metadata["turn_store"] = turn_store.to_payload()
+                metadata, closed_tool_calls = self._close_dangling_conversation_tool_calls(
+                    metadata,
+                    running_run_ids=running_run_ids,
+                    non_running_run_ids=non_running_run_ids,
+                    cleanup_at=datetime.utcnow(),
+                )
+                cleaned.extend(
+                    {
+                        "conversation_id": int(row.id),
+                        "turn_id": str(item.get("turn_id") or ""),
+                        "run_id": str(item.get("run_id") or ""),
+                        "tool_call_id": str(item.get("tool_call_id") or ""),
+                    }
+                    for item in closed_tool_calls
+                )
+                row.metadata_ = metadata
+            await db.commit()
+        return {
+            "timeout_seconds": timeout_seconds,
+            "cleaned_count": len(cleaned),
+            "cleaned_turns": cleaned,
+        }
+
+    def _close_dangling_conversation_tool_calls(
+        self,
+        metadata: Dict[str, Any],
+        *,
+        running_run_ids: set[str],
+        non_running_run_ids: set[str],
+        cleanup_at: datetime,
+    ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Close persisted tool calls that can no longer receive an observation."""
+        item_payload = metadata.get("item_stream") if isinstance(metadata.get("item_stream"), dict) else None
+        ledger_payload = metadata.get("tool_ledger") if isinstance(metadata.get("tool_ledger"), dict) else None
+        if not item_payload:
+            return metadata, []
+
+        item_stream = ConversationItemStreamStore.from_payload(item_payload)
+        tool_ledger = ToolLedgerStore.from_payload(ledger_payload)
+        turn_store = ConversationTurnStore.from_payload(
+            metadata.get("turn_store") if isinstance(metadata.get("turn_store"), dict) else None
+        )
+
+        item_result_keys = {
+            (str(entry.turn_id or ""), str(entry.tool_call_id or ""))
+            for entry in item_stream.entries
+            if str(entry.kind or "").strip().lower() == "tool_result"
+        }
+        ledger_result_keys = {
+            (str(entry.turn_id or ""), str(entry.tool_call_id or ""))
+            for entry in tool_ledger.entries
+            if str(entry.kind or "").strip().lower() == "tool_result"
+        }
+        turn_status_by_id = {
+            str(entry.turn_id or ""): str(entry.status or "").strip().lower()
+            for entry in turn_store.entries
+        }
+
+        closed: List[Dict[str, Any]] = []
+        created_at = cleanup_at.isoformat()
+        for entry in list(item_stream.entries or []):
+            if str(entry.kind or "").strip().lower() != "tool_call":
+                continue
+            if str(entry.status or "").strip().lower() not in {"started", "running", "pending"}:
+                continue
+            turn_id = str(entry.turn_id or "").strip()
+            tool_call_id = str(entry.tool_call_id or "").strip()
+            if not turn_id or not tool_call_id:
+                continue
+            key = (turn_id, tool_call_id)
+            if key in item_result_keys:
+                continue
+
+            run_id = str(entry.run_id or "").strip()
+            if run_id and run_id in running_run_ids:
+                continue
+            if run_id and non_running_run_ids and run_id not in non_running_run_ids:
+                continue
+            if not run_id and turn_status_by_id.get(turn_id) == "running":
+                continue
+
+            tool_name = str(entry.tool_name or "tool").strip() or "tool"
+            summary = f"tool={tool_name} failed, detail: run_stopped_before_result"
+            item_stream.append(
+                ConversationItemEntry(
+                    item_id=uuid.uuid4().hex,
+                    kind="tool_result",
+                    turn_id=entry.turn_id,
+                    role="tool",
+                    run_id=entry.run_id,
+                    iteration=entry.iteration,
+                    tool_name=entry.tool_name,
+                    tool_call_id=entry.tool_call_id,
+                    status="failed",
+                    arguments=dict(entry.arguments or {}) if isinstance(entry.arguments, dict) else None,
+                    summary=summary,
+                    success=False,
+                    error="run_stopped_before_result",
+                    permission_required=False,
+                    output_tokens_estimate=6,
+                    truncated=False,
+                    metadata={"source_kind": tool_name, "cleanup_reason": "dangling_tool_call"},
+                    created_at=created_at,
+                )
+            )
+            item_result_keys.add(key)
+            if key not in ledger_result_keys:
+                tool_ledger.append(
+                    ToolLedgerEntry(
+                        entry_id=uuid.uuid4().hex,
+                        kind="tool_result",
+                        tool_name=tool_name,
+                        turn_id=entry.turn_id,
+                        tool_call_id=entry.tool_call_id,
+                        run_id=entry.run_id,
+                        iteration=entry.iteration,
+                        status="failed",
+                        arguments=dict(entry.arguments or {}) if isinstance(entry.arguments, dict) else None,
+                        summary=summary,
+                        success=False,
+                        error="run_stopped_before_result",
+                        permission_required=False,
+                        output_tokens_estimate=6,
+                        truncated=False,
+                        metadata={"source_kind": tool_name, "cleanup_reason": "dangling_tool_call"},
+                        created_at=created_at,
+                    )
+                )
+                ledger_result_keys.add(key)
+            closed.append(
+                {
+                    "turn_id": turn_id,
+                    "run_id": run_id,
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                }
+            )
+
+        if not closed:
+            return metadata, []
+
+        call_counts_by_turn: Dict[str, int] = {}
+        result_counts_by_turn: Dict[str, int] = {}
+        for entry in item_stream.entries:
+            turn_id = str(entry.turn_id or "").strip()
+            if not turn_id:
+                continue
+            kind = str(entry.kind or "").strip().lower()
+            if kind == "tool_call":
+                call_counts_by_turn[turn_id] = call_counts_by_turn.get(turn_id, 0) + 1
+            elif kind == "tool_result":
+                result_counts_by_turn[turn_id] = result_counts_by_turn.get(turn_id, 0) + 1
+
+        for index, entry in enumerate(list(turn_store.entries or [])):
+            turn_id = str(entry.turn_id or "").strip()
+            turn_store.entries[index] = ConversationTurnEntry(
+                turn_id=entry.turn_id,
+                status="error" if str(entry.status or "").strip().lower() == "running" else entry.status,
+                user_message_id=entry.user_message_id,
+                assistant_message_id=entry.assistant_message_id,
+                run_id=entry.run_id,
+                user_content=entry.user_content,
+                assistant_summary=entry.assistant_summary,
+                iteration_count=entry.iteration_count,
+                tool_call_count=max(entry.tool_call_count, call_counts_by_turn.get(turn_id, 0)),
+                tool_result_count=max(entry.tool_result_count, result_counts_by_turn.get(turn_id, 0)),
+                error_message=entry.error_message
+                or ("dangling_tool_call_cleanup" if str(entry.status or "").strip().lower() == "running" else None),
+                started_at=entry.started_at,
+                completed_at=entry.completed_at
+                or (created_at if str(entry.status or "").strip().lower() == "running" else None),
+            )
+        turn_store.updated_at = created_at
+        metadata["item_stream"] = item_stream.to_payload()
+        metadata["tool_ledger"] = tool_ledger.to_payload()
+        metadata["turn_store"] = turn_store.to_payload()
+        return metadata, closed
 
     async def append_steps(self, run_id: str, steps: Iterable[Dict[str, Any]]) -> None:
         payload = list(steps)

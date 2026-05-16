@@ -10,6 +10,8 @@ import type {
   ChatRagOverrides,
   ChatRagRewriteProfile,
   ChatRagScopeMode,
+  ChatWorkflowAction,
+  ChatWorkflowControl,
   ChatUserPreferences,
   ConversationCompactedHistory,
   ConversationContextState,
@@ -40,10 +42,12 @@ interface ChatInputProps {
   ragOverrides?: ChatRagOverrides | null
   effectiveRagOverrides?: ChatRagOverrides | null
   ragResetToken?: number
+  workflowControl?: ChatWorkflowControl | null
   llmProvider?: string
   onInputChange: (value: string) => void
   onSend: () => void
   onStop: () => void
+  onWorkflowAction?: (action: ChatWorkflowAction) => void
   onRequestPreview?: () => void
   onChatPreferenceOverrideChange?: (
     key: ChatPreferenceKey,
@@ -190,6 +194,27 @@ const renderPreviewMessagePayload = (message: Record<string, any>) => {
   )
 }
 
+const renderPreviewRawObject = (value: unknown) => {
+  const serialized = (() => {
+    if (value == null) return ''
+    try {
+      return JSON.stringify(value, null, 2)
+    } catch {
+      return String(value)
+    }
+  })()
+
+  if (!serialized) {
+    return <div className="text-slate-500">当前没有可展示的内容。</div>
+  }
+
+  return (
+    <pre className="max-h-44 overflow-auto whitespace-pre-wrap break-words rounded-xl border border-white/[0.05] bg-black/10 px-2.5 py-2 text-xs leading-6 text-slate-300">
+      {serialized}
+    </pre>
+  )
+}
+
 /** 聊天输入区域 */
 const ChatInput = ({
   inputValue,
@@ -210,10 +235,12 @@ const ChatInput = ({
   ragOverrides = null,
   effectiveRagOverrides = null,
   ragResetToken = 0,
+  workflowControl = null,
   llmProvider,
   onInputChange,
   onSend,
   onStop,
+  onWorkflowAction,
   onRequestPreview,
   onChatPreferenceOverrideChange,
   onChatPreferenceOverrideClear,
@@ -253,10 +280,12 @@ const ChatInput = ({
   }, [ragOverrides])
 
   useEffect(() => {
+    // 文档选项异步分页加载，提交覆盖项时要读最新选中文档，避免闭包拿到旧值。
     ragDocumentIdsRef.current = ragDocumentIds
   }, [ragDocumentIds])
 
   useEffect(() => {
+    // 外部重置标记表示本轮临时 RAG 注入已结算，面板状态回到后端传入的基线。
     const nextOverrides = ragOverridesRef.current || null
     setRagEnabled(Boolean(nextOverrides?.enabled))
     setRagScopeMode(nextOverrides?.scope_mode || 'all')
@@ -287,6 +316,7 @@ const ChatInput = ({
   }, [documentSearchInput])
 
   useEffect(() => {
+    // 切换知识库或检索范围时清空文档列表，防止旧知识库的文档 ID 混入新范围。
     setDocumentOptions([])
     setDocumentSearchInput('')
     setDebouncedDocumentSearch('')
@@ -359,6 +389,7 @@ const ChatInput = ({
         setDocumentLoadedCount((current) => (documentPage === 0 ? items.length : current + items.length))
         setDocumentOptions((current) => {
           if (documentPage === 0) {
+            // 新搜索第一页仍保留已选文档，否则已选项可能因为不在当前页而从选择框消失。
             const preserved = current.filter((item) => ragDocumentIdsRef.current.includes(item.id))
             return mergeDocumentOptions(preserved, items)
           }
@@ -417,6 +448,7 @@ const ChatInput = ({
       next.query_rewrite_profile = ragRewriteMode
       next.use_query_rewrite = ragRewriteMode !== 'off'
     }
+    // 只在序列化结果变化时上抛，避免父级状态更新引起面板内部循环刷新。
     if (serializeRagOverrides(ragOverridesRef.current) !== serializeRagOverrides(next)) {
       onRagOverridesChange(next)
     }
@@ -466,6 +498,8 @@ const ChatInput = ({
     if (!raw.length) return []
     const draft = inputValue.trim()
     if (!draft) return raw.slice(0, 3)
+    // 预览接口可能已经把当前草稿放进 recent_messages；展示继承历史时去掉它，
+    // 避免用户误以为同一条输入会被重复发送。
     let lastIndex = -1
     for (let index = raw.length - 1; index >= 0; index -= 1) {
       const item = raw[index]
@@ -648,7 +682,7 @@ const ChatInput = ({
           : '',
       ].filter(Boolean)
     : []
-  const toolSchemaLabels = exactToolSchemas
+  const toolSchemaEntries = exactToolSchemas
     .map((schema, index) => {
       const name =
         (typeof schema?.name === 'string' && schema.name) ||
@@ -658,12 +692,22 @@ const ChatInput = ({
           : '') ||
         (typeof schema?.title === 'string' && schema.title) ||
         `tool_${index + 1}`
-      return String(name).trim()
+      return {
+        name: String(name).trim() || `tool_${index + 1}`,
+        schema,
+      }
     })
-    .filter(Boolean)
+    .filter((item) => Boolean(item.name))
   const previewRagEnabled = Boolean(contextPreview?.effective_rag_overrides?.enabled || effectiveRagOverrides?.enabled)
   const previewRagForceInitialSearch = Boolean(previewDebug?.rag_force_initial_knowledge_search)
   const previewRagForceInitialQuery = normalizePreviewScalar(previewDebug?.rag_force_initial_query)
+  const workflowAction = workflowControl?.action || null
+  const workflowStageStatusLabel =
+    workflowControl?.stage_status === 'running'
+      ? '进行中'
+      : workflowControl?.stage_status === 'blocked'
+        ? '已阻塞'
+        : '已完成'
 
   return (
     <div className="border-t border-white/[0.06] bg-slate-950/88 backdrop-blur-2xl">
@@ -706,6 +750,40 @@ const ChatInput = ({
             </Button>
           )}
         </div>
+
+        {workflowControl ? (
+          <div className="mt-3 rounded-[20px] border border-cyan-400/12 bg-[linear-gradient(135deg,rgba(8,47,73,0.28),rgba(15,23,42,0.7))] px-4 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="space-y-1">
+                <div className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-200/90">
+                  Skill Workflow
+                </div>
+                <div className="text-sm text-slate-100">
+                  {workflowControl.display_name || workflowControl.skill_name}
+                  {' · '}
+                  {workflowControl.stage_label || workflowControl.stage}
+                  {' '}
+                  {workflowStageStatusLabel}
+                </div>
+                <div className="text-xs text-slate-400">
+                  继续策略：{workflowControl.continue_policy || '未指定'}
+                  {workflowControl.next_stage_label ? ` · 下一阶段：${workflowControl.next_stage_label}` : ''}
+                </div>
+              </div>
+              {workflowAction && onWorkflowAction ? (
+                <Button
+                  size="small"
+                  type="primary"
+                  disabled={isSending}
+                  onClick={() => onWorkflowAction(workflowAction)}
+                  className="rounded-xl border-none bg-cyan-500 text-slate-950 shadow-none hover:!bg-cyan-400 disabled:opacity-50"
+                >
+                  {workflowAction.label}
+                </Button>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
 
         <div className="mt-3 overflow-hidden rounded-[22px] border border-emerald-400/12 bg-[linear-gradient(135deg,rgba(6,78,59,0.18),rgba(15,23,42,0.72))] shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] px-4 py-3">
@@ -1154,16 +1232,19 @@ const ChatInput = ({
                         </div>
 
                         <div>
-                          <div className="mb-1 text-slate-400">Tools（{exactToolSchemas.length} 个）</div>
-                          {toolSchemaLabels.length ? (
-                            <div className="flex flex-wrap gap-2">
-                              {toolSchemaLabels.map((label) => (
-                                <span
-                                  key={label}
-                                  className="rounded-full border border-white/[0.08] bg-white/[0.04] px-2.5 py-1 text-[11px] text-slate-300"
+                          <div className="mb-1 text-slate-400">Tool Schemas（{exactToolSchemas.length} 个）</div>
+                          {toolSchemaEntries.length ? (
+                            <div className="space-y-2">
+                              {toolSchemaEntries.map(({ name, schema }, index) => (
+                                <div
+                                  key={`${name}-${index}`}
+                                  className="rounded-xl border border-white/[0.05] bg-black/10 px-2.5 py-2"
                                 >
-                                  {label}
-                                </span>
+                                  <div className="mb-1 text-[11px] uppercase tracking-[0.12em] text-slate-500">
+                                    #{index + 1} {name}
+                                  </div>
+                                  {renderPreviewRawObject(schema)}
+                                </div>
                               ))}
                             </div>
                           ) : (

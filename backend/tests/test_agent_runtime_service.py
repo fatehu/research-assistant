@@ -1,5 +1,7 @@
 import os
 import sys
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -7,6 +9,155 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app.services.agent_runtime_service import AgentRuntimeService
 import app.services.agent_runtime_service as runtime_module
+
+
+@pytest.mark.asyncio
+async def test_commit_conversation_compaction_if_current_commits_matching_source(monkeypatch):
+    item_stream = {
+        "version": "conversation_item_stream.v1",
+        "updated_at": "2026-05-04T00:00:00",
+        "entries": [
+            {
+                "item_id": "item-user",
+                "kind": "user_message",
+                "turn_id": "turn:1",
+                "role": "user",
+                "content": "旧问题",
+                "message_id": 10,
+            }
+        ],
+    }
+    row = SimpleNamespace(metadata_={"item_stream": dict(item_stream)})
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, model, conversation_id):
+            return row
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(runtime_module, "async_session_factory", lambda: _FakeSession())
+
+    service = AgentRuntimeService()
+    source_fingerprint = service.build_item_stream_fingerprint(item_stream)
+
+    result = await service.commit_conversation_compaction_if_current(
+        42,
+        source_fingerprint=source_fingerprint,
+        context_state={"version": "conversation_context_state.v3", "updated_at": "now"},
+        compacted_history={
+            "version": "conversation_compacted_history.v2",
+            "history_summary": "旧问题摘要",
+            "compact_boundary_message_id": 10,
+        },
+        compact_boundary_entry={
+            "kind": "compact_boundary",
+            "role": "system",
+            "content": "旧问题摘要",
+            "message_id": 10,
+            "metadata": {
+                "compact_boundary_message_id": 10,
+                "replacement_history": [{"role": "system", "content": "旧问题摘要"}],
+            },
+        },
+        history_event_title="manual_compact",
+        history_event_detail="compacted_messages=1",
+        context_snapshot={"version": "conversation_context_snapshot.v1", "mode": "manual"},
+    )
+
+    assert result["committed"] is True
+    assert row.metadata_["context_state"]["version"] == "conversation_context_state.v3"
+    assert row.metadata_["compacted_history"]["history_summary"] == "旧问题摘要"
+    assert row.metadata_["history_log"]["events"][-1]["title"] == "manual_compact"
+    assert row.metadata_["context_snapshots"][-1]["mode"] == "manual"
+    kinds = [entry["kind"] for entry in row.metadata_["item_stream"]["entries"]]
+    assert kinds[-2:] == ["history_event", "compact_boundary"]
+
+
+@pytest.mark.asyncio
+async def test_commit_conversation_compaction_if_current_skips_stale_source(monkeypatch):
+    source_item_stream = {
+        "version": "conversation_item_stream.v1",
+        "updated_at": "2026-05-04T00:00:00",
+        "entries": [
+            {
+                "item_id": "item-user",
+                "kind": "user_message",
+                "turn_id": "turn:1",
+                "role": "user",
+                "content": "旧问题",
+                "message_id": 10,
+            }
+        ],
+    }
+    current_item_stream = {
+        "version": "conversation_item_stream.v1",
+        "updated_at": "2026-05-04T00:00:05",
+        "entries": [
+            *source_item_stream["entries"],
+            {
+                "item_id": "item-new",
+                "kind": "assistant_message",
+                "turn_id": "turn:1",
+                "role": "assistant",
+                "content": "新回答",
+                "message_id": 11,
+            },
+        ],
+    }
+    row = SimpleNamespace(metadata_={"item_stream": dict(current_item_stream)})
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, model, conversation_id):
+            return row
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(runtime_module, "async_session_factory", lambda: _FakeSession())
+
+    service = AgentRuntimeService()
+    result = await service.commit_conversation_compaction_if_current(
+        42,
+        source_fingerprint=service.build_item_stream_fingerprint(source_item_stream),
+        context_state={"version": "conversation_context_state.v3"},
+        compacted_history={"version": "conversation_compacted_history.v2", "history_summary": "旧摘要"},
+        compact_boundary_entry={
+            "kind": "compact_boundary",
+            "role": "system",
+            "content": "旧摘要",
+            "message_id": 10,
+            "metadata": {"compact_boundary_message_id": 10},
+        },
+        history_event_title="manual_compact",
+        history_event_detail="compacted_messages=1",
+        context_snapshot={"version": "conversation_context_snapshot.v1", "mode": "manual"},
+        stale_history_event_title="manual_compact_stale_skipped",
+        stale_history_event_detail="reason=stale_source",
+    )
+
+    assert result["committed"] is False
+    assert result["reason"] == "stale_source"
+    assert "context_state" not in row.metadata_
+    assert "compacted_history" not in row.metadata_
+    assert row.metadata_["history_log"]["events"][-1]["title"] == "manual_compact_stale_skipped"
+    assert "event=model_compaction_skipped" in row.metadata_["history_log"]["events"][-1]["detail"]
+    assert "current_entry_count=2" in row.metadata_["history_log"]["events"][-1]["detail"]
+    kinds = [entry["kind"] for entry in row.metadata_["item_stream"]["entries"]]
+    assert kinds[-1] == "history_event"
+    assert "compact_boundary" not in kinds
 
 
 @pytest.mark.asyncio
@@ -151,3 +302,141 @@ async def test_list_chat_run_events_loads_persisted_payloads(monkeypatch):
     assert [item["event"] for item in events] == ["start", "done"]
     assert events[0]["data"]["conversation_id"] == 42
     assert events[1]["data"]["answer"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stale_runs_marks_old_running_runs_as_error(monkeypatch):
+    old_running = SimpleNamespace(
+        id="run-old",
+        channel="chat",
+        conversation_id=107,
+        status="running",
+        started_at=datetime.utcnow() - timedelta(hours=2),
+        finished_at=None,
+        metadata_={},
+    )
+    recent_running = SimpleNamespace(
+        id="run-new",
+        channel="chat",
+        conversation_id=107,
+        status="running",
+        started_at=datetime.utcnow(),
+        finished_at=None,
+        metadata_={},
+    )
+
+    class _ScalarsResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return list(self._rows)
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def execute(self, stmt):
+            return _ScalarsResult([old_running])
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(runtime_module, "async_session_factory", lambda: _FakeSession())
+
+    report = await AgentRuntimeService().cleanup_stale_runs(older_than_seconds=300, only_channels=["chat"])
+
+    assert report["cleaned_count"] == 1
+    assert report["cleaned_runs"][0]["id"] == "run-old"
+    assert old_running.status == "error"
+    assert old_running.finished_at is not None
+    assert old_running.metadata_["error"] == "stale_run_cleanup"
+    assert recent_running.status == "running"
+
+
+def test_close_dangling_conversation_tool_calls_adds_failed_result():
+    service = AgentRuntimeService()
+    metadata = {
+        "turn_store": {
+            "version": "conversation_turn_store.v1",
+            "entries": [
+                {
+                    "turn_id": "turn:1",
+                    "status": "stopped",
+                    "tool_call_count": 1,
+                    "tool_result_count": 0,
+                }
+            ],
+        },
+        "tool_ledger": {
+            "version": "conversation_tool_ledger.v1",
+            "entries": [
+                {
+                    "entry_id": "call-entry",
+                    "kind": "tool_call",
+                    "tool_name": "knowledge_search",
+                    "turn_id": "turn:1",
+                    "tool_call_id": "call-1",
+                    "run_id": "run-1",
+                    "iteration": 1,
+                    "status": "started",
+                    "arguments": {"query": "classification"},
+                }
+            ],
+        },
+        "item_stream": {
+            "version": "conversation_item_stream.v1",
+            "entries": [
+                {
+                    "item_id": "item-call",
+                    "kind": "tool_call",
+                    "role": "tool",
+                    "tool_name": "knowledge_search",
+                    "turn_id": "turn:1",
+                    "tool_call_id": "call-1",
+                    "run_id": "run-1",
+                    "iteration": 1,
+                    "status": "started",
+                    "arguments": {"query": "classification"},
+                }
+            ],
+        },
+    }
+
+    updated, closed = service._close_dangling_conversation_tool_calls(
+        metadata,
+        running_run_ids=set(),
+        non_running_run_ids={"run-1"},
+        cleanup_at=datetime(2026, 4, 24, 8, 0, 0),
+    )
+
+    assert closed == [
+        {
+            "turn_id": "turn:1",
+            "run_id": "run-1",
+            "tool_call_id": "call-1",
+            "tool_name": "knowledge_search",
+        }
+    ]
+    item_results = [
+        item
+        for item in updated["item_stream"]["entries"]
+        if item["kind"] == "tool_result" and item["tool_call_id"] == "call-1"
+    ]
+    ledger_results = [
+        item
+        for item in updated["tool_ledger"]["entries"]
+        if item["kind"] == "tool_result" and item["tool_call_id"] == "call-1"
+    ]
+    assert item_results[0]["status"] == "failed"
+    assert item_results[0]["success"] is False
+    assert item_results[0]["error"] == "run_stopped_before_result"
+    assert ledger_results[0]["status"] == "failed"
+    assert updated["turn_store"]["entries"][0]["tool_call_count"] == 1
+    assert updated["turn_store"]["entries"][0]["tool_result_count"] == 1

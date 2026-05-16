@@ -22,6 +22,12 @@ from loguru import logger
 from openai import AsyncOpenAI
 
 from app.config import settings
+from app.services.llm_service import (
+    build_llm_source_headers,
+    log_tagged_llm_request_done,
+    log_tagged_llm_request_error,
+    log_tagged_llm_request_start,
+)
 from app.services.render_pipeline_contract import (
     CanonicalAtomBundle,
     RenderPipelineContractError,
@@ -107,6 +113,8 @@ class ReaderMultimodalLayoutService:
         if cross_column_merge_ratio > 0.08:
             trigger_reasons.append("cross_column_merge_high")
 
+        # 即使调用方当前把 enabled 当作所有页面的 opt-in，也保留逐文档遥测；
+        # 返回的 trigger_reasons 仍说明页面是否真的有风险特征。
         state = self._doc_stats.setdefault(
             int(paper_id),
             {
@@ -492,6 +500,8 @@ class ReaderMultimodalLayoutService:
         payload["known_layout_ids"] = [real_to_alias.get(item, item) for item in known_ids]
         digest_rows = [row for row in list(payload.get("docmind_layout_digest") or []) if isinstance(row, dict)]
         if digest_rows and real_to_alias:
+            # 过长 layout ID 会让多模态 JSON 变脆弱；先在 prompt 中使用别名，
+            # 校验后再映射回规范 DocMind ID，保证下游契约稳定。
             aliased_digest_rows: List[Dict[str, Any]] = []
             for row in digest_rows:
                 cloned = dict(row)
@@ -570,6 +580,8 @@ class ReaderMultimodalLayoutService:
         last_error = err
         retry_hint = ""
         if isinstance(last_error, RenderPipelineContractError):
+            # 校验反馈刻意保持简短：足够修复 enum 和必填字段错误，
+            # 但不鼓励模型偏离 schema。
             retry_hint = f"Previous output failed validation: code={last_error.code}, stage={last_error.stage}. Return strict JSON only."
             if str(last_error.code) == "STAGE1_REQUIRED_FIELD_MISSING":
                 retry_hint += (
@@ -718,6 +730,8 @@ class ReaderMultimodalLayoutService:
         last_error = err
         retry_hint = ""
         if isinstance(last_error, RenderPipelineContractError):
+            # 第二阶段只负责设计；重试时要求模型修复 JSON，同时保留已知的
+            # 布局/组件允许列表。
             retry_hint = f"Previous output failed validation: code={last_error.code}, stage={last_error.stage}. Return strict JSON only."
         validated_retry, err_retry = await _attempt(primary_model, retry_hint)
         if isinstance(validated_retry, dict):
@@ -3450,11 +3464,19 @@ class ReaderMultimodalLayoutService:
             return None
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        source = f"reader.multimodal_layout.{prompt_kind}"
         if str(prompt_kind) in {"line_parse_advice_v1", "stage1_structural_v1", "stage1_semantic_v2"}:
             max_tokens = max(1200, int(getattr(settings, "reader_mm_parser_max_tokens", 4200) or 4200))
         else:
             max_tokens = max(900, int(getattr(settings, "reader_mm_max_tokens", 2200) or 2200))
         request_timeout = max(2.0, float(timeout_ms) / 1000.0)
+        extra_headers = build_llm_source_headers(source)
+        log_tagged_llm_request_start(
+            source=source,
+            provider="aliyun",
+            model=model,
+            operation="chat",
+        )
         try:
             resp = await asyncio.wait_for(
                 client.chat.completions.create(
@@ -3476,14 +3498,35 @@ class ReaderMultimodalLayoutService:
                     max_tokens=max_tokens,
                     response_format={"type": "json_object"},
                     timeout=request_timeout,
+                    extra_headers=extra_headers or None,
                 ),
                 timeout=request_timeout + 1.0,
             )
         except Exception as exc:  # pragma: no cover - network failures are acceptable
+            log_tagged_llm_request_error(
+                source=source,
+                provider="aliyun",
+                model=model,
+                operation="chat",
+                error=f"{type(exc).__name__}: {exc!r}",
+            )
             logger.warning(
                 f"[ReaderMM] model call failed model={model}, prompt_kind={prompt_kind}: {type(exc).__name__}: {exc!r}"
             )
             return None
+        usage_obj = getattr(resp, "usage", None)
+        log_tagged_llm_request_done(
+            source=source,
+            provider="aliyun",
+            model=str(getattr(resp, "model", "") or model),
+            operation="chat",
+            finish_reason=str(getattr((getattr(resp, "choices", None) or [None])[0], "finish_reason", "") or ""),
+            usage={
+                "prompt_tokens": int(getattr(usage_obj, "prompt_tokens", 0) or 0),
+                "completion_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
+                "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
+            },
+        )
 
         content = ""
         finish_reason = ""
@@ -4387,4 +4430,3 @@ class ReaderMultimodalLayoutService:
             if ch.isalnum() or ("\u4e00" <= ch <= "\u9fff"):
                 cleaned.append(ch)
         return "".join(cleaned)[:180]
-

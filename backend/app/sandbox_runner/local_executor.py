@@ -170,10 +170,12 @@ def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
 def _safe_builtins():
     builtins_map = __builtins__ if isinstance(__builtins__, dict) else __builtins__.__dict__
     allowed = [
+        "__build_class__",
         "abs", "all", "any", "bool", "dict", "enumerate", "float", "int", "len",
         "list", "max", "min", "pow", "print", "range", "round", "set", "slice",
         "sorted", "str", "sum", "tuple", "zip", "map", "filter", "format",
         "getattr", "hasattr", "isinstance", "issubclass", "type", "Exception",
+        "object", "super",
         "ValueError", "TypeError", "KeyError", "IndexError", "RuntimeError",
         "NameError", "AttributeError", "ImportError", "ModuleNotFoundError",
         "FileNotFoundError", "PermissionError", "OSError"
@@ -184,7 +186,7 @@ def _safe_builtins():
     return safe
 
 
-namespace = {"__builtins__": _safe_builtins()}
+namespace = {"__builtins__": _safe_builtins(), "__name__": "__main__"}
 execution_count = 0
 last_used_at = time.time()
 _WORKSPACE_DIR = ""

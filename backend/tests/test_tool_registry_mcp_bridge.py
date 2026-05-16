@@ -77,8 +77,13 @@ def _patch_default_tools(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(agent_tools, "LiteratureSearchTool", lambda: DummyTool("literature_search"))
 
 
+def _reset_shared_mcp_state():
+    agent_tools.ToolRegistry.reset_shared_mcp_cache()
+
+
 @pytest.mark.asyncio
 async def test_refresh_mcp_tools_and_expose_schema(monkeypatch):
+    _reset_shared_mcp_state()
     _patch_default_tools(monkeypatch)
     schema = FakeSchema(
         server_name="fetch",
@@ -103,6 +108,7 @@ async def test_refresh_mcp_tools_and_expose_schema(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_prefers_local_tool_over_mcp(monkeypatch):
+    _reset_shared_mcp_state()
     _patch_default_tools(monkeypatch)
     schema = FakeSchema(
         server_name="fetch",
@@ -128,6 +134,7 @@ async def test_execute_prefers_local_tool_over_mcp(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_calls_mcp_when_local_tool_missing(monkeypatch):
+    _reset_shared_mcp_state()
     _patch_default_tools(monkeypatch)
     schema = FakeSchema(
         server_name="fetch",
@@ -148,3 +155,56 @@ async def test_execute_calls_mcp_when_local_tool_missing(monkeypatch):
     assert result.success is True
     assert result.output == "remote:mcp.fetch.search"
     assert fake_manager.call_history == [("mcp.fetch.search", {"query": "abc"})]
+
+
+@pytest.mark.asyncio
+async def test_refresh_mcp_tools_reuses_shared_discovery_cache(monkeypatch):
+    _reset_shared_mcp_state()
+    _patch_default_tools(monkeypatch)
+    schema = FakeSchema(
+        server_name="fetch",
+        tool_name="search",
+        qualified_name="mcp.fetch.search",
+        description="remote search",
+        input_schema={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+    )
+    fake_manager = FakeMCPManager([schema])
+
+    monkeypatch.setattr(agent_tools.settings, "mcp_enabled", True)
+    monkeypatch.setattr(agent_tools.ToolRegistry, "_create_mcp_client_manager", lambda self: fake_manager)
+
+    first = agent_tools.ToolRegistry(db=None, user_id=1)
+    second = agent_tools.ToolRegistry(db=None, user_id=2)
+
+    await first.refresh_mcp_tools()
+    await second.refresh_mcp_tools()
+
+    assert fake_manager.discover_calls == 1
+    assert "mcp.fetch.search" in [item["function"]["name"] for item in second.list_tools()]
+
+
+@pytest.mark.asyncio
+async def test_warmup_shared_mcp_tools_populates_registry_cache(monkeypatch):
+    _reset_shared_mcp_state()
+    _patch_default_tools(monkeypatch)
+    schema = FakeSchema(
+        server_name="fetch",
+        tool_name="search",
+        qualified_name="mcp.fetch.search",
+        description="remote search",
+        input_schema={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+    )
+    fake_manager = FakeMCPManager([schema])
+
+    monkeypatch.setattr(agent_tools.settings, "mcp_enabled", True)
+    monkeypatch.setattr(agent_tools.ToolRegistry, "_create_standalone_mcp_client_manager", classmethod(lambda cls: fake_manager))
+
+    report = await agent_tools.ToolRegistry.warmup_shared_mcp_tools(force_refresh=False)
+    registry = agent_tools.ToolRegistry(db=None, user_id=1, initialize_mcp=False)
+    registry._mcp_client_manager = fake_manager
+    await registry.refresh_mcp_tools()
+
+    assert report["status"] == "ready"
+    assert report["tool_count"] == 1
+    assert fake_manager.discover_calls == 1
+    assert "mcp.fetch.search" in [item["function"]["name"] for item in registry.list_tools()]

@@ -59,7 +59,12 @@ class GenerativeReaderAgentCore(AgentCore):
         resolved = [str(item).strip() for item in list(allowed_tool_names or []) if str(item).strip()]
         self.allowed_tool_names: Set[str] = set(resolved or list(self.DEFAULT_ALLOWED_TOOLS))
 
-    def _build_system_prompt(self, messages: Optional[List[Dict[str, Any]]] = None) -> str:
+    def _build_system_prompt(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        *,
+        function_calling: bool = False,
+    ) -> str:
         tools_desc = self.tools.get_tools_description(include_tool_names=self.allowed_tool_names)
         self._last_tool_selection = {
             "intent": "generative_reader",

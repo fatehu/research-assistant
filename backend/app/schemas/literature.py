@@ -111,6 +111,7 @@ class PaperSearchResponse(BaseModel):
     total: int
     offset: int = 0
     has_more: bool = False
+    next_token: Optional[str] = None
     papers: List[PaperSearchResult]
     query: str
     source: str
@@ -169,7 +170,7 @@ class CollectionKnowledgeReadinessItem(BaseModel):
 
 class CollectionKnowledgeReadinessResponse(BaseModel):
     collection_id: int
-    knowledge_base_id: int
+    knowledge_base_id: Optional[int] = None
     total_papers: int
     completed_papers: int
     running_papers: int
@@ -1036,7 +1037,9 @@ class ReadingDossierV2AdjacentPageRow(BaseModel):
             item_payload["seq"] = index
             try:
                 item_payload = ReadingDossierV2AdjacentContentStreamItem.model_validate(item_payload).model_dump(mode="json")
-            except Exception:
+            except Exception as exc:
+                if "legacy JSON payload stuffing" in str(exc):
+                    raise
                 continue
             normalized_stream.append(item_payload)
 
@@ -2937,7 +2940,7 @@ class LiteratureAskRequest(BaseModel):
     scope: Literal["paper", "collection"]
     paper_id: Optional[int] = None
     collection_id: Optional[int] = None
-    knowledge_base_id: int
+    knowledge_base_id: Optional[int] = None
     mode: Literal["agentic", "classic"] = "agentic"
     question: str = Field(..., min_length=1, max_length=4000)
     session_id: Optional[int] = None

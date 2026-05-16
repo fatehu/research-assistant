@@ -51,7 +51,7 @@ const EmptyState = ({ onQuickPrompt }: EmptyStateProps) => {
       <p className="text-slate-400 text-center max-w-md mb-6 text-sm leading-relaxed">
         我可以帮助你解答科研问题、分析数据、检索知识库
         <br />
-        <span className="text-emerald-400">支持工具调用，可以看到完整思考过程</span>
+        <span className="text-emerald-400">支持工具调用，可以看到过程与工具轨道</span>
       </p>
 
       {/* 可用工具 */}

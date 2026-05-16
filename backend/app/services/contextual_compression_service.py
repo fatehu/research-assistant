@@ -50,8 +50,12 @@ class ContextualCompressionService:
 请输出 JSON：
 {{
   "relevant_content": "保留后的相关内容（必须带 [{source_label}] 标签）",
-  "relevance_score": 0
+  "relevance_score": 7
 }}
+
+relevance_score 使用 0-10 分：0 表示完全无关；1-3 表示弱相关或仅背景相关；
+4-6 表示与问题有直接关系且可采用；7-9 表示高度相关；10 表示可直接回答问题。
+如果 relevant_content 非空且确实直接相关，通常应给 4 分或以上；只有没有直接相关句子时才输出空内容并给 0 分。
 """.strip()
 
     BATCH_COMPRESS_PROMPT = """
@@ -67,10 +71,15 @@ class ContextualCompressionService:
     {{
       "source_id": 1,
       "relevant_content": "相关内容，必须带 [来源1] 标签",
-      "relevance_score": 0
+      "relevance_score": 7
     }}
   ]
 }}
+
+relevance_score 使用 0-10 分：0 表示完全无关；1-3 表示弱相关或仅背景相关；
+4-6 表示与问题有直接关系且可采用；7-9 表示高度相关；10 表示可直接回答问题。
+如果某个 source_id 的 relevant_content 非空且确实直接相关，通常应给 4 分或以上；
+只有没有直接相关句子时才输出空内容并给 0 分。每个输入 source_id 都必须返回一项。
 """.strip()
 
     SYSTEM_PROMPT = (
@@ -94,6 +103,7 @@ class ContextualCompressionService:
         if llm.provider == "ollama":
             return True
 
+        # 远程服务方没有有效密钥时直接走抽取式兜底，避免压缩阶段拖垮检索链路。
         api_key = (llm.config.get("api_key") or "").strip()
         if not api_key:
             return False
@@ -210,9 +220,10 @@ class ContextualCompressionService:
         content = re.sub(r"^[-*\s]+", "", content)
         content = re.sub(r"\n{3,}", "\n\n", content)
         source_token = f"[{source_label}]"
-        if source_token not in content:
-            content = f"{source_token} {content}"
-        return content.strip()
+        content = re.sub(rf"\s*{re.escape(source_token)}\s*", " ", content).strip()
+        if not content:
+            return ""
+        return f"{source_token} {content}".strip()
 
     @staticmethod
     def _split_batches(chunks: Sequence[CompressionInput], batch_size: int) -> list[list[CompressionInput]]:
@@ -264,6 +275,7 @@ class ContextualCompressionService:
             score = overlap + bonus
             scored.append((score, idx, sentence))
 
+        # 兜底路径只选少量高重叠句子，并按原文顺序拼回去，保证引用片段仍可追溯。
         scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
         selected = [item for item in scored if item[0] > 0][:2]
         if not selected:
@@ -349,6 +361,7 @@ class ContextualCompressionService:
         if isinstance(parsed, list):
             items = [item for item in parsed if isinstance(item, dict)]
         elif isinstance(parsed, dict):
+            # 不同模型可能返回 items/results/chunks 或单对象；统一归一化为 source_id 映射。
             possible_items = parsed.get("items") or parsed.get("results") or parsed.get("chunks")
             if isinstance(possible_items, list):
                 items = [item for item in possible_items if isinstance(item, dict)]
@@ -402,6 +415,7 @@ class ContextualCompressionService:
 
         threshold = max(0.0, min(settings.contextual_compression_skip_rerank_threshold, 1.0))
         if chunk.reranker_score is not None and self._normalize_reranker_score(float(chunk.reranker_score)) >= threshold:
+            # 重排器已经高度确认相关时跳过大模型压缩，减少延迟和不必要的改写风险。
             return self._result_for_high_reranker(chunk, source_label)
 
         if not self._llm_available():
@@ -433,6 +447,7 @@ class ContextualCompressionService:
                         settings.llm_max_tokens,
                         settings.contextual_compression_max_output_tokens,
                     ),
+                    source="retrieval.contextual_compression.single",
                 ),
                 timeout=max(1, settings.contextual_compression_timeout_seconds),
             )
@@ -511,6 +526,7 @@ class ContextualCompressionService:
                     settings.llm_max_tokens,
                     settings.contextual_compression_max_output_tokens * max(1, len(chunks)),
                 ),
+                source="retrieval.contextual_compression.batch",
             ),
             timeout=max(1, settings.contextual_compression_timeout_seconds),
         )
@@ -569,6 +585,7 @@ class ContextualCompressionService:
             return [results[item.source_id] for item in chunks if item.source_id in results]
 
         if not self._llm_available():
+            # 批量模式也必须完整返回每个输入的结果；大模型不可用时逐块走抽取式兜底。
             for chunk in pending:
                 source_label = self._source_label(chunk.source_id)
                 results[chunk.source_id] = self._result_with_fallback(
@@ -596,6 +613,7 @@ class ContextualCompressionService:
                         source_label = self._source_label(chunk.source_id)
                         parsed = parsed_items.get(chunk.source_id)
                         if not parsed:
+                            # 模型漏掉某个 source_id 时只回退该片段，避免整批成功结果被丢弃。
                             results[chunk.source_id] = self._result_with_fallback(
                                 query,
                                 chunk,

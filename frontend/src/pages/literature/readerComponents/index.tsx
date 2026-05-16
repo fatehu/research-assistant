@@ -244,6 +244,8 @@ function deriveColumnWidthRatios(tableCells: TableCellShape[], fallbackCount: nu
   const maxCol = tableCells.reduce((max, cell) => Math.max(max, cell.colEnd), -1)
   const count = Math.max(fallbackCount, maxCol + 1)
   if (count <= 0) return []
+  // 有几何宽度时优先使用它，让重建表格保留 PDF 的视觉比例，
+  // 而不是渲染成等宽列。
   const bounds: Array<{ x0: number; x1: number } | null> = Array.from({ length: count }, () => null)
   let globalX0: number | null = null
   let globalX1: number | null = null
@@ -298,6 +300,8 @@ function shouldMergeTableRowIntoPrevious(
   const effectiveCells = meaningfulCells.length > 0 ? meaningfulCells : nextCells
   const firstColumn = Math.min(...effectiveCells.map((cell) => cell.colStart))
   if (firstColumn <= 0) return false
+  // 从非零列开始的物理行通常是跨行 label 单元格下的延续，
+  // 不是新的逻辑行。
   return previousLogicalRow.cells.some((cell) => cell.colStart < firstColumn && cell.rowEnd >= nextRowIndex)
 }
 
@@ -527,6 +531,8 @@ function isJumpableAnchor(
   const hasGeometryPolygons = Array.isArray(anchor.geometry?.polygons) && anchor.geometry!.polygons.length > 0
   const segmentIndex = Number(anchor.segment_index || 0)
   const segmentTotal = Number(anchor.segment_total || 0)
+  // 只有 full-block anchors 可点击；segmented anchors 用于 evidence 展示，
+  // 但在长段落中会让跳转预览不稳定。
   if (coordVersion === 'anchor_v2' && (segmentIndex > 0 || segmentTotal > 0)) return false
   if (coordVersion === 'anchor_v2' && !canonicalBlockId) return false
   if (coordVersion === 'layout_uid_v1' && !sourceLayoutId && !hasGeometryPolygons) return false
@@ -1328,6 +1334,8 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
   }
   const props = propsValidation.props || {}
   const nodeGatePassed = isNodeGatePassed(node)
+  // 节点 gates 失败时仍渲染组件主体，但隐藏 anchors，避免 UI 跳转到
+  // 校验器标记为不可靠的证据。
   const anchorRefs = normalizeAnchorRows(node.source_anchor_refs)
     .filter((row) => nodeGatePassed && isJumpableAnchor(row, ctx?.isActionableAnchor))
 

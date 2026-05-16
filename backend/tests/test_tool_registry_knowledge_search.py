@@ -1,5 +1,6 @@
 import os
 import sys
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,10 +36,117 @@ def test_tool_registry_registers_knowledge_search_only_when_db_available(monkeyp
     with_db = agent_tools.ToolRegistry(db=object(), user_id=1)
     without_db = agent_tools.ToolRegistry(db=None, user_id=1)
     with_factory = agent_tools.ToolRegistry(db=None, db_session_factory=lambda: object(), user_id=1)
+    codelab = agent_tools.ToolRegistry(db=object(), user_id=1, route_profile="codelab")
+
+    paper_tool_names = {
+        "paper_search",
+        "project_tree",
+        "project_read_file",
+        "project_write_report",
+        "project_write_file",
+        "project_bash",
+        "project_claude",
+        "paper_research_prepare",
+        "paper_research_search_project_zoekt",
+        "paper_research_probe_repo",
+        "paper_research_probe_url",
+        "paper_research_status",
+    }
 
     assert "knowledge_search" in with_db._tools
+    assert paper_tool_names.issubset(set(with_db._tools))
     assert "knowledge_search" not in without_db._tools
+    assert paper_tool_names.isdisjoint(set(without_db._tools))
     assert "knowledge_search" in with_factory._tools
+    assert paper_tool_names.issubset(set(with_factory._tools))
+    assert "knowledge_search" in codelab._tools
+    assert paper_tool_names.isdisjoint(set(codelab._tools))
+
+
+@pytest.mark.asyncio
+async def test_project_write_report_only_writes_reference_report_markdown(monkeypatch, tmp_path):
+    from app.services import project_paths, project_service
+
+    class _ProjectService:
+        def __init__(self, db):
+            self.db = db
+
+        async def get_project_payload(self, project_id, user_id):
+            return {"id": int(project_id), "user_id": int(user_id)}
+
+    monkeypatch.setattr(project_service, "ProjectService", _ProjectService)
+    monkeypatch.setattr(project_paths, "get_project_root_dir", lambda project_id: tmp_path / str(project_id))
+
+    tool = agent_tools.ProjectWriteReportTool(db=object(), user_id=1)
+    result = await tool.execute(
+        project_id=7,
+        relative_path="tuning_research.md",
+        content="# Tuning research\n\n- finding",
+    )
+
+    assert result.success is True
+    assert result.data["relative_path"] == "reference/reports/tuning_research.md"
+    assert (tmp_path / "7" / "reference" / "reports" / "tuning_research.md").read_text(encoding="utf-8") == (
+        "# Tuning research\n\n- finding"
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_write_report_rejects_repo_or_non_markdown_paths(monkeypatch, tmp_path):
+    from app.services import project_paths, project_service
+
+    class _ProjectService:
+        def __init__(self, db):
+            self.db = db
+
+        async def get_project_payload(self, project_id, user_id):
+            return {"id": int(project_id), "user_id": int(user_id)}
+
+    monkeypatch.setattr(project_service, "ProjectService", _ProjectService)
+    monkeypatch.setattr(project_paths, "get_project_root_dir", lambda project_id: tmp_path / str(project_id))
+
+    tool = agent_tools.ProjectWriteReportTool(db=object(), user_id=1)
+    repo_result = await tool.execute(
+        project_id=7,
+        relative_path="repo/source/TUNING-PLAN.md",
+        content="# should not land here",
+    )
+    json_result = await tool.execute(
+        project_id=7,
+        relative_path="reference/reports/tuning_research.json",
+        content="{}",
+    )
+
+    assert repo_result.success is False
+    assert repo_result.error == "project_report_path_out_of_scope"
+    assert json_result.success is False
+    assert json_result.error == "project_report_path_out_of_scope"
+    assert not (tmp_path / "7" / "repo" / "source" / "TUNING-PLAN.md").exists()
+    assert not (tmp_path / "7" / "reference" / "reports" / "tuning_research.json").exists()
+
+
+def test_paper_research_tool_parameters_expose_input_model_constraints():
+    issues = []
+    for name, tool_cls in vars(agent_tools).items():
+        if not inspect.isclass(tool_cls):
+            continue
+        if not name.startswith("PaperResearch") or not name.endswith("Tool"):
+            continue
+        if not getattr(tool_cls, "parameters", None) or not getattr(tool_cls, "input_model", None):
+            continue
+
+        model_schema = tool_cls.input_model.model_json_schema()
+        model_props = model_schema.get("properties", {}) or {}
+        manual_props = tool_cls.parameters.get("properties", {}) or {}
+        for field_name, model_meta in model_props.items():
+            manual_meta = manual_props.get(field_name)
+            if not isinstance(manual_meta, dict):
+                continue
+            for key in ("minimum", "maximum", "minLength", "maxLength", "enum"):
+                if key in model_meta and manual_meta.get(key) != model_meta.get(key):
+                    issues.append(f"{name}.{field_name}.{key}")
+
+    assert not issues, "paper tool schema drift: " + "; ".join(sorted(issues))
 
 
 def test_knowledge_search_runtime_uses_configurable_threshold(monkeypatch):
@@ -344,3 +452,65 @@ def test_api_search_filters_embedding_dimension():
     assert "dc.embedding_dimension = :vector_dimension" in knowledge_api
     assert "\"vector_dimension\": group_dimension" in knowledge_api
     assert "embedding::vector(" in knowledge_api
+
+
+def test_paper_research_probe_url_classifies_hdf5_payload():
+    tool = agent_tools.PaperResearchStatusTool(db=None, user_id=1)
+
+    ok, downloadable, diagnosis, next_action = tool._probe_url_diagnosis(
+        status_code=200,
+        content_length=1024,
+        detected_kind="hdf5",
+        expected_kind="hdf5",
+        head_bytes=b"\x89HDF\r\n\x1a\n",
+    )
+
+    assert ok is True
+    assert downloadable is True
+    assert diagnosis == "valid_hdf5"
+    assert next_action == "use_as_official_source"
+
+
+def test_paper_research_probe_url_flags_empty_202_response():
+    tool = agent_tools.PaperResearchStatusTool(db=None, user_id=1)
+
+    ok, downloadable, diagnosis, next_action = tool._probe_url_diagnosis(
+        status_code=202,
+        content_length=0,
+        detected_kind="unknown",
+        expected_kind="file",
+        head_bytes=b"",
+    )
+
+    assert ok is False
+    assert downloadable is False
+    assert diagnosis == "accepted_but_empty"
+    assert next_action == "diagnose_official_source_failure"
+
+
+def test_paper_research_probe_url_treats_html_landing_page_as_not_downloadable():
+    tool = agent_tools.PaperResearchStatusTool(db=None, user_id=1)
+
+    ok, downloadable, diagnosis, next_action = tool._probe_url_diagnosis(
+        status_code=200,
+        content_length=4096,
+        detected_kind="html",
+        expected_kind="auto",
+        head_bytes=b"<!DOCTYPE html><html><body>Google Drive</body></html>",
+    )
+
+    assert ok is False
+    assert downloadable is False
+    assert diagnosis == "html_page"
+    assert next_action == "use_as_reference_page"
+
+
+def test_paper_research_parse_git_ls_remote_extracts_default_branch():
+    tool = agent_tools.PaperResearchStatusTool(db=None, user_id=1)
+
+    parsed = tool._parse_git_ls_remote(
+        "ref: refs/heads/main\tHEAD\n0123456789abcdef0123456789abcdef01234567\tHEAD\n"
+    )
+
+    assert parsed["default_branch"] == "main"
+    assert parsed["head_sha"] == "0123456789abcdef0123456789abcdef01234567"

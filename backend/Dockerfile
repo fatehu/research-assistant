@@ -10,12 +10,16 @@ ENV LANG=C.UTF-8 \
 
 RUN apt-get update && apt-get install -y \
     gcc \
+    git \
     gosu \
+    golang-go \
     libpq-dev \
     fontconfig \
     fonts-wqy-zenhei \
+    libreoffice-writer \
     nodejs \
     npm \
+    pandoc \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -26,6 +30,18 @@ RUN pip install --no-cache-dir --default-timeout=120 --retries 10 --index-url ${
 import docling
 print(docling.__file__)
 PY
+
+ARG AIDER_CHAT_VERSION=0.86.2
+RUN python -m venv /opt/aider && \
+    /opt/aider/bin/pip install --no-cache-dir --default-timeout=120 --retries 10 --index-url ${PIP_INDEX_URL} --upgrade pip setuptools wheel && \
+    /opt/aider/bin/pip install --no-cache-dir --default-timeout=120 --retries 10 --index-url ${PIP_INDEX_URL} "aider-chat==${AIDER_CHAT_VERSION}" && \
+    ln -sf /opt/aider/bin/aider /usr/local/bin/aider && \
+    /usr/local/bin/aider --version
+
+ARG ZOEKT_VERSION=bbe6b77210da6966947d9780bd440ebc08a78707
+RUN GOBIN=/usr/local/bin go install github.com/sourcegraph/zoekt/cmd/zoekt@${ZOEKT_VERSION} && \
+    GOBIN=/usr/local/bin go install github.com/sourcegraph/zoekt/cmd/zoekt-git-index@${ZOEKT_VERSION} && \
+    GOBIN=/usr/local/bin go install github.com/sourcegraph/zoekt/cmd/zoekt-index@${ZOEKT_VERSION}
 
 COPY . .
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh

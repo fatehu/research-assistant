@@ -48,6 +48,42 @@ def _parse_retry_after_seconds(value: Optional[str]) -> Optional[float]:
         return None
 
 
+def _normalize_search_sort_key(value: Optional[str]) -> str:
+    normalized = str(value or "relevance").strip().lower().replace("-", "_")
+    aliases = {
+        "": "relevance",
+        "score": "relevance",
+        "publication": "latest",
+        "publication_date": "latest",
+        "published": "latest",
+        "pub_date": "latest",
+        "date": "latest",
+        "latest_publication": "latest",
+        "most_cited": "citations",
+        "citation": "citations",
+        "citation_count": "citations",
+        "cited_by_count": "citations",
+        "is_referenced_by_count": "citations",
+        "recently_updated": "updated",
+        "last_updated": "updated",
+        "submitted_date": "submitted",
+        "recently_added": "recent",
+        "most_recent": "recent",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _normalize_search_sort_order(value: Optional[str]) -> str:
+    normalized = str(value or "desc").strip().lower()
+    if normalized in {"asc", "ascending", "1"}:
+        return "asc"
+    return "desc"
+
+
+def _arxiv_sort_order(value: Optional[str]) -> str:
+    return "ascending" if _normalize_search_sort_order(value) == "asc" else "descending"
+
+
 @dataclass
 class PaperResult:
     """论文搜索结果"""
@@ -142,6 +178,8 @@ class RateLimitedHttpProvider:
             if attempt >= self.retry_attempts:
                 return response
 
+            # 服务方限流通常会带 Retry-After；优先使用它而不是本地指数退避，
+            # 避免立刻再次触发 429/503。
             retry_after = _parse_retry_after_seconds(response.headers.get("Retry-After"))
             wait_seconds = retry_after if retry_after is not None else max(
                 self.retry_backoff_seconds,
@@ -160,16 +198,15 @@ class RateLimitedHttpProvider:
 
 class SemanticScholarService(RateLimitedHttpProvider):
     """Semantic Scholar API 服务"""
-    
+
     BASE_URL = "https://api.semanticscholar.org/graph/v1"
-    SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
-    
+    SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search/bulk"
+
     # API 字段
     PAPER_FIELDS = [
         "paperId", "externalIds", "title", "abstract", "venue", "year",
-        "referenceCount", "citationCount", "influentialCitationCount",
-        "isOpenAccess", "openAccessPdf", "fieldsOfStudy", "publicationDate",
-        "journal", "authors", "citations", "references", "url"
+        "referenceCount", "citationCount", "openAccessPdf", "fieldsOfStudy",
+        "publicationDate", "authors", "url"
     ]
     
     def __init__(self):
@@ -230,15 +267,33 @@ class SemanticScholarService(RateLimitedHttpProvider):
         if len(self._cache) > 100:
             oldest_key = min(self._cache.keys(), key=lambda k: self._cache[k][1])
             del self._cache[oldest_key]
-    
+
+    @staticmethod
+    def _format_year_range(year_range: Optional[tuple]) -> Optional[str]:
+        if not year_range:
+            return None
+        start, end = year_range
+        start_token = str(start).strip() if start is not None else ""
+        end_token = str(end).strip() if end is not None else ""
+        if start_token and end_token:
+            return f"{start_token}-{end_token}"
+        if start_token:
+            return f"{start_token}-"
+        if end_token:
+            return f"-{end_token}"
+        return None
+
     async def search(
         self,
         query: str,
         limit: int = 10,
         offset: int = 0,
+        page_token: Optional[str] = None,
         year_range: Optional[tuple] = None,
         fields_of_study: Optional[List[str]] = None,
-        open_access_only: bool = False
+        open_access_only: bool = False,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         搜索论文
@@ -251,34 +306,52 @@ class SemanticScholarService(RateLimitedHttpProvider):
             fields_of_study: 研究领域过滤
             open_access_only: 仅开放获取
         """
-        logger.info(f"[S2] 搜索论文: {query}, limit={limit}, offset={offset}")
-        
+        logger.info(f"[S2] 搜索论文(BULK): {query}, offset={offset}, token={bool(page_token)}")
+
         # 检查缓存
-        cache_key = self._get_cache_key(query, limit=limit, offset=offset, 
-                                         year_range=year_range, fields=fields_of_study,
-                                         open_access=open_access_only)
+        cache_key = self._get_cache_key(
+            query,
+            limit=limit,
+            offset=offset,
+            page_token=page_token,
+            year_range=year_range,
+            fields=fields_of_study,
+            open_access=open_access_only,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
         cached = self._get_cached(cache_key)
         if cached:
             return cached
-        
+
         params = {
             "query": query,
-            "limit": min(limit, 100),
-            "offset": offset,
             "fields": ",".join(self.PAPER_FIELDS)
         }
-        
+        if page_token:
+            params["token"] = page_token
+
         # 年份过滤
-        if year_range:
-            params["year"] = f"{year_range[0]}-{year_range[1]}"
-        
+        year_filter = self._format_year_range(year_range)
+        if year_filter:
+            params["year"] = year_filter
+
         # 领域过滤
         if fields_of_study:
             params["fieldsOfStudy"] = ",".join(fields_of_study)
-        
+
         # 开放获取过滤
         if open_access_only:
             params["openAccessPdf"] = ""
+
+        sort_key = _normalize_search_sort_key(sort_by)
+        s2_sort_field = {
+            "latest": "publicationDate",
+            "citations": "citationCount",
+            "paper_id": "paperId",
+        }.get(sort_key)
+        if s2_sort_field:
+            params["sort"] = f"{s2_sort_field}:{_normalize_search_sort_order(sort_order)}"
         
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
@@ -295,13 +368,16 @@ class SemanticScholarService(RateLimitedHttpProvider):
                 
                 data = response.json()
                 papers = [self._parse_paper(p) for p in data.get("data", [])]
-                
+                next_token = data.get("token")
+
                 result = {
                     "total": data.get("total", len(papers)),
-                    "offset": data.get("offset", offset),
+                    "offset": offset,
+                    "next_token": next_token,
+                    "has_more": bool(next_token),
                     "papers": papers
                 }
-                
+
                 # 缓存结果
                 self._set_cache(cache_key, result)
                 
@@ -432,8 +508,11 @@ class ArxivService(RateLimitedHttpProvider):
         limit: int = 10,
         offset: int = 0,
         categories: Optional[List[str]] = None,
-        sort_by: str = "relevance",  # relevance, lastUpdatedDate, submittedDate
-        sort_order: str = "descending"
+        year_range: Optional[tuple] = None,
+        fields_of_study: Optional[List[str]] = None,
+        open_access_only: bool = False,
+        sort_by: Optional[str] = "relevance",
+        sort_order: Optional[str] = "descending",
     ) -> Dict[str, Any]:
         """
         搜索 arXiv 论文
@@ -447,19 +526,39 @@ class ArxivService(RateLimitedHttpProvider):
             sort_order: 排序顺序
         """
         logger.info(f"[arXiv] 搜索论文: {query}, limit={limit}, offset={offset}")
-        
+
         # 构建查询
         search_query = f"all:{query}"
-        if categories:
-            cat_query = " OR ".join([f"cat:{c}" for c in categories])
+        category_tokens = list(categories or [])
+        if fields_of_study:
+            for token in fields_of_study:
+                normalized = str(token or "").strip()
+                if normalized and normalized in self.CATEGORIES and normalized not in category_tokens:
+                    category_tokens.append(normalized)
+        if category_tokens:
+            cat_query = " OR ".join([f"cat:{c}" for c in category_tokens])
             search_query = f"({search_query}) AND ({cat_query})"
-        
+
+        if year_range:
+            start_year, end_year = year_range
+            start_date = f"{int(start_year) if start_year is not None else 1900}01010000"
+            end_date = f"{int(end_year) if end_year is not None else 3000}12312359"
+            search_query = f"({search_query}) AND submittedDate:[{start_date} TO {end_date}]"
+
+        sort_key = _normalize_search_sort_key(sort_by)
+        arxiv_sort_by = {
+            "updated": "lastUpdatedDate",
+            "submitted": "submittedDate",
+            "latest": "submittedDate",
+            "relevance": "relevance",
+        }.get(sort_key, "relevance")
+
         params = {
             "search_query": search_query,
             "start": offset,
             "max_results": limit,
-            "sortBy": sort_by,
-            "sortOrder": sort_order
+            "sortBy": arxiv_sort_by,
+            "sortOrder": _arxiv_sort_order(sort_order),
         }
         
         try:
@@ -664,25 +763,60 @@ class PubMedService(RateLimitedHttpProvider):
             min_interval_seconds=min_interval_seconds,
         )
     
+    @staticmethod
+    def _build_search_term(
+        query: str,
+        year_range: Optional[tuple] = None,
+        open_access_only: bool = False,
+    ) -> str:
+        terms = [f"({query})"]
+        if year_range:
+            start_year, end_year = year_range
+            if start_year is not None or end_year is not None:
+                start_value = int(start_year) if start_year is not None else 1800
+                end_value = int(end_year) if end_year is not None else 3000
+                terms.append(f"{start_value}:{end_value}[dp]")
+        if open_access_only:
+            terms.append("free full text[sb]")
+        return " AND ".join(terms)
+
     async def search(
         self,
         query: str,
         limit: int = 10,
-        offset: int = 0
+        offset: int = 0,
+        year_range: Optional[tuple] = None,
+        fields_of_study: Optional[List[str]] = None,
+        open_access_only: bool = False,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
     ) -> Dict[str, Any]:
         """搜索 PubMed 论文"""
         logger.info(f"[PubMed] 搜索: {query}, limit={limit}")
-        
+
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
-                # 第一步：搜索获取 ID 列表
+                search_term = self._build_search_term(
+                    query,
+                    year_range=year_range,
+                    open_access_only=open_access_only,
+                )
+
+                # 第一步：通过 usehistory 保存结果集，后续 efetch 用 WebEnv/query_key 续取。
                 search_params = {
                     "db": "pubmed",
-                    "term": query,
+                    "term": search_term,
                     "retmax": limit,
                     "retstart": offset,
                     "retmode": "json",
-                    "sort": "relevance"
+                    "sort": {
+                        "latest": "pub date",
+                        "recent": "most recent",
+                        "title": "title",
+                        "author": "author",
+                        "journal": "journal",
+                    }.get(_normalize_search_sort_key(sort_by), "relevance"),
+                    "usehistory": "y",
                 }
                 if self.api_key:
                     search_params["api_key"] = self.api_key
@@ -696,20 +830,29 @@ class PubMedService(RateLimitedHttpProvider):
                     return {"total": 0, "papers": [], "error": f"Search error: {search_resp.status_code}"}
                 
                 search_data = search_resp.json()
-                id_list = search_data.get("esearchresult", {}).get("idlist", [])
-                total = int(search_data.get("esearchresult", {}).get("count", 0))
-                
+                esearch_result = search_data.get("esearchresult", {})
+                id_list = esearch_result.get("idlist", [])
+                total = int(esearch_result.get("count", 0))
+                webenv = esearch_result.get("webenv")
+                query_key = esearch_result.get("querykey")
+
                 logger.info(f"[PubMed] 搜索ID: total={total}, 获取到{len(id_list)}个ID, offset={offset}")
-                
-                if not id_list:
-                    return {"total": 0, "papers": [], "offset": offset}
-                
+
+                if total <= 0 or (not id_list and not (webenv and query_key)):
+                    return {"total": total, "papers": [], "offset": offset, "has_more": False}
+
                 # 第二步：获取详细信息
                 fetch_params = {
                     "db": "pubmed",
-                    "id": ",".join(id_list),
-                    "retmode": "xml"
+                    "retmode": "xml",
+                    "retstart": offset,
+                    "retmax": limit,
                 }
+                if webenv and query_key:
+                    fetch_params["WebEnv"] = webenv
+                    fetch_params["query_key"] = query_key
+                else:
+                    fetch_params["id"] = ",".join(id_list)
                 if self.api_key:
                     fetch_params["api_key"] = self.api_key
                 
@@ -728,7 +871,8 @@ class PubMedService(RateLimitedHttpProvider):
                 return {
                     "total": total,
                     "offset": offset,
-                    "papers": papers
+                    "papers": papers,
+                    "has_more": offset + len(papers) < total,
                 }
                 
         except Exception as e:
@@ -866,26 +1010,51 @@ class OpenAlexService(RateLimitedHttpProvider):
         query: str,
         limit: int = 10,
         offset: int = 0,
-        year_range: Optional[tuple] = None
+        year_range: Optional[tuple] = None,
+        fields_of_study: Optional[List[str]] = None,
+        open_access_only: bool = False,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
     ) -> Dict[str, Any]:
         """搜索 OpenAlex 论文"""
         logger.info(f"[OpenAlex] 搜索: {query}, limit={limit}")
-        
+
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                sort_key = _normalize_search_sort_key(sort_by)
+                openalex_sort_field = {
+                    "latest": "publication_date",
+                    "citations": "cited_by_count",
+                    "title": "display_name",
+                    "relevance": "relevance_score",
+                }.get(sort_key, "relevance_score")
+                openalex_order = _normalize_search_sort_order(sort_order)
                 params = {
                     "search": query,
                     "per_page": limit,
                     "page": (offset // limit) + 1,
-                    "sort": "relevance_score:desc"
+                    "sort": f"{openalex_sort_field}:{openalex_order}",
                 }
-                
+
                 if self.email:
                     params["mailto"] = self.email
-                
+
+                filter_parts: List[str] = []
                 if year_range:
-                    params["filter"] = f"publication_year:{year_range[0]}-{year_range[1]}"
-                
+                    start_year, end_year = year_range
+                    if start_year is not None:
+                        filter_parts.append(f"from_publication_date:{int(start_year)}-01-01")
+                    if end_year is not None:
+                        filter_parts.append(f"to_publication_date:{int(end_year)}-12-31")
+                    elif sort_key == "latest":
+                        filter_parts.append(f"to_publication_date:{datetime.utcnow().date().isoformat()}")
+                elif sort_key == "latest":
+                    filter_parts.append(f"to_publication_date:{datetime.utcnow().date().isoformat()}")
+                if open_access_only:
+                    filter_parts.append("open_access.is_oa:true")
+                if filter_parts:
+                    params["filter"] = ",".join(filter_parts)
+
                 response = await self._request_with_retry(client, f"{self.BASE_URL}/works", params=params)
                 
                 if response.status_code != 200:
@@ -1034,20 +1203,50 @@ class CrossRefService(RateLimitedHttpProvider):
         self,
         query: str,
         limit: int = 10,
-        offset: int = 0
+        offset: int = 0,
+        year_range: Optional[tuple] = None,
+        fields_of_study: Optional[List[str]] = None,
+        open_access_only: bool = False,
+        page_token: Optional[str] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
     ) -> Dict[str, Any]:
         """搜索 CrossRef 论文"""
         logger.info(f"[CrossRef] 搜索: {query}, limit={limit}")
-        
+
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                sort_key = _normalize_search_sort_key(sort_by)
+                crossref_sort = {
+                    "latest": "published",
+                    "citations": "is-referenced-by-count",
+                    "updated": "updated",
+                    "references": "references-count",
+                    "relevance": "relevance",
+                }.get(sort_key, "relevance")
                 params = {
                     "query": query,
                     "rows": limit,
-                    "offset": offset,
-                    "sort": "relevance"
+                    "sort": crossref_sort,
+                    "order": _normalize_search_sort_order(sort_order),
                 }
-                
+                if page_token or offset == 0:
+                    params["cursor"] = page_token or "*"
+                else:
+                    params["offset"] = offset
+
+                filter_parts: List[str] = []
+                if year_range:
+                    start_year, end_year = year_range
+                    if start_year is not None:
+                        filter_parts.append(f"from-pub-date:{int(start_year)}-01-01")
+                    if end_year is not None:
+                        filter_parts.append(f"until-pub-date:{int(end_year)}-12-31")
+                if open_access_only:
+                    filter_parts.append("has-license:true")
+                if filter_parts:
+                    params["filter"] = ",".join(filter_parts)
+
                 headers = {}
                 if self.email:
                     headers["User-Agent"] = f"ResearchAssistant/1.0 (mailto:{self.email})"
@@ -1065,11 +1264,14 @@ class CrossRefService(RateLimitedHttpProvider):
                 data = response.json()
                 message = data.get("message", {})
                 papers = [self._parse_item(item) for item in message.get("items", [])]
-                
+                next_cursor = message.get("next-cursor") if "cursor" in params else None
+
                 return {
                     "total": message.get("total-results", 0),
                     "offset": offset,
-                    "papers": papers
+                    "papers": papers,
+                    "next_token": next_cursor,
+                    "has_more": bool(next_cursor and next_cursor != page_token and papers),
                 }
                 
         except Exception as e:
@@ -1200,10 +1402,16 @@ class LiteratureService:
         source: str = "semantic_scholar",
         limit: int = 10,
         offset: int = 0,
+        page_token: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """统一搜索接口"""
         normalized_source = str(source or "").strip().lower() or self.default_source
+        year_range = kwargs.get("year_range")
+        fields_of_study = kwargs.get("fields_of_study")
+        open_access_only = bool(kwargs.get("open_access_only", False))
+        sort_by = kwargs.get("sort_by")
+        sort_order = kwargs.get("sort_order")
         if normalized_source == "auto":
             return await self.search_auto(query, limit=limit, offset=offset, **kwargs)
         if normalized_source == "multi":
@@ -1211,18 +1419,69 @@ class LiteratureService:
                 query=query,
                 limit_per_source=limit,
                 offset=offset,
-                year_range=kwargs.get("year_range"),
+                year_range=year_range,
+                fields_of_study=fields_of_study,
+                open_access_only=open_access_only,
+                sort_by=sort_by,
+                sort_order=sort_order,
             )
         if normalized_source == "arxiv":
-            return await self.arxiv.search(query, limit, offset, **kwargs)
+            return await self.arxiv.search(
+                query,
+                limit,
+                offset,
+                year_range=year_range,
+                fields_of_study=fields_of_study,
+                open_access_only=open_access_only,
+                sort_by=sort_by,
+                sort_order=sort_order,
+            )
         if normalized_source == "pubmed":
-            return await self.pubmed.search(query, limit, offset)
+            return await self.pubmed.search(
+                query,
+                limit,
+                offset,
+                year_range=year_range,
+                fields_of_study=fields_of_study,
+                open_access_only=open_access_only,
+                sort_by=sort_by,
+                sort_order=sort_order,
+            )
         if normalized_source == "openalex":
-            return await self.openalex.search(query, limit, offset, **kwargs)
+            return await self.openalex.search(
+                query,
+                limit,
+                offset,
+                year_range=year_range,
+                fields_of_study=fields_of_study,
+                open_access_only=open_access_only,
+                sort_by=sort_by,
+                sort_order=sort_order,
+            )
         if normalized_source == "crossref":
-            return await self.crossref.search(query, limit, offset)
+            return await self.crossref.search(
+                query,
+                limit,
+                offset,
+                year_range=year_range,
+                fields_of_study=fields_of_study,
+                open_access_only=open_access_only,
+                page_token=page_token,
+                sort_by=sort_by,
+                sort_order=sort_order,
+            )
         if normalized_source == "semantic_scholar":
-            return await self.s2.search(query, limit, offset, **kwargs)
+            return await self.s2.search(
+                query,
+                limit,
+                offset,
+                page_token=page_token,
+                year_range=year_range,
+                fields_of_study=fields_of_study,
+                open_access_only=open_access_only,
+                sort_by=sort_by,
+                sort_order=sort_order,
+            )
         return {
             "total": 0,
             "offset": offset,
@@ -1262,6 +1521,8 @@ class LiteratureService:
             if result.get("error"):
                 errors[source_name] = str(result["error"])
 
+        # 自动搜索返回第一个有可用论文的来源，同时保留部分错误，
+        # 方便 API 响应侧观测。
         payload: Dict[str, Any] = {
             "total": 0,
             "offset": offset,
@@ -1341,12 +1602,18 @@ class LiteratureService:
         limit_per_source: int = 5,
         offset: int = 0,
         year_range: Optional[tuple] = None,
+        fields_of_study: Optional[List[str]] = None,
+        open_access_only: bool = False,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
     ) -> Dict[str, Any]:
         """多源并行搜索并融合去重。"""
         limit_per_source = max(1, int(limit_per_source))
         offset = max(0, int(offset))
         fetch_limit = min(max(limit_per_source + offset, limit_per_source), 100)
 
+        # 每个 provider 都从 offset 0 拉取，再在去重后分页；否则重复的 DOI/arXiv
+        # 记录会让后续页不稳定。
         tasks = {
             source_name: self.search(
                 query=query,
@@ -1354,6 +1621,10 @@ class LiteratureService:
                 limit=fetch_limit,
                 offset=0,
                 year_range=year_range,
+                fields_of_study=fields_of_study,
+                open_access_only=open_access_only,
+                sort_by=sort_by,
+                sort_order=sort_order,
             )
             for source_name in self.multi_source_order
         }
@@ -1388,6 +1659,7 @@ class LiteratureService:
                 paper.raw_data = raw_data
                 key = self._paper_dedupe_key(paper)
                 existing = merged.get(key)
+                # 对同一篇论文保留信息最丰富的记录，不受哪个 provider 先返回影响。
                 merged[key] = paper if existing is None else self._pick_better_paper(existing, paper)
 
         deduped = list(merged.values())

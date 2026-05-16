@@ -63,8 +63,13 @@ def _patch_default_tools(monkeypatch: pytest.MonkeyPatch, web_search_tool: Count
     monkeypatch.setattr(agent_tools, "LiteratureSearchTool", lambda: CountingTool("literature_search"))
 
 
+def _reset_shared_mcp_state():
+    agent_tools.ToolRegistry.reset_shared_mcp_cache()
+
+
 @pytest.mark.asyncio
 async def test_route_prefers_external_then_skip_local(monkeypatch):
+    _reset_shared_mcp_state()
     local_tool = CountingTool("web_search", output="local-web")
     fake_manager = FakeMCPManager(
         {
@@ -95,6 +100,7 @@ async def test_route_prefers_external_then_skip_local(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_route_fallback_to_local_when_external_failed(monkeypatch):
+    _reset_shared_mcp_state()
     local_tool = CountingTool("web_search", output="local-web")
     fake_manager = FakeMCPManager(
         {"mcp.brave.search": _make_mcp_result(False, "remote failed", error="mcp_call_failed")}
@@ -119,6 +125,7 @@ async def test_route_fallback_to_local_when_external_failed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_route_tries_next_candidate_on_missing(monkeypatch):
+    _reset_shared_mcp_state()
     local_tool = CountingTool("web_search", output="local-web")
     fake_manager = FakeMCPManager(
         {
@@ -153,6 +160,7 @@ async def test_route_tries_next_candidate_on_missing(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_route_circuit_breaker_skips_remote_after_threshold(monkeypatch):
+    _reset_shared_mcp_state()
     local_tool = CountingTool("web_search", output="local-web")
     fake_manager = FakeMCPManager(
         {"mcp.brave.search": _make_mcp_result(False, "timeout", error="timeout")}

@@ -422,6 +422,8 @@ class ReaderSingleAgentValidator:
         known_set = set(known_ids)
         whitelist = {str(item).strip() for item in list(component_whitelist or []) if str(item).strip()}
 
+        # 校验入口拆成分类、清洗和 UI 计划三类输出，分别检查 ID 覆盖、
+        # 源文本不可变和组件契约，便于后续 deterministic repair 精准修复。
         classification_rows = [
             row
             for row in list((step_result.get("classification") or {}).get("items") or [])
@@ -485,6 +487,8 @@ class ReaderSingleAgentValidator:
         covered_block_ids: Set[str] = set()
         layout_tokens_raw = (step_result.get("ui_plan_draft") or {}).get("layout_tokens")
         layout_tokens = self._sanitize_layout_tokens(layout_tokens_raw)
+        # 布局标记描述的是页面级布局；组件级 region/column_id 必须引用
+        # 这里声明过的区域，防止模型发明不可渲染的布局目标。
         if layout_tokens_raw is not None and not isinstance(layout_tokens_raw, Mapping):
             layout_contract_errors.append("layout_tokens_not_object")
         layout_mode = self._normalize_layout_mode((layout_tokens_raw or {}).get("layout_mode") if isinstance(layout_tokens_raw, Mapping) else None)
@@ -575,6 +579,8 @@ class ReaderSingleAgentValidator:
             for source_id in source_block_ids:
                 if source_id in known_set:
                     covered_block_ids.add(source_id)
+            # 属性校验只做结构和基础类型检查；内容质量留给后续主观评分，
+            # 避免 validator 过度干预模型表达。
             props_errors = self._component_props_errors(component, row.get("props"))
             if props_errors:
                 whitelist_errors.extend(props_errors)
@@ -714,6 +720,8 @@ class ReaderSingleAgentValidator:
         missing_known_block_ids = [layout_id for layout_id in known_ids if layout_id not in covered_block_ids]
         no_drop_errors: List[str] = []
         if missing_known_block_ids:
+            # 不丢块校验是硬门：所有 DocMind blocks 必须至少被一个组件拥有，
+            # 即使最终组件可能被折叠展示。
             no_drop_errors.append(
                 self._structured_error(
                     "no_drop_blocks_missing",
@@ -789,6 +797,8 @@ class ReaderSingleAgentValidator:
         known_set = set(known_ids)
         whitelist = {str(item).strip() for item in list(component_whitelist or []) if str(item).strip()}
 
+        # 确定性修复不尝试“变聪明”，只做可证明安全的补齐、去重和回退，
+        # 让失败的模型输出尽量回到 renderer 可接受的最小形态。
         repaired: Dict[str, Any] = {
             "classification": {"items": []},
             "cleaning": {"items": []},
@@ -820,6 +830,8 @@ class ReaderSingleAgentValidator:
             if previous_ownership and layout_id in previous_ownership:
                 prev_bucket = str(previous_ownership.get(layout_id) or "").strip().lower()
                 if prev_bucket in {"main_content", "aux_content"}:
+                    # 已有 ownership 比当前模型输出更可信；修复时保持不变，
+                    # 避免多轮重试让同一 block 在主内容/辅助内容之间来回漂移。
                     bucket = prev_bucket
             cls_map[layout_id] = {
                 "layout_id": layout_id,
@@ -1511,4 +1523,3 @@ class ReaderSingleAgentValidator:
         if allow_heading:
             return [{"component": "SectionHeading", "source_block_ids": [first_id], "props": {"text": text or first_id, "level": 2}}]
         return []
-

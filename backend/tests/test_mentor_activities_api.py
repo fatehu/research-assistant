@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from app.api.mentor import get_mentor_activities
+from app.api.mentor import get_mentor_activities, get_my_students
 
 
 class _FakeScalarResult:
@@ -29,6 +29,33 @@ class _FakeDB:
         if not self._batches:
             return _FakeScalarResult([])
         return _FakeScalarResult(self._batches.pop(0))
+
+
+@pytest.mark.asyncio
+async def test_get_my_students_includes_activity_counts():
+    joined_at = datetime.utcnow()
+    student = SimpleNamespace(
+        id=11,
+        username="stu1",
+        full_name="学生1",
+        email="stu1@example.com",
+        avatar=None,
+        department="CS",
+        research_direction="RAG",
+        joined_at=joined_at,
+        last_login=None,
+    )
+    db = _FakeDB([[(student, 3, 1, 12, 3)]])
+    mentor = SimpleNamespace(id=100)
+
+    students = await get_my_students(current_user=mentor, db=db)
+
+    assert len(students) == 1
+    assert students[0].id == 11
+    assert students[0].conversation_count == 3
+    assert students[0].knowledge_base_count == 1
+    assert students[0].paper_count == 12
+    assert students[0].notebook_count == 3
 
 
 @pytest.mark.asyncio
@@ -61,4 +88,3 @@ async def test_mentor_activities_merge_and_sort_desc():
     assert items[2].type == "conversation"
     assert items[3].type == "knowledge"
     assert items[0].student.username == "stu2"
-

@@ -1,11 +1,11 @@
 import axios, { AxiosError } from 'axios'
 
-// API base configuration
+// 接口基础配置集中在这里，方便本地开发、Docker 和部署环境共享同一套客户端入口。
 const VITE_ENV = ((import.meta as any).env || {}) as Record<string, string | undefined>
 const API_BASE_URL = VITE_ENV.VITE_API_BASE_URL || 'http://localhost:8888'
 export const SHOW_RAG_METRICS = VITE_ENV.VITE_SHOW_RAG_METRICS === 'true'
-// Let long-running reader/workbench v2 builds be bounded by backend/runtime policy
-// instead of a browser-side hard timeout that aborts valid cold-start executions.
+// 阅读器和 workbench v2 构建可能触发冷启动；由后端/runtime 控制超时，
+// 不在浏览器侧硬中断有效请求。
 const LONG_RUNNING_READER_TIMEOUT_MS = 0
 const CHAT_CONTEXT_PREVIEW_TIMEOUT_MS = 90000
 
@@ -29,7 +29,7 @@ export type TaskStatus =
   | 'timeout'
   | 'cancelled'
 
-// Create axios instance
+// 默认 axios 实例负责普通 JSON 请求；流式接口使用 fetch 单独处理。
 const api = axios.create({
   baseURL: API_BASE_URL,
   timeout: 30000, // 30s timeout
@@ -46,6 +46,8 @@ function reuseInflightRequest<T>(
   key: string,
   factory: () => Promise<T>,
 ): Promise<T> {
+  // 同一个缓存型阅读器请求在短时间内可能被多个组件同时触发；复用进行中的 Promise，
+  // 避免重复占用后端构建资源。
   const cached = inflight.get(key)
   if (cached) return cached
   const request = factory().finally(() => {
@@ -57,7 +59,7 @@ function reuseInflightRequest<T>(
   return request
 }
 
-// Request interceptor - attach token
+// 请求拦截器负责从 zustand 持久化状态取 token，并附加到所有普通 API 请求。
 api.interceptors.request.use((config) => {
   const authStorage = localStorage.getItem('auth-storage')
   if (authStorage) {
@@ -136,7 +138,7 @@ const readJsonSseResponse = async (
         const data = JSON.parse(line.slice(5).trim())
         onEvent?.(data.event, data.data)
       } catch {
-        // ignore malformed stream chunk
+        // 忽略被网络分片截断或后端调试输出污染的异常流片段。
       }
     }
 
@@ -147,7 +149,7 @@ const readJsonSseResponse = async (
           const data = JSON.parse(trailing.slice(5).trim())
           onEvent?.(data.event, data.data)
         } catch {
-          // ignore malformed trailing chunk
+          // 忽略收尾阶段仍不完整的异常片段。
         }
       }
       return ''
@@ -167,7 +169,7 @@ const readJsonSseResponse = async (
   }
 }
 
-// Response interceptor - normalize errors
+// 响应拦截器统一错误消息，并在 401 时清理本地登录态。
 api.interceptors.response.use(
   (response) => response,
   (error: AxiosError<ApiErrorResponsePayload>) => {
@@ -218,6 +220,69 @@ export interface AuthResponse {
   user: User
 }
 
+export interface DocumentArtifactBlock {
+  block_id: string
+  index: number
+  title: string
+  heading_path: string[]
+  required: boolean
+  target_words: number
+  block_constraints: string
+  markdown: string
+  status: string
+  updated_at?: string
+}
+
+export interface DocumentArtifact {
+  schema_version: string
+  artifact_id: string
+  template_id: string
+  title: string
+  global_constraints: string
+  blocks: DocumentArtifactBlock[]
+  created_at?: string
+  updated_at?: string
+}
+
+export interface DocumentArtifactSchemaGenerateRequest {
+  template_id: string
+  title?: string
+  user_notes?: string
+}
+
+export interface DocumentArtifactCreateRequest {
+  template_id: string
+  schema: DocumentArtifact
+}
+
+export interface DocumentArtifactBlockUpdateRequest {
+  title?: string
+  block_constraints?: string
+  markdown?: string
+  status?: string
+}
+
+export interface DocumentArtifactSpanRewriteRequest {
+  instruction: string
+  selected_text: string
+  before_context?: string
+  after_context?: string
+  occurrence_index?: number
+  start_offset?: number
+  end_offset?: number
+}
+
+export interface DocumentArtifactSpanRewriteResponse {
+  artifact: DocumentArtifact
+  block_id: string
+  old_markdown: string
+  new_markdown: string
+  selected_text: string
+  replacement_text: string
+  start_offset: number
+  end_offset: number
+}
+
 export interface Conversation {
   id: number
   user_id: number
@@ -225,6 +290,8 @@ export interface Conversation {
   llm_provider: string
   llm_model?: string
   is_archived: number
+  is_starred?: number
+  starred_at?: string | null
   created_at: string
   updated_at: string
   messages?: Message[]
@@ -237,8 +304,16 @@ export interface Conversation {
   tool_ledger?: ConversationToolLedger
   item_stream?: ConversationItemStream
   context_snapshots?: ConversationContextSnapshot[]
+  document_artifact?: DocumentArtifact | null
 }
 
+export interface ConversationStarResponse {
+  message: string
+  is_starred: number
+  starred_at?: string | null
+}
+
+// 会话上下文相关类型与后端压缩/证据账本保持同构，聊天页、调试窗口和历史恢复都会读取。
 export interface ConversationEvidenceLedgerEntry {
   entry_id: string
   origin_kind: 'tool_result' | 'assistant_summary' | 'llm_inferred'
@@ -254,6 +329,15 @@ export interface ConversationEvidenceLedgerEntry {
   retrieval_scope?: Record<string, unknown>
 }
 
+export interface ConversationDecisionState {
+  status?: 'active' | 'ready' | 'blocked' | 'waiting'
+  evidence_status?: 'insufficient' | 'sufficient'
+  next_action?: string
+  blocked_reason?: string
+  allowed_actions: string[]
+  repo_edit_allowed?: boolean
+}
+
 export interface ConversationContextState {
   version: string
   active_topic?: string
@@ -262,6 +346,7 @@ export interface ConversationContextState {
   open_questions: string[]
   resolved_facts: string[]
   evidence_ledger: ConversationEvidenceLedgerEntry[]
+  decision_state?: ConversationDecisionState
   last_reasoning_summary?: string
   last_user_message?: string
   turn_count: number
@@ -310,6 +395,7 @@ export interface ChatRagOverrides {
   use_contextual_compression?: boolean
 }
 
+// 聊天运行记录是新的流式执行入口：先创建 run，再单独订阅事件流，便于恢复/取消。
 export interface ChatRunResponse {
   run_id: string
   user_id?: number
@@ -367,6 +453,7 @@ export interface ConversationToolLedgerEntry {
   created_at?: string
 }
 
+// 工具账本和条目流都是后端持久化的执行轨迹；前者偏审计，后者偏 UI 渲染。
 export interface ConversationToolLedger {
   version: string
   updated_at?: string
@@ -417,8 +504,26 @@ export interface ConversationItemStreamEntry {
   output_tokens_estimate?: number
   truncated?: boolean
   parallel_group?: string
-  metadata?: Record<string, unknown>
+  metadata?: ConversationItemStreamEntryMetadata
   created_at?: string
+}
+
+export interface ToolWorkflowSummary {
+  version: string
+  headline?: string
+  status?: string
+  highlights?: string[]
+  next_action?: string
+  evidence_refs?: string[]
+  decision_state?: ConversationDecisionState
+  tool_names?: string[]
+  success_count?: number
+  failure_count?: number
+  permission_count?: number
+}
+
+export interface ConversationItemStreamEntryMetadata extends Record<string, unknown> {
+  workflow_summary?: ToolWorkflowSummary
 }
 
 export interface ConversationItemStream {
@@ -510,6 +615,59 @@ export interface ChatContextDebugMessage {
   content: string
 }
 
+export interface ChatContextDebugSkill {
+  name: string
+  description?: string
+  path?: string
+  config_path?: string
+  interface_path?: string
+  score?: number
+  activation_reason?: string
+  display_name?: string
+  short_description?: string
+  default_prompt?: string
+  when_to_use?: string
+  user_invocable?: boolean
+  execution_context?: string
+  agent?: string
+  effort?: string
+  allow_implicit_invocation?: boolean
+  scripts?: string[]
+  stage_names?: string[]
+  stage_policies?: string[]
+  artifact_paths?: string[]
+  continue_policies?: string[]
+  default_continue_policy?: string
+}
+
+export interface ChatSkillLaunchRequest {
+  skill_name: string
+  stage?: string
+  paper_id?: number
+  project_id?: number | null
+  goal?: string | null
+  preferred_draft_id?: string | null
+}
+
+export interface ChatWorkflowAction {
+  label: string
+  message: string
+  skill_launch?: ChatSkillLaunchRequest | null
+}
+
+export interface ChatWorkflowControl {
+  skill_name: string
+  display_name?: string
+  stage: string
+  stage_label?: string
+  stage_status: 'completed' | 'blocked' | 'running'
+  continue_policy?: string
+  next_stage?: string
+  next_stage_label?: string
+  suggested_action?: string
+  action?: ChatWorkflowAction | null
+}
+
 export interface ChatModelRequestMessageRaw extends Record<string, unknown> {
   role?: string
   content?: unknown
@@ -548,6 +706,9 @@ export interface ChatContextDebug {
   carry_over_previous_goal?: boolean
   selected_tools: string[]
   tool_choice: string
+  available_skills?: ChatContextDebugSkill[]
+  active_skills?: ChatContextDebugSkill[]
+  skill_prompt_tokens_estimate?: number
   conversation_state?: ConversationContextState
   conversation_state_summary?: string
   anchor_summary?: string
@@ -581,6 +742,7 @@ export interface ChatContextDebug {
   model_tool_schemas_raw?: Record<string, unknown>[]
 }
 
+// 消息 metadata 中的引用索引服务于前端引用解释，不参与模型上下文本身。
 export interface ReasoningSummary {
   summary: string
 }
@@ -609,6 +771,10 @@ export interface MessageMetadata extends Record<string, unknown> {
   rag_metrics?: RagMetrics
   reasoning_summary?: ReasoningSummary
   citation_index?: Record<string, MessageCitationSourceItem>
+  workflow_control?: ChatWorkflowControl
+  document_artifact_selection?: {
+    block_ids: string[]
+  }
 }
 
 export interface Message {
@@ -770,11 +936,11 @@ export interface SearchResult {
   score: number
   chunk_index: number
   metadata: Record<string, unknown>
-  // [Fix 12] Hierarchical retrieval fields
-  chunk_level?: string // paragraph / section / document
-  section_type?: string // abstract / methodology / results ...
+  // 分层检索字段由后端补充，用于展示父级章节和段落层级。
+  chunk_level?: string // 段落 / 章节 / 文档
+  section_type?: string // 摘要 / 方法 / 结果等
   section_title?: string
-  parent_context?: string // parent chunk preview
+  parent_context?: string // 父级 chunk 预览
 }
 
 export interface SearchResponse {
@@ -822,6 +988,8 @@ async function streamJsonSse<TEvent extends string = string>(
   onEvent?: SseEventHandler<TEvent>,
   abortController?: AbortController,
 ): Promise<void> {
+  // 通用 SSE 订阅工具用于知识库/文献状态流；网络瞬断时做轻量重连，
+  // 非重试型业务错误仍向上抛出。
   const sleep = async (ms: number): Promise<void> => {
     if (abortController?.signal.aborted) return
     await new Promise<void>((resolve) => {
@@ -853,7 +1021,7 @@ async function streamJsonSse<TEvent extends string = string>(
           const err = (await response.json()) as { detail?: ApiErrorDetail }
           detail = extractApiErrorMessage(err?.detail, detail)
         } catch {
-          // ignore json parse error for non-json body
+          // 非 JSON 错误体保留默认错误文案。
         }
         const retryableStatus = response.status >= 500
         if (!retryableStatus) {
@@ -892,7 +1060,7 @@ async function streamJsonSse<TEvent extends string = string>(
             if (!event) continue
             onEvent?.(event as TEvent, parsed?.data)
           } catch {
-            // ignore malformed chunk
+            // 忽略异常流片段，等待后续心跳或业务事件修正 UI 状态。
           }
         }
       }
@@ -1010,6 +1178,8 @@ export const userApi = {
   },
 }
 
+// 聊天 API 同时保留旧 sendMessageStream 和新 run/stream 两套入口；
+// 新页面优先使用 run 模式，便于停止、恢复和读取持久化执行轨迹。
 export const chatApi = {
   getConversations: async (
     skip = 0,
@@ -1032,6 +1202,67 @@ export const chatApi = {
     return response.data
   },
 
+  generateDocumentArtifactSchema: async (
+    conversationId: number,
+    data: DocumentArtifactSchemaGenerateRequest,
+  ): Promise<DocumentArtifact> => {
+    const response = await api.post(
+      `/api/v1/chat/conversations/${conversationId}/document-artifact/schema`,
+      data,
+      { timeout: 120000 },
+    )
+    return response.data
+  },
+
+  createDocumentArtifact: async (
+    conversationId: number,
+    data: DocumentArtifactCreateRequest,
+  ): Promise<DocumentArtifact> => {
+    const response = await api.post(
+      `/api/v1/chat/conversations/${conversationId}/document-artifact`,
+      data,
+    )
+    return response.data
+  },
+
+  getDocumentArtifact: async (conversationId: number): Promise<DocumentArtifact> => {
+    const response = await api.get(`/api/v1/chat/conversations/${conversationId}/document-artifact`)
+    return response.data
+  },
+
+  updateDocumentArtifactBlock: async (
+    conversationId: number,
+    blockId: string,
+    data: DocumentArtifactBlockUpdateRequest,
+  ): Promise<DocumentArtifact> => {
+    const response = await api.patch(
+      `/api/v1/chat/conversations/${conversationId}/document-artifact/blocks/${encodeURIComponent(blockId)}`,
+      data,
+    )
+    return response.data
+  },
+
+  rewriteDocumentArtifactBlockSpan: async (
+    conversationId: number,
+    blockId: string,
+    data: DocumentArtifactSpanRewriteRequest,
+  ): Promise<DocumentArtifactSpanRewriteResponse> => {
+    const response = await api.post(
+      `/api/v1/chat/conversations/${conversationId}/document-artifact/blocks/${encodeURIComponent(blockId)}/rewrite-span`,
+      data,
+      { timeout: 120000 },
+    )
+    return response.data
+  },
+
+  branchConversation: async (conversationId: number, title?: string): Promise<Conversation> => {
+    const response = await api.post(
+      `/api/v1/chat/conversations/${conversationId}/branch`,
+      title ? { title } : {},
+    )
+    return response.data
+  },
+
   previewContext: async (
     message: string,
     conversationId?: number,
@@ -1039,6 +1270,8 @@ export const chatApi = {
     chatPreferenceOverrides?: Partial<ChatUserPreferences>,
     ragOverrides?: ChatRagOverrides | null,
   ): Promise<ChatContextPreviewResponse> => {
+    // 完整上下文预演会组装模型请求、工具 schema、偏好和临时 RAG 设置，
+    // 因此给它独立的较长超时。
     const response = await api.post(
       '/api/v1/chat/context-preview',
       {
@@ -1064,6 +1297,16 @@ export const chatApi = {
     await api.delete(`/api/v1/chat/conversations/${conversationId}`)
   },
 
+  updateConversationStar: async (
+    conversationId: number,
+    isStarred: boolean,
+  ): Promise<ConversationStarResponse> => {
+    const response = await api.put(`/api/v1/chat/conversations/${conversationId}/star`, {
+      is_starred: isStarred,
+    })
+    return response.data
+  },
+
   getMessages: async (
     conversationId: number,
     skip = 0,
@@ -1082,7 +1325,10 @@ export const chatApi = {
     sendPlanId?: string,
     chatPreferenceOverrides?: Partial<ChatUserPreferences>,
     ragOverrides?: ChatRagOverrides | null,
+    skillLaunch?: ChatSkillLaunchRequest | null,
+    documentArtifactBlockIds?: string[],
   ): Promise<ChatRunResponse> => {
+    // 创建 run 时只提交本轮输入和覆盖项；实际 token/工具事件通过 streamChatRun 返回。
     const response = await api.post('/api/v1/chat/runs', {
       message,
       conversation_id: conversationId,
@@ -1092,6 +1338,8 @@ export const chatApi = {
         ? { chat_preference_overrides: chatPreferenceOverrides }
         : {}),
       ...(ragOverrides && ragOverrides.enabled ? { rag_overrides: ragOverrides } : {}),
+      ...(skillLaunch ? { skill_launch: skillLaunch } : {}),
+      ...(documentArtifactBlockIds?.length ? { document_artifact_block_ids: documentArtifactBlockIds } : {}),
     })
     return response.data
   },
@@ -1102,6 +1350,7 @@ export const chatApi = {
     abortController?: AbortController,
   ): Promise<void> => {
     try {
+      // 运行记录事件流使用 fetch，而不是 axios，这样可以逐块读取 SSE。
       const response = await fetch(`${API_BASE_URL}/api/v1/chat/runs/${encodeURIComponent(runId)}/stream`, {
         method: 'GET',
         headers: {
@@ -1130,6 +1379,18 @@ export const chatApi = {
     return response.data
   },
 
+  getActiveConversationRun: async (conversationId: number): Promise<ChatRunResponse | null> => {
+    try {
+      const response = await api.get(`/api/v1/chat/conversations/${conversationId}/active-run`)
+      return response.data || null
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        return null
+      }
+      throw error
+    }
+  },
+
   sendMessageStream: async (
     message: string,
     conversationId?: number,
@@ -1138,8 +1399,11 @@ export const chatApi = {
     sendPlanId?: string,
     chatPreferenceOverrides?: Partial<ChatUserPreferences>,
     ragOverrides?: ChatRagOverrides | null,
+    skillLaunch?: ChatSkillLaunchRequest | null,
+    documentArtifactBlockIds?: string[],
   ): Promise<void> => {
     try {
+      // 兼容旧聊天入口：直接发送并订阅响应流，新 run 模式稳定后仍可作为回退。
       const response = await fetch(`${API_BASE_URL}/api/v1/chat/send`, {
         method: 'POST',
         headers: {
@@ -1155,6 +1419,8 @@ export const chatApi = {
             ? { chat_preference_overrides: chatPreferenceOverrides }
             : {}),
           ...(ragOverrides && ragOverrides.enabled ? { rag_overrides: ragOverrides } : {}),
+          ...(skillLaunch ? { skill_launch: skillLaunch } : {}),
+          ...(documentArtifactBlockIds?.length ? { document_artifact_block_ids: documentArtifactBlockIds } : {}),
         }),
         signal: abortController?.signal,
       })
@@ -1266,6 +1532,7 @@ export const knowledgeApi = {
     file: File,
     options: DocumentUploadOptions = {},
   ): Promise<Document> => {
+    // 上传文档时把摄取模式和抽取配置一起放入 multipart，后端据此选择本地/在线解析链路。
     const formData = new FormData()
     formData.append('file', file)
     if (options.ingestMode) {
@@ -1319,6 +1586,7 @@ export const knowledgeApi = {
     onEvent?: (event: 'connected' | 'heartbeat' | 'document_status', data: any) => void,
     abortController?: AbortController,
   ): Promise<void> => {
+    // 文档摄取状态走 SSE；页面可订阅单个知识库，也可订阅全局状态变化。
     const query = new URLSearchParams()
     if (params?.kb_id && params.kb_id > 0) {
       query.set('kb_id', String(params.kb_id))
@@ -1345,6 +1613,7 @@ export const knowledgeApi = {
     includeParentContext = false,
     options: KnowledgeSearchOptions = {},
   ): Promise<SearchResponse> => {
+    // 搜索选项直接映射后端 RAG 流水线开关，调用方可以按场景覆盖重排、混合检索和压缩。
     const {
       useReranker = true,
       useHybrid = true,
@@ -1358,6 +1627,7 @@ export const knowledgeApi = {
       timeoutMs = 300000,
       signal,
     } = options
+    // 相邻 chunk 窗口限制在小范围内，避免一次检索把上下文膨胀到不可控。
     const normalizedAdjacentWindow = Math.max(1, Math.min(3, adjacentWindow))
 
     const response = await api.post('/api/v1/knowledge/search', {
@@ -1427,6 +1697,64 @@ export interface Paper {
   collection_ids: number[]
 }
 
+export interface ResearchProjectPaperSummary {
+  id: number
+  title: string
+  year?: number
+  venue?: string
+  arxiv_id?: string
+  role: string
+  notes?: string
+}
+
+export interface ResearchProjectWorkspaceSummary {
+  id: number
+  paper_id?: number
+  paper_title?: string
+  notebook_id?: string
+  title: string
+  status: string
+  role: string
+  run_count: number
+  latest_run_status?: string
+  latest_run_at?: string
+}
+
+export interface ResearchProject {
+  id: number
+  user_id: number
+  primary_paper_id?: number
+  primary_workspace_id?: number
+  title: string
+  goal?: string
+  status: 'draft' | 'active' | 'archived' | string
+  summary: Record<string, unknown>
+  paper_count: number
+  workspace_count: number
+  primary_paper?: ResearchProjectPaperSummary
+  primary_workspace?: ResearchProjectWorkspaceSummary
+  papers: ResearchProjectPaperSummary[]
+  workspaces: ResearchProjectWorkspaceSummary[]
+  project_root?: string
+  project_root_exists?: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface ResearchProjectFolderTree {
+  project_id: number
+  project_root: string
+  exists: boolean
+  tree: string
+}
+
+export interface ResearchProjectCreateRequest {
+  title?: string
+  goal?: string
+  status?: 'draft' | 'active' | 'archived'
+  paper_ids?: number[]
+}
+
 export interface PaperSearchResult {
   source: string
   external_id: string
@@ -1450,6 +1778,7 @@ export interface PaperSearchResponse {
   total: number
   offset: number
   has_more: boolean
+  next_token?: string | null
   papers: PaperSearchResult[]
   query: string
   source: string
@@ -2894,7 +3223,7 @@ export interface CollectionKnowledgeReadinessItem {
 
 export interface CollectionKnowledgeReadiness {
   collection_id: number
-  knowledge_base_id: number
+  knowledge_base_id?: number
   total_papers: number
   completed_papers: number
   running_papers: number
@@ -2911,7 +3240,7 @@ export interface LiteratureAskRequest {
   scope: LiteratureAskScope
   paper_id?: number
   collection_id?: number
-  knowledge_base_id: number
+  knowledge_base_id?: number
   mode?: 'agentic' | 'classic'
   question: string
   session_id?: number
@@ -2919,6 +3248,7 @@ export interface LiteratureAskRequest {
 
 export interface LiteratureAskSource {
   idx?: number
+  knowledge_base_id?: number
   document_id: number
   document_name: string
   page?: number
@@ -3010,10 +3340,13 @@ export const literatureApi = {
     source?: string
     limit?: number
     offset?: number
+    page_token?: string
     year_start?: number
     year_end?: number
     fields?: string
     open_access?: boolean
+    sort_by?: string
+    sort_order?: string
   }): Promise<PaperSearchResponse> => {
     const response = await api.get('/api/v1/literature/search', { params })
     return response.data
@@ -3180,6 +3513,7 @@ export const literatureApi = {
     ) => void,
     abortController?: AbortController,
   ): Promise<void> => {
+    // 旧版生成式阅读器仍保留独立流式入口，供需要逐步渲染页面结构的界面使用。
     const response = await fetch(`${API_BASE_URL}/api/v1/literature/papers/${paperId}/reader/generative/stream`, {
       method: 'POST',
       headers: {
@@ -3196,7 +3530,7 @@ export const literatureApi = {
         const err = (await response.json()) as { detail?: ApiErrorDetail }
         detail = extractApiErrorMessage(err?.detail, detail)
       } catch {
-        // ignore json parse error for non-json body
+        // 非 JSON 错误体保留默认错误文案。
       }
       throw new Error(detail)
     }
@@ -3226,7 +3560,7 @@ export const literatureApi = {
           if (!event) continue
           onEvent?.(event, parsed.data as ReaderGenerativeStreamEventMap[ReaderGenerativeStreamEvent])
         } catch {
-          // ignore malformed stream chunk
+          // 忽略异常流片段，等待后续事件继续驱动渲染。
         }
       }
     }
@@ -3249,6 +3583,7 @@ export const literatureApi = {
     ) => void,
     abortController?: AbortController,
   ): Promise<void> => {
+    // 组合阅读器流式返回结构化组件计划，事件类型由 ReaderComposeStreamEventMap 约束。
     const response = await fetch(`${API_BASE_URL}/api/v1/literature/papers/${paperId}/reader/composed/stream`, {
       method: 'POST',
       headers: {
@@ -3265,7 +3600,7 @@ export const literatureApi = {
         const err = (await response.json()) as { detail?: ApiErrorDetail }
         detail = extractApiErrorMessage(err?.detail, detail)
       } catch {
-        // ignore json parse error for non-json body
+        // 非 JSON 错误体保留默认错误文案。
       }
       throw new Error(detail)
     }
@@ -3295,7 +3630,7 @@ export const literatureApi = {
           if (!event) continue
           onEvent?.(event, parsed.data as ReaderComposeStreamEventMap[ReaderComposeStreamEvent])
         } catch {
-          // ignore malformed stream chunk
+          // 忽略异常流片段，避免单个坏包中断整个阅读器构建。
         }
       }
     }
@@ -3342,6 +3677,7 @@ export const literatureApi = {
     payload: ReaderExperiencePlanRequest,
   ): Promise<ReaderExperiencePlanResponse> => {
     const requestKey = JSON.stringify(['experience_plan_cached', paperId, payload])
+    // 缓存读取可能被多个 tab/panel 同时触发；同 key 请求在前端层面合并。
     return reuseInflightRequest(inflightCachedExperienceRequests, requestKey, async () => {
       const response = await api.post(
         `/api/v1/literature/papers/${paperId}/experience/plan/cached`,
@@ -3357,6 +3693,7 @@ export const literatureApi = {
     payload: ReaderExperienceV2Request,
   ): Promise<ReaderExperienceV2Response> => {
     const requestKey = JSON.stringify(['experience_v2_cached', paperId, payload])
+    // 第二版阅读体验构建更重，复用进行中的缓存请求可以减少后端排队压力。
     return reuseInflightRequest(inflightCachedExperienceV2Requests, requestKey, async () => {
       const response = await api.post(
         `/api/v1/literature/papers/${paperId}/experience-v2/cached`,
@@ -3509,6 +3846,7 @@ export const literatureApi = {
     ) => void,
     abortController?: AbortController,
   ): Promise<void> => {
+    // 内联问答绑定具体阅读节点，使用独立事件类型，避免和整页 composed 流混淆。
     const response = await fetch(`${API_BASE_URL}/api/v1/literature/papers/${paperId}/reader/composed/inline-query/stream`, {
       method: 'POST',
       headers: {
@@ -3525,7 +3863,7 @@ export const literatureApi = {
         const err = (await response.json()) as { detail?: ApiErrorDetail }
         detail = extractApiErrorMessage(err?.detail, detail)
       } catch {
-        // ignore json parse error for non-json body
+        // 非 JSON 错误体保留默认错误文案。
       }
       throw new Error(detail)
     }
@@ -3555,7 +3893,7 @@ export const literatureApi = {
           if (!event) continue
           onEvent?.(event, parsed.data as ReaderInlineQueryEventMap[ReaderInlineQueryEvent])
         } catch {
-          // ignore malformed stream chunk
+          // 忽略异常流片段，避免局部问答因单个坏包失败。
         }
       }
     }
@@ -3635,10 +3973,10 @@ export const literatureApi = {
 
   getCollectionKnowledgeReadiness: async (
     collectionId: number,
-    knowledgeBaseId: number,
+    knowledgeBaseId?: number,
   ): Promise<CollectionKnowledgeReadiness> => {
     const response = await api.get(`/api/v1/literature/collections/${collectionId}/knowledge-readiness`, {
-      params: { knowledge_base_id: knowledgeBaseId },
+      params: knowledgeBaseId && knowledgeBaseId > 0 ? { knowledge_base_id: knowledgeBaseId } : undefined,
     })
     return response.data
   },
@@ -3648,6 +3986,7 @@ export const literatureApi = {
     onEvent?: (event: 'connected' | 'heartbeat' | 'paper_link_status' | 'reader_page_ready', data: any) => void,
     abortController?: AbortController,
   ): Promise<void> => {
+    // 文献状态流复用通用 SSE 工具，用于论文入库、知识库链接和 reader ready 通知。
     const query = new URLSearchParams()
     if (params?.paper_id && params.paper_id > 0) {
       query.set('paper_id', String(params.paper_id))
@@ -3681,6 +4020,7 @@ export const literatureApi = {
     onEvent?: (event: LiteratureAskEvent['event'], data: any) => void,
     abortController?: AbortController
   ): Promise<void> => {
+    // 文献问答是范围化流式接口，scope 可指向单篇论文、合集或知识库。
     const response = await fetch(`${API_BASE_URL}/api/v1/literature/ask`, {
       method: 'POST',
       headers: {
@@ -3697,7 +4037,7 @@ export const literatureApi = {
         const err = (await response.json()) as { detail?: ApiErrorDetail }
         detail = extractApiErrorMessage(err?.detail, detail)
       } catch {
-        // ignore json parse error for non-json body
+        // 非 JSON 错误体保留默认错误文案。
       }
       throw new Error(detail)
     }
@@ -3724,7 +4064,7 @@ export const literatureApi = {
           const parsed = JSON.parse(line.slice(6)) as LiteratureAskEvent
           onEvent?.(parsed.event, parsed.data)
         } catch {
-          // ignore malformed chunk
+          // 忽略异常流片段，后续 token/完成事件会继续推进 UI。
         }
       }
     }
@@ -3736,6 +4076,7 @@ export const literatureApi = {
     onEvent?: (event: ReaderExperienceBlockExplainEvent['event'], data: any) => void,
     abortController?: AbortController,
   ): Promise<void> => {
+    // 块解释针对第二版阅读体验里的单个块做解释，仍然采用 SSE 以便展示增量回答。
     const response = await fetch(`${API_BASE_URL}/api/v1/literature/papers/${paperId}/experience-v2/block-explain/stream`, {
       method: 'POST',
       headers: {
@@ -3752,7 +4093,7 @@ export const literatureApi = {
         const err = (await response.json()) as { detail?: ApiErrorDetail }
         detail = extractApiErrorMessage(err?.detail, detail)
       } catch {
-        // ignore json parse error for non-json body
+        // 非 JSON 错误体保留默认错误文案。
       }
       throw new Error(detail)
     }
@@ -3779,10 +4120,283 @@ export const literatureApi = {
           const parsed = JSON.parse(line.slice(6)) as ReaderExperienceBlockExplainEvent
           onEvent?.(parsed.event, parsed.data)
         } catch {
-          // ignore malformed chunk
+          // 忽略异常流片段，避免解释面板被单个坏包打断。
         }
       }
     }
+  },
+}
+
+export const projectApi = {
+  listProjects: async (params?: { paper_id?: number }): Promise<ResearchProject[]> => {
+    const response = await api.get('/api/v1/projects', { params })
+    return response.data
+  },
+
+  getProject: async (projectId: number): Promise<ResearchProject> => {
+    const response = await api.get(`/api/v1/projects/${projectId}`)
+    return response.data
+  },
+
+  getProjectFolderTree: async (projectId: number): Promise<ResearchProjectFolderTree> => {
+    const response = await api.get(`/api/v1/projects/${projectId}/folder-tree`)
+    return response.data
+  },
+
+  createProject: async (data: ResearchProjectCreateRequest): Promise<ResearchProject> => {
+    const response = await api.post('/api/v1/projects', data)
+    return response.data
+  },
+
+  deleteProject: async (projectId: number): Promise<Record<string, unknown>> => {
+    const response = await api.delete(`/api/v1/projects/${projectId}`)
+    return response.data
+  },
+}
+
+export interface LiteratureReviewWorkspaceFile {
+  name: string
+  relative_path: string
+  group: 'root' | 'pdf' | 'md' | 'review' | 'searches' | 'other'
+  suffix: string
+  size: number
+  modified_at: string
+  media_type: string
+  previewable: boolean
+  download_path: string
+}
+
+export interface LiteratureReviewWorkspaceCounts {
+  pdf: number
+  md: number
+  json: number
+  review: number
+}
+
+export interface LiteratureReviewWorkspace {
+  literature_review_id: string
+  topic: string
+  notes: string
+  target_paper_count: number
+  user_id?: number | null
+  created_at: string
+  updated_at: string
+  modified_at: string
+  root_path: string
+  status: string
+  paper_count: number
+  counts: LiteratureReviewWorkspaceCounts
+  files: LiteratureReviewWorkspaceFile[]
+  has_final: boolean
+  manifest?: Record<string, unknown>
+}
+
+export interface LiteratureReviewWorkspaceOverview {
+  reviews_root: string
+  workspaces: LiteratureReviewWorkspace[]
+}
+
+export interface LiteratureReviewFileContent {
+  name: string
+  relative_path: string
+  suffix: string
+  size: number
+  modified_at: string
+  media_type: string
+  content: string
+  truncated: boolean
+}
+
+export const literatureReviewWorkspaceApi = {
+  getOverview: async (): Promise<LiteratureReviewWorkspaceOverview> => {
+    const response = await api.get('/api/v1/literature-reviews/overview')
+    return response.data
+  },
+
+  getWorkspace: async (reviewId: string): Promise<LiteratureReviewWorkspace> => {
+    const response = await api.get(`/api/v1/literature-reviews/${encodeURIComponent(reviewId)}`)
+    return response.data
+  },
+
+  getFileContent: async (reviewId: string, relativePath: string): Promise<LiteratureReviewFileContent> => {
+    const response = await api.get(`/api/v1/literature-reviews/${encodeURIComponent(reviewId)}/files/content`, {
+      params: { relative_path: relativePath },
+    })
+    return response.data
+  },
+
+  downloadFile: async (reviewId: string, relativePath: string): Promise<Blob> => {
+    const response = await api.get(`/api/v1/literature-reviews/${encodeURIComponent(reviewId)}/files/download`, {
+      params: { relative_path: relativePath },
+      responseType: 'blob',
+    })
+    return response.data
+  },
+}
+
+export interface DocxManagedFile {
+  name: string
+  stored_name?: string
+  original_filename?: string
+  relative_path: string
+  path: string
+  size: number
+  modified_at: string
+  media_type: string
+  download_path: string
+  file_role: 'sample_template' | 'writing_guide' | 'reference'
+  file_role_label: string
+}
+
+export interface DocxTemplate {
+  template_id: string
+  name: string
+  description: string
+  created_at: string
+  updated_at: string
+  created_by?: number
+  root_path: string
+  files_path: string
+  md_constraints: string
+  docx_constraints: string
+  files: DocxManagedFile[]
+}
+
+export interface DocxWorkspace {
+  docx_id: string
+  template_id?: string
+  template_name?: string
+  artifact_id?: string
+  conversation_id?: number | null
+  user_id?: number | null
+  path: string
+  workspace_path?: string
+  source_path?: string
+  requirements_path?: string
+  output_basename?: string
+  docx_path?: string
+  pdf_path?: string
+  status?: string
+  validation_status?: string
+  session_id?: string
+  error?: string
+  modified_at: string
+  files: DocxManagedFile[]
+}
+
+export interface DocxDocumentArtifactSummary {
+  artifact_id: string
+  template_id?: string
+  title: string
+  conversation_id?: number | string | null
+  path: string
+  relative_path: string
+  download_path?: string
+  block_count: number
+  filled_block_count: number
+  updated_at?: string
+  modified_at: string
+  size: number
+}
+
+export interface DocxTemplateOverview {
+  docx_root: string
+  templates_root: string
+  artifacts_root?: string
+  default_docx_style_prompt: string
+  templates: DocxTemplate[]
+  workspaces: DocxWorkspace[]
+  document_artifacts?: DocxDocumentArtifactSummary[]
+}
+
+export interface DocxTemplateSaveRequest {
+  template_id?: string
+  name: string
+  description?: string
+  md_constraints?: string
+  docx_constraints?: string
+}
+
+export interface DocxTemplateAnalyzeResponse {
+  template_id: string
+  md_constraints: string
+  docx_constraints: string
+  notes: string
+  raw_model_output: string
+  analysis: Record<string, unknown>
+  artifacts: Record<string, string>
+}
+
+export const docxTemplateApi = {
+  getOverview: async (): Promise<DocxTemplateOverview> => {
+    const response = await api.get('/api/v1/docx/templates/overview')
+    return response.data
+  },
+
+  saveTemplate: async (data: DocxTemplateSaveRequest): Promise<DocxTemplate> => {
+    const response = await api.post('/api/v1/docx/templates', data)
+    return response.data
+  },
+
+  updateDefaultDocxStylePrompt: async (prompt: string): Promise<{ default_docx_style_prompt: string }> => {
+    const response = await api.put('/api/v1/docx/templates/default-docx-style-prompt', { prompt })
+    return response.data
+  },
+
+  uploadTemplateFile: async (
+    templateId: string,
+    file: File,
+    fileRole: DocxManagedFile['file_role'] = 'reference',
+  ): Promise<DocxManagedFile> => {
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('file_role', fileRole)
+    const response = await api.post(`/api/v1/docx/templates/${encodeURIComponent(templateId)}/files`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    return response.data
+  },
+
+  updateTemplateFileRole: async (
+    templateId: string,
+    fileName: string,
+    fileRole: DocxManagedFile['file_role'],
+  ): Promise<DocxManagedFile> => {
+    const response = await api.put(
+      `/api/v1/docx/templates/${encodeURIComponent(templateId)}/files/${encodeURIComponent(fileName)}/role`,
+      { file_role: fileRole },
+    )
+    return response.data
+  },
+
+  deleteTemplateFile: async (
+    templateId: string,
+    fileName: string,
+  ): Promise<{ template_id: string; file_name: string; deleted: boolean }> => {
+    const response = await api.delete(
+      `/api/v1/docx/templates/${encodeURIComponent(templateId)}/files/${encodeURIComponent(fileName)}`,
+    )
+    return response.data
+  },
+
+  analyzeTemplate: async (
+    templateId: string,
+    userNotes = '',
+  ): Promise<DocxTemplateAnalyzeResponse> => {
+    const response = await api.post(
+      `/api/v1/docx/templates/${encodeURIComponent(templateId)}/analyze`,
+      { user_notes: userNotes },
+      { timeout: 120000 },
+    )
+    return response.data
+  },
+
+  downloadFile: async (relativePath: string): Promise<Blob> => {
+    const response = await api.get('/api/v1/docx/templates/files/download', {
+      params: { relative_path: relativePath },
+      responseType: 'blob',
+    })
+    return response.data
   },
 }
 
@@ -3894,6 +4508,7 @@ export const codelabApi = {
   },
 
   executeCell: async (notebookId: string, data: ExecuteRequest): Promise<ExecuteResponse> => {
+    // 单元格执行可能运行用户实验代码，超时由后端沙箱/后台执行策略控制。
     const response = await api.post(`/api/v1/codelab/notebooks/${notebookId}/execute`, data, {
       timeout: 0,
     })
@@ -3901,6 +4516,7 @@ export const codelabApi = {
   },
 
   executeCode: async (data: ExecuteRequest): Promise<ExecuteResponse> => {
+    // 临时代码执行同样不设置浏览器侧超时，避免长任务被前端提前切断。
     const response = await api.post('/api/v1/codelab/execute', data, {
       timeout: 0,
     })
@@ -4101,7 +4717,7 @@ export interface AgentChatRequest {
 }
 
 export interface AgentChatEvent {
-  type: 'content' | 'done' | 'error' | 'thought' | 'action' | 'observation' | 'answer' | 'start' | 'authorization_required'
+  type: 'content' | 'done' | 'error' | 'thought' | 'action' | 'observation' | 'artifact_updated' | 'answer' | 'start' | 'authorization_required'
   content?: string
   code_blocks?: AgentCodeBlock[]
   react_steps?: ReactStep[]
@@ -4115,19 +4731,17 @@ export interface AgentChatEvent {
   output?: string
   error_contract?: ApiErrorContract
   iteration?: number
-  action?: string // action requiring approval
+  action?: string // 需要用户确认的操作
   provider?: string
   model?: string
-  notebook_updated?: boolean // whether notebook content changed
-  cell_id?: string // new cell id
-  new_cell?: Cell // created cell payload
-  updated_cell?: Cell // updated cell payload
+  notebook_updated?: boolean // 笔记本内容是否变更
+  cell_id?: string // 新单元格 ID
+  new_cell?: Cell // 新建单元格内容
+  updated_cell?: Cell // 更新后的单元格内容
 }
 
-// ========== Notebook Agent API ==========
-
+// 笔记本 Agent 接口：围绕单个 notebook 提供上下文、历史、流式聊天和同步回退。
 export const agentApi = {
-  // Get notebook context
   getContext: async (notebookId: string): Promise<AgentContextResponse> => {
     const response = await api.get(`/api/v1/codelab/notebooks/${notebookId}/agent/context`)
     return response.data
@@ -4154,6 +4768,7 @@ export const agentApi = {
     onEvent: (event: AgentChatEvent) => void,
     abortController?: AbortController
   ): Promise<void> => {
+    // 笔记本 agent 的流式协议直接返回 AgentChatEvent，而不是通用 event/data 包装。
     const response = await fetch(
       `${API_BASE_URL}/api/v1/codelab/notebooks/${notebookId}/agent/chat`,
       {
@@ -4216,6 +4831,7 @@ export const agentApi = {
     suggested_code?: string
     suggested_action?: string
   }> => {
+    // 同步模式用于不需要增量事件的简单场景；请求体强制 stream=false。
     const response = await api.post(
       `/api/v1/codelab/notebooks/${notebookId}/agent/chat`,
       { ...request, stream: false }
@@ -4255,7 +4871,7 @@ export const agentApi = {
     return response.data
   },
 
-  // Analyze data
+  // 分析数据。
   analyzeData: async (
     notebookId: string,
     variableName: string,
@@ -4897,10 +5513,10 @@ export const shareApi = {
     return response.data
   },
 
-  // Share a resource
+  // 分享单个资源。
   shareResource: async (data: {
     resource_type: string
-    resource_id: number | string // supports numeric id or string id (e.g. notebook UUID)
+    resource_id: number | string // 支持数字 ID 或字符串 ID，例如 notebook UUID
     shared_with_type: 'user' | 'group' | 'all_students'
     shared_with_id?: number
     permission?: string
@@ -4910,10 +5526,10 @@ export const shareApi = {
     return response.data
   },
 
-  // Batch share
+  // 批量分享资源。
   batchShare: async (data: {
     resource_type: string
-    resource_ids: (number | string)[] // supports numeric id or string id
+    resource_ids: (number | string)[] // 支持数字 ID 或字符串 ID
     shared_with_type: 'user' | 'group' | 'all_students'
     shared_with_id?: number
     permission?: string
@@ -5134,7 +5750,7 @@ export const mentorshipApi = {
     return studentApi.getReceivedInvitations()
   },
 
-  // Compatibility methods used by Team/Mentorship stores
+  // 团队和导师关系 store 使用的兼容方法。
   getMentors: async (query: string = ''): Promise<UserBrief[]> => {
     const mentors = await studentApi.searchMentors(query)
     return mentors

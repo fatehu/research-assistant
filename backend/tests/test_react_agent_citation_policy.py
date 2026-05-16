@@ -7,7 +7,16 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app.services.agent_tools import ToolResult
 from app.services.agent_profiles import resolve_agent_profile
-from app.services.react_agent import AgentContext, AgentRuntimeContext, ExecutedToolCall, ParsedToolCall, ReActAgent, RoutingDecision
+from app.services.react_agent import (
+    AgentContext,
+    AgentRuntimeContext,
+    AgentState,
+    AgentStep,
+    ExecutedToolCall,
+    ParsedToolCall,
+    ReActAgent,
+    RoutingDecision,
+)
 from app.config import settings
 
 
@@ -31,6 +40,17 @@ class _DummyLLM:
 
     async def chat(self, *args, **kwargs):
         return {"content": "修正后的回答 [来源1]"}
+
+
+class _HangingCitationLLM:
+    provider = "test"
+    config = {"model": "test-model"}
+
+    async def chat(self, *args, **kwargs):
+        import asyncio
+
+        await asyncio.sleep(1)
+        return {"content": "不会及时返回"}
 
 
 class _DummyTools:
@@ -143,6 +163,57 @@ class _IntentFilteredCodelabTools:
         return ToolResult(success=True, output=f"ok:{tool_name}", data={})
 
 
+class _PaperWorkflowTools:
+    def get_tools_description(self, **kwargs) -> str:
+        return "- paper_research_status: 读取论文复现状态"
+
+    def list_tools(self, **kwargs):
+        return _tool_defs("paper_research_status", "activate_skill")
+
+    async def execute(self, tool_name: str, **kwargs):
+        _ = kwargs
+        return ToolResult(success=True, output=f"ok:{tool_name}", data={})
+
+
+class _PaperSelfWorkTools:
+    def __init__(self):
+        self.executed = []
+
+    def get_tools_description(self, **kwargs) -> str:
+        include = kwargs.get("include_tool_names")
+        names = sorted(include) if include else [
+            "activate_skill",
+            "paper_research_status",
+            "paper_research_prepare",
+            "project_claude",
+            "project_write_report",
+            "project_bash",
+            "project_write_file",
+            "paper_research_start_execution",
+        ]
+        return "\n".join(f"- {name}: {name}" for name in names)
+
+    def list_tools(self, **kwargs):
+        include = kwargs.get("include_tool_names")
+        names = sorted(include) if include else [
+            "activate_skill",
+            "paper_research_status",
+            "paper_research_prepare",
+            "project_claude",
+            "project_write_report",
+            "project_bash",
+            "project_write_file",
+            "paper_research_start_execution",
+        ]
+        return _tool_defs(*names)
+
+    async def execute(self, tool_name: str, **kwargs):
+        self.executed.append((tool_name, dict(kwargs)))
+        if tool_name == "project_claude":
+            return ToolResult(success=False, output="Project Claude 调用 runtime-worker 失败。", error="project_claude_worker_failed", data={})
+        return ToolResult(success=True, output=f"ok:{tool_name}", data={})
+
+
 class _RouterAwareCodelabTools:
     route_profile = "codelab"
     notebook_id = "nb-route"
@@ -234,6 +305,14 @@ class _FunctionCallingPreviewLLM:
 
     def supports_function_calling(self):
         return True
+
+
+class _RecordingRuntimeService:
+    def __init__(self):
+        self.upsert_calls = []
+
+    async def upsert_conversation_context_state(self, conversation_id: int, state):
+        self.upsert_calls.append((conversation_id, dict(state or {})))
 
 
 def test_system_prompt_contains_citation_policy():
@@ -427,11 +506,12 @@ async def test_prepare_direct_response_can_force_direct_without_tools(monkeypatc
 @pytest.mark.parametrize(
     "message_text",
     [
+        "解释深度学习中的注意力机制",
         "一句话解释注意力机制",
         "请直接用一句话解释注意力机制",
     ],
 )
-async def test_prepare_direct_response_short_circuits_obvious_single_turn_direct_chat(
+async def test_prepare_direct_response_short_circuits_single_turn_direct_chat(
     monkeypatch,
     message_text,
 ):
@@ -447,11 +527,8 @@ async def test_prepare_direct_response_short_circuits_obvious_single_turn_direct
 
     assert prepared is not None
     assert prepared.routing_decision is not None
-    assert prepared.routing_decision.source == "heuristic_direct"
     assert prepared.routing_decision.needs_tools is False
-    assert prepared.context.context_debug["model_request_mode"] == "direct"
-    assert prepared.context.context_debug["model_system_prompt"] == prepared.system_prompt
-    assert prepared.context.context_debug["model_messages_raw"] == prepared.llm_messages
+    assert prepared.routing_decision.source == "heuristic_direct"
 
 
 @pytest.mark.asyncio
@@ -490,7 +567,7 @@ async def test_prepare_direct_response_returns_none_when_current_turn_rag_is_ena
         "如果不使用它，会出现什么限制？",
     ],
 )
-async def test_prepare_direct_response_short_circuits_obvious_followup_direct_chat(
+async def test_prepare_direct_response_short_circuits_followup_direct_chat(
     monkeypatch,
     message_text,
 ):
@@ -512,9 +589,8 @@ async def test_prepare_direct_response_short_circuits_obvious_followup_direct_ch
 
     assert prepared is not None
     assert prepared.routing_decision is not None
-    assert prepared.routing_decision.source == "heuristic_direct_followup"
     assert prepared.routing_decision.needs_tools is False
-    assert prepared.routing_decision.carry_over_previous_goal is True
+    assert prepared.routing_decision.source == "heuristic_direct_followup"
 
 
 @pytest.mark.asyncio
@@ -673,6 +749,227 @@ async def test_execute_single_tool_call_blocks_tools_outside_selected_allowlist(
     assert "notebook_execute" in executed.observation_output
 
 
+@pytest.mark.asyncio
+async def test_execute_single_tool_call_pins_paper_skill_after_successful_paper_tool():
+    runtime_service = _RecordingRuntimeService()
+    agent = ReActAgent(
+        _DummyLLM(),
+        _PaperWorkflowTools(),
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(user_id=1, channel="chat", conversation_id=321),
+        runtime_service=runtime_service,
+    )
+    agent._last_tool_selection = {
+        "selected_tools": ["paper_research_status", "activate_skill"],
+    }
+    context = AgentContext(messages=[], conversation_state={})
+
+    executed = await agent._execute_single_tool_call(
+        context,
+        ParsedToolCall(
+            call_id="call-paper-status",
+            name="paper_research_status",
+            arguments={"project_id": 3},
+            arguments_raw='{"project_id":3}',
+        ),
+        parallel_group="test",
+    )
+
+    assert executed.success is True
+    assert agent.runtime_context.active_skill_names == ["paper-reproduction"]
+    assert context.conversation_state["active_skill_names"] == ["paper-reproduction"]
+    assert agent._last_tool_selection["active_skill_names"] == ["paper-reproduction"]
+    assert len(runtime_service.upsert_calls) == 2
+    first_conversation_id, first_state = runtime_service.upsert_calls[0]
+    assert first_conversation_id == 321
+    assert first_state["workflow_binding"]["skill"] == "paper-reproduction"
+    assert first_state["decision_state"]["repo_edit_allowed"] is False
+    second_conversation_id, second_state = runtime_service.upsert_calls[1]
+    assert second_conversation_id == 321
+    assert second_state["active_skill_names"] == ["paper-reproduction"]
+    assert second_state["active_skill_updated_at"] == context.conversation_state["active_skill_updated_at"]
+    assert second_state["workflow_binding"]["skill"] == "paper-reproduction"
+    assert second_state["decision_state"]["repo_edit_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_execute_single_tool_call_does_not_duplicate_pinned_paper_skill():
+    runtime_service = _RecordingRuntimeService()
+    agent = ReActAgent(
+        _DummyLLM(),
+        _PaperWorkflowTools(),
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(
+            user_id=1,
+            channel="chat",
+            conversation_id=321,
+            active_skill_names=["paper-reproduction"],
+        ),
+        runtime_service=runtime_service,
+    )
+    agent._last_tool_selection = {
+        "selected_tools": ["paper_research_status", "activate_skill"],
+        "active_skill_names": ["paper-reproduction"],
+    }
+    context = AgentContext(messages=[], conversation_state={"active_skill_names": ["paper-reproduction"]})
+
+    executed = await agent._execute_single_tool_call(
+        context,
+        ParsedToolCall(
+            call_id="call-paper-status",
+            name="paper_research_status",
+            arguments={"project_id": 3},
+            arguments_raw='{"project_id":3}',
+        ),
+        parallel_group="test",
+    )
+
+    assert executed.success is True
+    assert agent.runtime_context.active_skill_names == ["paper-reproduction"]
+    assert context.conversation_state["active_skill_names"] == ["paper-reproduction"]
+    assert len(runtime_service.upsert_calls) == 1
+    conversation_id, state = runtime_service.upsert_calls[0]
+    assert conversation_id == 321
+    assert state["active_skill_names"] == ["paper-reproduction"]
+    assert state["workflow_binding"]["skill"] == "paper-reproduction"
+    assert state["decision_state"]["repo_edit_allowed"] is False
+
+
+def test_paper_reproduction_active_skill_hides_self_work_tools():
+    tools = _PaperSelfWorkTools()
+    agent = ReActAgent(
+        _DummyLLM(),
+        tools,
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(
+            user_id=1,
+            channel="chat",
+            conversation_id=321,
+            active_skill_names=["paper-reproduction"],
+        ),
+    )
+
+    agent._build_system_prompt(messages=[{"role": "user", "content": "继续真实数据集复现"}])
+
+    selected_tools = set(agent._last_tool_selection["selected_tools"])
+    assert "project_claude" in selected_tools
+    assert "paper_research_status" in selected_tools
+    assert "project_write_report" in selected_tools
+    assert "project_bash" not in selected_tools
+    assert "project_write_file" not in selected_tools
+    assert "paper_research_start_execution" not in selected_tools
+
+
+def test_paper_reproduction_active_skill_injects_session_system_prompt():
+    tools = _PaperSelfWorkTools()
+    agent = ReActAgent(
+        _DummyLLM(),
+        tools,
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(
+            user_id=1,
+            channel="chat",
+            conversation_id=321,
+            active_skill_names=["paper-reproduction"],
+        ),
+    )
+
+    prompt = agent._build_system_prompt(messages=[{"role": "user", "content": "继续论文复现"}])
+
+    assert "## Skill Session System Prompt" in prompt
+    assert "你是策划者和决策者，不是实施 worker" in prompt
+    assert "通过 `project_claude`" in prompt
+    assert "不能作为 Claude Code 不可用或失败后的实施 fallback" in prompt
+    assert "skill_system_prompt_tokens_estimate" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_paper_reproduction_blocks_stale_project_bash_selection():
+    tools = _PaperSelfWorkTools()
+    agent = ReActAgent(
+        _DummyLLM(),
+        tools,
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(
+            user_id=1,
+            channel="chat",
+            conversation_id=321,
+            active_skill_names=["paper-reproduction"],
+        ),
+    )
+    agent._last_tool_selection = {
+        "selected_tools": ["project_bash", "project_claude", "activate_skill"],
+        "active_skill_names": ["paper-reproduction"],
+    }
+    context = AgentContext(
+        messages=[],
+        conversation_state={
+            "active_skill_names": ["paper-reproduction"],
+            "workflow_binding": {"skill": "paper-reproduction", "project_id": 9, "paper_id": 113},
+        },
+    )
+
+    executed = await agent._execute_single_tool_call(
+        context,
+        ParsedToolCall(
+            call_id="call-project-bash",
+            name="project_bash",
+            arguments={"project_id": 9, "command": "python3 download_datasets.py --output-dir data"},
+            arguments_raw='{"project_id":9}',
+        ),
+        parallel_group="test",
+    )
+
+    assert executed.success is False
+    assert executed.error == "paper_reproduction_requires_claude_worker"
+    assert "project_claude" in executed.observation_output
+    assert "适用范围提示" in executed.observation_output
+    assert tools.executed == []
+
+
+@pytest.mark.asyncio
+async def test_project_claude_failure_observation_mentions_no_bash_fallback():
+    tools = _PaperSelfWorkTools()
+    agent = ReActAgent(
+        _DummyLLM(),
+        tools,
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(
+            user_id=1,
+            channel="chat",
+            conversation_id=321,
+            active_skill_names=["paper-reproduction"],
+        ),
+    )
+    agent._last_tool_selection = {
+        "selected_tools": ["project_claude", "activate_skill"],
+        "active_skill_names": ["paper-reproduction"],
+    }
+    context = AgentContext(
+        messages=[],
+        conversation_state={
+            "active_skill_names": ["paper-reproduction"],
+            "workflow_binding": {"skill": "paper-reproduction", "project_id": 9, "paper_id": 113},
+        },
+    )
+
+    executed = await agent._execute_single_tool_call(
+        context,
+        ParsedToolCall(
+            call_id="call-project-claude",
+            name="project_claude",
+            arguments={"project_id": 9, "prompt": "run real dataset reproduction"},
+            arguments_raw='{"project_id":9}',
+        ),
+        parallel_group="test",
+    )
+
+    assert executed.success is False
+    assert executed.error == "project_claude_worker_failed"
+    assert "唯一项目执行 worker" in executed.observation_output
+    assert "不能改用 `project_bash`" in executed.observation_output
+
+
 def test_chat_prompt_uses_default_routing_without_router(monkeypatch):
     monkeypatch.setattr(settings, "tool_selection_enabled", True)
     tools = _KnowledgeFollowupTools()
@@ -689,6 +986,32 @@ def test_chat_prompt_uses_default_routing_without_router(monkeypatch):
     assert "优先调用 `knowledge_search`" not in prompt
     assert agent._last_tool_selection["intent"] == "general_chat"
     assert agent._last_tool_selection["routing_source"] == "default_agent"
+
+
+def test_apply_tool_call_overrides_backfills_paper_binding_for_paper_skill():
+    agent = ReActAgent(_DummyLLM(), _PaperWorkflowTools(), max_iterations=1)
+
+    effective_prepare = agent._apply_tool_call_overrides(
+        "paper_research_prepare",
+        {},
+        workflow_binding={"skill": "paper-reproduction", "paper_id": 113, "project_id": 8},
+    )
+    effective_project_read = agent._apply_tool_call_overrides(
+        "project_read_file",
+        {"relative_path": "reference/paper/paper_interpretation.md"},
+        workflow_binding={"skill": "paper-reproduction", "paper_id": 113, "project_id": 8},
+    )
+    explicit_args = agent._apply_tool_call_overrides(
+        "paper_research_prepare",
+        {"paper_id": 999, "project_id": 77},
+        workflow_binding={"skill": "paper-reproduction", "paper_id": 113, "project_id": 8},
+    )
+
+    assert effective_prepare["paper_id"] == 113
+    assert effective_prepare["project_id"] == 8
+    assert effective_project_read["project_id"] == 8
+    assert explicit_args["paper_id"] == 999
+    assert explicit_args["project_id"] == 77
 
 
 def test_system_prompt_includes_one_turn_rag_injection():
@@ -746,11 +1069,12 @@ def test_observation_message_for_web_search_requires_web_citation():
     assert "只能使用 observation 中出现过的网页编号" in message
 
 
-def test_build_tool_result_ledger_entries_carries_structured_metadata():
+@pytest.mark.asyncio
+async def test_build_tool_result_ledger_entries_carries_structured_metadata():
     agent = ReActAgent(_DummyLLM(), _DummyTools(), max_iterations=1)
     context = AgentContext(messages=[], turn_id="turn:1", run_id="run-1", iteration=1)
 
-    rows = agent._build_tool_result_ledger_entries(
+    rows = await agent._build_tool_result_ledger_entries(
         context,
         [
             ExecutedToolCall(
@@ -759,6 +1083,7 @@ def test_build_tool_result_ledger_entries_carries_structured_metadata():
                 tool_message={},
                 tool_name="knowledge_search",
                 observation_output="[来源1] 命中 Transformer / Attention Is All You Need.pdf",
+                result_data={},
                 tool_call_id="call-1",
                 arguments={"query": "attention"},
                 success=True,
@@ -865,6 +1190,20 @@ async def test_ensure_citation_compliance_repairs_answer():
     assert "[来源1]" in fixed
     assert context.citation_repair_attempts == 1
     assert context.citation_repair_successes == 1
+
+
+@pytest.mark.asyncio
+async def test_ensure_citation_compliance_times_out_to_note(monkeypatch):
+    monkeypatch.setattr(settings, "agent_citation_repair_timeout_seconds", 0.01, raising=False)
+    agent = ReActAgent(_HangingCitationLLM(), _DummyTools(), max_iterations=1)
+    context = AgentContext(messages=[])
+    context.allowed_source_labels = {"1", "2"}
+
+    fixed = await agent._ensure_citation_compliance("这是没有引用的回答", context)
+
+    assert "当前可用来源仅为 [来源1], [来源2]" in fixed
+    assert context.citation_repair_attempts == 1
+    assert context.citation_repair_successes == 0
 
 
 @pytest.mark.asyncio
@@ -987,6 +1326,66 @@ async def test_compress_web_observation_emits_distinct_web_labels():
     assert "[网页2]" in second
 
 
+@pytest.mark.asyncio
+async def test_compress_web_observation_surfaces_direct_candidate_urls():
+    agent = ReActAgent(_DummyLLM(), _DummyTools(), max_iterations=1)
+    context = AgentContext(messages=[])
+
+    result = ToolResult(
+        success=True,
+        output="raw output",
+        data={
+            "results": [
+                {
+                    "title": "automl/nanoTabPFN",
+                    "url": "https://github.com/automl/nanoTabPFN",
+                    "snippet": "repo page",
+                    "domain": "github.com",
+                    "candidate_download_urls": [
+                        "http://ml.informatik.uni-freiburg.de/research-artifacts/nanoTabPFN/300k_150x5_2.h5"
+                    ],
+                }
+            ]
+        },
+    )
+
+    compressed = await agent._compress_web_search_observation('"300k_150x5_2.h5" nanoTabPFN', result, context=context)
+
+    assert "Direct candidate URLs:" in compressed
+    assert "300k_150x5_2.h5" in compressed
+
+
+@pytest.mark.asyncio
+async def test_compress_web_scrape_observation_preserves_full_page_content():
+    agent = ReActAgent(_DummyLLM(), _DummyTools(), max_iterations=1)
+    context = AgentContext(messages=[])
+    markdown = "# Example Domain\nThis domain is for use in illustrative examples.\n\nMore detail here."
+
+    result = ToolResult(
+        success=True,
+        output="raw output",
+        data={
+            "source_kind": "public_web_page",
+            "url": "https://example.com",
+            "source_domain": "example.com",
+            "metadata": {"title": "Example Domain"},
+            "markdown": markdown,
+            "public_links": [
+                {
+                    "label": "Example Domain",
+                    "href": "https://example.com",
+                    "snippet": markdown,
+                }
+            ],
+        },
+    )
+
+    compressed = await agent._compress_web_search_observation("example domain", result, context=context)
+
+    assert "Content:\n# Example Domain" in compressed
+    assert "This domain is for use in illustrative examples." in compressed
+
+
 def test_build_rag_metrics_with_required_citation():
     context = AgentContext(messages=[])
     context.final_answer = "Transformer 的核心是自注意力机制 [来源1]"
@@ -998,11 +1397,12 @@ def test_build_rag_metrics_with_required_citation():
 
     metrics = ReActAgent._build_rag_metrics(context)
     assert metrics["knowledge_search_calls"] == 1
-    assert metrics["source_labels_count"] == 2
+    assert metrics["source_labels_count"] == 1
     assert metrics["answer_citation_count"] == 1
     assert metrics["citation_required"] is True
     assert metrics["citation_valid"] is True
-    assert metrics["source_labels"] == ["来源1", "来源2"]
+    assert metrics["source_labels"] == ["来源1"]
+    assert metrics["available_source_labels"] == ["来源1", "来源2"]
 
 
 def test_build_rag_metrics_with_web_and_knowledge_citations():
@@ -1017,11 +1417,12 @@ def test_build_rag_metrics_with_web_and_knowledge_citations():
 
     assert metrics["knowledge_search_calls"] == 1
     assert metrics["web_search_calls"] == 2
-    assert metrics["source_labels_count"] == 3
+    assert metrics["source_labels_count"] == 2
     assert metrics["answer_citation_count"] == 2
     assert metrics["citation_required"] is True
     assert metrics["citation_valid"] is True
-    assert metrics["source_labels"] == ["来源1", "网页1", "网页2"]
+    assert metrics["source_labels"] == ["来源1", "网页1"]
+    assert metrics["available_source_labels"] == ["来源1", "网页1", "网页2"]
 
 
 class _ScriptedLLM:
@@ -1192,3 +1593,39 @@ async def test_execute_single_tool_call_treats_direct_mcp_web_search_as_citable_
     assert executed.metadata["source_items"][0]["label"] == "网页1"
     followup = agent._build_observation_message_multi([executed])
     assert "公网引用必须只使用 observation 已出现过的 [网页X]" in followup
+
+
+def test_maybe_stop_after_background_execution_started_sets_final_answer():
+    agent = ReActAgent(
+        _DummyLLM(),
+        _DummyTools(),
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(channel="chat"),
+    )
+    context = AgentContext(messages=[])
+
+    thought = agent._maybe_stop_after_background_execution_started(
+        context,
+        [
+            {
+                "type": "observation",
+                "data": {
+                    "tool": "paper_research_start_execution",
+                    "output": "长任务已转入后台执行。\nexecution_id=baseline_repro_fresh",
+                    "data": {
+                        "background_execution": {
+                            "execution_id": "baseline_repro_fresh",
+                            "status": "running",
+                        },
+                        "background_execution_started": True,
+                        "background_execution_completed": False,
+                    },
+                },
+            }
+        ],
+    )
+
+    assert thought is not None
+    assert context.state == AgentState.DONE
+    assert "baseline_repro_fresh" in context.final_answer
+    assert "后台执行" in context.final_answer

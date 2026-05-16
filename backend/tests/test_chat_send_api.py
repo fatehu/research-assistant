@@ -8,9 +8,10 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from app.core import database as core_database
 from app.api import chat as chat_api
 from app.models.conversation import Conversation, Message
-from app.schemas.chat import ChatRequest
+from app.schemas.chat import ChatRequest, ChatSkillLaunch
 
 
 class _ScalarResult:
@@ -59,6 +60,7 @@ class _FakeRuntimeService:
     def __init__(self):
         self.turn_entries = {}
         self.item_entries = []
+        self.context_states = {}
 
     async def get_conversation_revision(self, conversation_id):
         return "rev-54"
@@ -74,6 +76,10 @@ class _FakeRuntimeService:
         if not payload:
             return {}
         return payload
+
+    async def cleanup_stale_conversation_turns(self, conversation_id, older_than_seconds):
+        _ = conversation_id, older_than_seconds
+        return 0
 
     async def append_conversation_item_entries(self, conversation_id, entries):
         for entry in entries:
@@ -97,7 +103,10 @@ class _FakeRuntimeService:
         }
 
     async def get_conversation_context_state(self, conversation_id):
-        return None
+        return self.context_states.get(int(conversation_id))
+
+    async def upsert_conversation_context_state(self, conversation_id, state):
+        self.context_states[int(conversation_id)] = dict(state or {})
 
     async def get_conversation_tool_ledger(self, conversation_id):
         return None
@@ -110,11 +119,108 @@ class _FakeRuntimeService:
         }
 
 
+class _NoopCompactionService:
+    def __init__(self):
+        self.enqueued = []
+
+    def enqueue_conversation(self, conversation_id, **kwargs):
+        self.enqueued.append((conversation_id, dict(kwargs)))
+        return {"queued": True, "reason": "queued"}
+
+
+class _FakeSaveSession:
+    def __init__(self):
+        self._next_message_id = 2000
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def add(self, obj):
+        if isinstance(obj, Message):
+            if getattr(obj, "id", None) is None:
+                obj.id = self._next_message_id
+                self._next_message_id += 1
+            if getattr(obj, "created_at", None) is None:
+                obj.created_at = datetime.utcnow()
+
+    async def commit(self):
+        return None
+
+    async def refresh(self, obj):
+        if getattr(obj, "id", None) is None:
+            obj.id = self._next_message_id
+            self._next_message_id += 1
+        if getattr(obj, "created_at", None) is None:
+            obj.created_at = datetime.utcnow()
+        return obj
+
+
+class _FakeStreamingResponse:
+    def __init__(self, iterator):
+        self.body_iterator = iterator
+
+
+async def _identity_skill_launch_request(request, *, user_id, db):
+    _ = user_id, db
+    return request
+
+
+@pytest.fixture(autouse=True)
+def _stub_compaction_service(monkeypatch):
+    monkeypatch.setattr(chat_api, "get_conversation_context_compaction_service", lambda: _NoopCompactionService())
+    monkeypatch.setattr(core_database, "async_session_factory", lambda: _FakeSaveSession())
+
+
+@pytest.mark.asyncio
+async def test_consume_streaming_response_events_collects_start_and_done():
+    async def _iterator():
+        yield chat_api._sse_event("start", {"turn_id": "turn:1", "conversation_id": 149}).encode("utf-8")
+        yield chat_api._sse_event("done", {"answer": "ok", "run_id": "run-1"}).encode("utf-8")
+
+    published = []
+
+    async def _publish(event, data):
+        published.append((event, data))
+
+    start_payload, done_payload = await chat_api._consume_streaming_response_events(
+        _FakeStreamingResponse(_iterator()),
+        publish=_publish,
+        idle_timeout_seconds=1.0,
+    )
+
+    assert start_payload["turn_id"] == "turn:1"
+    assert done_payload["answer"] == "ok"
+    assert [event for event, _ in published] == ["start", "done"]
+
+
+@pytest.mark.asyncio
+async def test_consume_streaming_response_events_raises_on_idle_timeout():
+    async def _iterator():
+        await asyncio.sleep(0.05)
+        if False:
+            yield b""
+
+    async def _publish(event, data):
+        return None
+
+    with pytest.raises(RuntimeError, match="chat_stream_idle_timeout_after_0s|chat_stream_idle_timeout_after_1s"):
+        await chat_api._consume_streaming_response_events(
+            _FakeStreamingResponse(_iterator()),
+            publish=_publish,
+            idle_timeout_seconds=0.01,
+        )
+
+
 class _FakePlanner:
     def __init__(self, runtime_service):
         self.runtime_service = runtime_service
+        self.seen_messages = []
 
     async def prepare_direct_response(self, messages, *, force_no_tools=False):
+        self.seen_messages.append([dict(item) for item in messages])
         return SimpleNamespace(
             system_prompt="direct-system",
             llm_messages=[{"role": "user", "content": messages[-1]["content"]}],
@@ -174,10 +280,152 @@ class _FakeSlowStreamingLLMService(_FakeLLMService):
         await asyncio.sleep(30)
 
 
+class _FakeDelayedStreamingLLMService(_FakeLLMService):
+    async def chat_stream(self, *args, **kwargs):
+        await asyncio.sleep(0.03)
+        yield "delayed answer"
+
+
 class _User:
     id = 7
     username = "tester"
     preferred_llm_provider = "aliyun"
+
+
+class _FakeSkillService:
+    def __init__(self):
+        self.calls = []
+
+    def render_launch_prompt(self, skill_name, payload):
+        self.calls.append({"skill_name": skill_name, "payload": dict(payload or {})})
+        return f"expanded::{payload.get('stage')}::{payload.get('paper_id')}"
+
+    def get_skill(self, skill_name):
+        if skill_name != "paper-reproduction":
+            return None
+        return SimpleNamespace(
+            name="paper-reproduction",
+            display_name="Paper Reproduction",
+            stage_names=("planning", "execution", "tuning"),
+            stage_policies=(
+                "planning=manual",
+                "execution=auto_continue",
+                "tuning=ask_to_continue",
+            ),
+            default_continue_policy="ask_to_continue",
+        )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_payload"),
+    [
+        ("paper_research_inspect_runtime", {"project_id": 2}),
+        ("paper_research_assess_repo_mainpath", {"project_id": 2}),
+        ("paper_research_probe_repo", {"project_id": 2, "repo_url": "https://github.com/example/repo"}),
+        ("paper_research_probe_url", {"project_id": 2, "url": "https://example.com/data.zip"}),
+    ],
+)
+def test_build_tool_event_workflow_control_payload_promotes_probe_stage(monkeypatch, tool_name, tool_payload):
+    skill_service = _FakeSkillService()
+    monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
+
+    workflow_control = chat_api._build_tool_event_workflow_control_payload(
+        ChatRequest(
+            message="继续论文规划阶段（paper_id=111）",
+            conversation_id=58,
+            stream=True,
+            use_tools=True,
+            skill_launch=ChatSkillLaunch(
+                skill_name="paper-reproduction",
+                stage="planning",
+                paper_id=111,
+                project_id=2,
+            ),
+        ),
+        tool_name=tool_name,
+        tool_payload=tool_payload,
+        success=True,
+        phase="action",
+    )
+
+    assert workflow_control is not None
+    assert workflow_control["stage"] == "planning"
+    assert workflow_control["stage_status"] == "running"
+    assert workflow_control["continue_policy"] == "manual"
+    assert workflow_control.get("next_stage") is None
+    assert workflow_control.get("action") is None
+
+
+@pytest.mark.parametrize("stage", ["planning", "execution", "tuning"])
+def test_project_write_report_workflow_stage_follows_active_skill_stage(monkeypatch, stage):
+    skill_service = _FakeSkillService()
+    monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
+
+    workflow_control = chat_api._build_tool_event_workflow_control_payload(
+        ChatRequest(
+            message=f"继续论文{stage}阶段（paper_id=111）",
+            conversation_id=58,
+            stream=True,
+            use_tools=True,
+            skill_launch=ChatSkillLaunch(
+                skill_name="paper-reproduction",
+                stage=stage,
+                paper_id=111,
+                project_id=2,
+            ),
+        ),
+        tool_name="project_write_report",
+        tool_payload={
+            "project_id": 2,
+            "relative_path": "reference/reports/tuning_research.md",
+            "artifact_kind": "project_report",
+        },
+        success=True,
+        phase="action",
+    )
+
+    assert workflow_control is not None
+    assert workflow_control["stage"] == stage
+    assert workflow_control["stage_status"] == "running"
+
+
+def test_reference_report_paths_do_not_force_planning_stage():
+    assert chat_api._infer_paper_stage_from_artifact_path("reference/reports/tuning_research.md") is None
+
+
+def test_final_workflow_control_converts_running_stage_to_completed(monkeypatch):
+    skill_service = _FakeSkillService()
+    monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
+
+    request = ChatRequest(
+        message="继续论文规划阶段（paper_id=111）",
+        conversation_id=58,
+        stream=True,
+        use_tools=True,
+        skill_launch=ChatSkillLaunch(
+            skill_name="paper-reproduction",
+            stage="planning",
+            paper_id=111,
+            project_id=2,
+        ),
+    )
+    workflow_control = chat_api._build_final_workflow_control_payload(
+        request,
+        active_workflow_control={
+            "skill_name": "paper-reproduction",
+            "display_name": "Paper Reproduction",
+            "stage": "planning",
+            "stage_label": "规划阶段",
+            "stage_status": "running",
+            "continue_policy": "manual",
+        },
+    )
+
+    assert workflow_control is not None
+    assert workflow_control["stage"] == "planning"
+    assert workflow_control["stage_status"] == "completed"
+    assert workflow_control["next_stage"] == "execution"
+    assert workflow_control["action"]["label"] == "继续 执行阶段"
 
 
 @pytest.mark.asyncio
@@ -387,3 +635,598 @@ async def test_send_message_stream_emits_phase_events_before_direct_answer(monke
     assert '"key": "waiting_model"' in joined
     assert '"event": "content"' in joined
     assert '"event": "done"' in joined
+
+
+@pytest.mark.asyncio
+async def test_send_message_direct_stream_emits_heartbeat_while_waiting_for_model(monkeypatch):
+    conversation = Conversation(
+        id=62,
+        user_id=7,
+        title="测试对话",
+        llm_provider="aliyun",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    conversation.messages = []
+    runtime_service = _FakeRuntimeService()
+
+    import app.services.react_agent as react_agent_module
+
+    monkeypatch.setattr(chat_api, "_chat_sse_heartbeat_seconds", lambda: 0.01)
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: _FakePlanner(runtime_service))
+    monkeypatch.setattr(chat_api, "LLMService", _FakeDelayedStreamingLLMService)
+
+    response = await chat_api.send_message(
+        ChatRequest(
+            message="请直接回答，但模型首 token 会慢。",
+            conversation_id=62,
+            stream=True,
+            use_tools=False,
+        ),
+        current_user=_User(),
+        db=_FakeDB(conversation),
+    )
+
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else str(chunk))
+
+    joined = "".join(chunks)
+    assert '"event": "heartbeat"' in joined
+    assert '"phase": "model_wait"' in joined
+    assert joined.index('"event": "heartbeat"') < joined.index('"event": "content"')
+    assert not [entry for entry in runtime_service.item_entries if entry.get("kind") == "heartbeat"]
+
+
+def test_chat_request_accepts_skill_launch_without_message():
+    request = ChatRequest(
+        skill_launch=ChatSkillLaunch(
+            skill_name="paper-reproduction",
+            stage="planning",
+            paper_id=111,
+        ),
+        stream=True,
+    )
+
+    assert request.message is None
+    assert request.skill_launch is not None
+    assert request.skill_launch.skill_name == "paper-reproduction"
+
+
+@pytest.mark.asyncio
+async def test_send_message_uses_skill_launch_renderer_but_persists_visible_message(monkeypatch):
+    conversation = Conversation(
+        id=57,
+        user_id=7,
+        title="测试对话",
+        llm_provider="aliyun",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    conversation.messages = []
+    runtime_service = _FakeRuntimeService()
+    planner = _FakePlanner(runtime_service)
+    skill_service = _FakeSkillService()
+
+    import app.services.react_agent as react_agent_module
+
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
+    monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(chat_api, "_normalize_skill_launch_request", _identity_skill_launch_request)
+    monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: planner)
+    monkeypatch.setattr(chat_api, "LLMService", _FakeLLMService)
+
+    response = await chat_api.send_message(
+        ChatRequest(
+            message="继续论文规划阶段（paper_id=111）",
+            conversation_id=57,
+            stream=False,
+            use_tools=True,
+            skill_launch=ChatSkillLaunch(
+                skill_name="paper-reproduction",
+                stage="planning",
+                paper_id=111,
+                project_id=2,
+                goal="run baseline",
+            ),
+        ),
+        current_user=_User(),
+        db=_FakeDB(conversation),
+    )
+
+    assert response["message"].content == "direct answer"
+    assert skill_service.calls == [
+        {
+            "skill_name": "paper-reproduction",
+            "payload": {
+                "skill_name": "paper-reproduction",
+                "stage": "planning",
+                "paper_id": 111,
+                "project_id": 2,
+                "goal": "run baseline",
+            },
+        }
+    ]
+    assert planner.seen_messages[-1][-1]["content"] == "expanded::planning::111"
+    assert response["workflow_control"]["next_stage"] == "execution"
+    turn_store = await runtime_service.get_conversation_turn_store(57)
+    assert turn_store["entries"][0]["user_content"] == "继续论文规划阶段（paper_id=111）"
+
+
+@pytest.mark.asyncio
+async def test_send_message_stream_emits_workflow_control_for_skill_launch(monkeypatch):
+    conversation = Conversation(
+        id=58,
+        user_id=7,
+        title="测试对话",
+        llm_provider="aliyun",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    conversation.messages = []
+    runtime_service = _FakeRuntimeService()
+    planner = _FakePlanner(runtime_service)
+    skill_service = _FakeSkillService()
+
+    import app.services.react_agent as react_agent_module
+
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
+    monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(chat_api, "_normalize_skill_launch_request", _identity_skill_launch_request)
+    monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: planner)
+    monkeypatch.setattr(chat_api, "LLMService", _FakeStreamingLLMService)
+
+    response = await chat_api.send_message(
+        ChatRequest(
+            message="继续论文规划阶段（paper_id=111）",
+            conversation_id=58,
+            stream=True,
+            use_tools=True,
+            skill_launch=ChatSkillLaunch(
+                skill_name="paper-reproduction",
+                stage="planning",
+                paper_id=111,
+                project_id=2,
+            ),
+        ),
+        current_user=_User(),
+        db=_FakeDB(conversation),
+    )
+
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else str(chunk))
+
+    joined = "".join(chunks)
+    assert '"event": "done"' in joined
+    assert '"workflow_control"' in joined
+    assert '"next_stage": "execution"' in joined
+    assert '继续 执行阶段' in joined
+
+
+@pytest.mark.asyncio
+async def test_send_message_stream_emits_running_workflow_control_on_probe_tool(monkeypatch):
+    class _ToolPlanner:
+        def __init__(self, runtime_service):
+            self.runtime_service = runtime_service
+
+        async def prepare_direct_response(self, messages, *, force_no_tools=False):
+            _ = messages, force_no_tools
+            return None
+
+    class _ToolAgent:
+        def __init__(self, runtime_service):
+            self.runtime_service = runtime_service
+
+        async def run(self, agent_messages, stream=True, prepared_plan=None):
+            _ = agent_messages, stream, prepared_plan
+            yield {"type": "start", "data": {"provider": "test", "model": "tool-model"}}
+            yield {
+                "type": "action",
+                "data": {
+                    "tool": "paper_research_inspect_runtime",
+                    "input": {"project_id": 2},
+                },
+            }
+            yield {
+                "type": "observation",
+                "data": {
+                    "tool": "paper_research_inspect_runtime",
+                    "success": True,
+                    "output": "runtime ok",
+                    "data": {"project_id": 2},
+                },
+            }
+            yield {
+                "type": "done",
+                "data": {
+                    "answer": "runtime inspected",
+                    "run_id": "run-1",
+                },
+            }
+
+    conversation = Conversation(
+        id=59,
+        user_id=7,
+        title="测试对话",
+        llm_provider="aliyun",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    conversation.messages = []
+    runtime_service = _FakeRuntimeService()
+    skill_service = _FakeSkillService()
+
+    import app.services.react_agent as react_agent_module
+
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
+    monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(chat_api, "_normalize_skill_launch_request", _identity_skill_launch_request)
+    monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: _ToolPlanner(runtime_service))
+    monkeypatch.setattr(react_agent_module, "create_react_agent", lambda *args, **kwargs: _ToolAgent(runtime_service))
+    monkeypatch.setattr(chat_api, "LLMService", _FakeStreamingLLMService)
+
+    response = await chat_api.send_message(
+        ChatRequest(
+            message="继续论文规划阶段（paper_id=111）",
+            conversation_id=59,
+            stream=True,
+            use_tools=True,
+            skill_launch=ChatSkillLaunch(
+                skill_name="paper-reproduction",
+                stage="planning",
+                paper_id=111,
+                project_id=2,
+            ),
+        ),
+        current_user=_User(),
+        db=_FakeDB(conversation),
+    )
+
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else str(chunk))
+
+    joined = "".join(chunks)
+    assert '"event": "action"' in joined
+    assert '"stage": "planning"' in joined
+    assert '"stage_status": "running"' in joined
+    assert '"event": "done"' in joined
+
+
+@pytest.mark.asyncio
+async def test_send_message_agent_stream_emits_heartbeat_while_agent_is_silent(monkeypatch):
+    class _ToolPlanner:
+        def __init__(self, runtime_service):
+            self.runtime_service = runtime_service
+
+        async def prepare_direct_response(self, messages, *, force_no_tools=False):
+            _ = messages, force_no_tools
+            return None
+
+    class _SilentAgent:
+        def __init__(self, runtime_service):
+            self.runtime_service = runtime_service
+            self.runtime_context = SimpleNamespace(run_id="run-heartbeat-1")
+
+        async def run(self, agent_messages, stream=True, prepared_plan=None):
+            _ = agent_messages, stream, prepared_plan
+            await asyncio.sleep(0.03)
+            yield {"type": "start", "data": {"provider": "test", "model": "tool-model"}}
+            await asyncio.sleep(0.03)
+            yield {
+                "type": "done",
+                "data": {
+                    "answer": "agent completed after silence",
+                    "run_id": "run-heartbeat-1",
+                },
+            }
+
+    conversation = Conversation(
+        id=63,
+        user_id=7,
+        title="测试 agent heartbeat",
+        llm_provider="aliyun",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    conversation.messages = []
+    runtime_service = _FakeRuntimeService()
+
+    import app.services.react_agent as react_agent_module
+
+    monkeypatch.setattr(chat_api, "_chat_sse_heartbeat_seconds", lambda: 0.01)
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: _ToolPlanner(runtime_service))
+    monkeypatch.setattr(react_agent_module, "create_react_agent", lambda *args, **kwargs: _SilentAgent(runtime_service))
+    monkeypatch.setattr(chat_api, "LLMService", _FakeStreamingLLMService)
+
+    response = await chat_api.send_message(
+        ChatRequest(
+            message="需要工具路径，但 agent 会短暂静默。",
+            conversation_id=63,
+            stream=True,
+            use_tools=True,
+        ),
+        current_user=_User(),
+        db=_FakeDB(conversation),
+    )
+
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else str(chunk))
+
+    joined = "".join(chunks)
+    assert '"event": "heartbeat"' in joined
+    assert '"phase": "model_wait"' in joined
+    assert '"conversation_id": 63' in joined
+    assert '"turn_id": "turn:1000"' in joined
+    assert '"event": "done"' in joined
+    assert not [entry for entry in runtime_service.item_entries if entry.get("kind") == "heartbeat"]
+
+
+@pytest.mark.asyncio
+async def test_normalize_skill_launch_request_resolves_project_and_builds_reference(monkeypatch, tmp_path):
+    paper = SimpleNamespace(
+        id=111,
+        title="Attention Is All You Need",
+        year=2017,
+        venue="NeurIPS",
+        arxiv_id="1706.03762",
+    )
+    captured = {}
+
+    async def _fake_get_owned_paper(db, *, user_id, paper_id):
+        _ = db
+        captured["paper_lookup"] = {"user_id": user_id, "paper_id": paper_id}
+        return paper
+
+    async def _fake_resolve_project(db, *, user_id, paper, project_id, goal):
+        _ = db, paper
+        captured["project_resolution"] = {"user_id": user_id, "project_id": project_id, "goal": goal}
+        return {"id": 9, "primary_paper_id": 111}
+
+    class _FakeBuilder:
+        def __init__(self, db):
+            captured["builder_db"] = db
+
+        @classmethod
+        def reference_bundle_ready(cls, project_dir):
+            captured["project_dir"] = str(project_dir)
+            return False
+
+        async def build(self, *, paper, project_id, user_id, refresh=False):
+            captured["builder_call"] = {
+                "paper_id": int(paper.id),
+                "project_id": int(project_id),
+                "user_id": int(user_id),
+                "refresh": bool(refresh),
+            }
+            return {"reference_ready": True}
+
+    monkeypatch.setattr(chat_api, "_get_owned_paper_for_skill_launch", _fake_get_owned_paper)
+    monkeypatch.setattr(chat_api, "_resolve_project_payload_for_skill_launch", _fake_resolve_project)
+    monkeypatch.setattr(chat_api, "ProjectReferenceBuilderService", _FakeBuilder)
+    monkeypatch.setattr(chat_api, "get_project_root_dir", lambda project_id: tmp_path / str(int(project_id)))
+
+    normalized = await chat_api._normalize_skill_launch_request(
+        ChatRequest(
+            skill_launch=ChatSkillLaunch(
+                skill_name="paper-reproduction",
+                stage="planning",
+                paper_id=111,
+                goal="run baseline",
+            ),
+            stream=True,
+        ),
+        user_id=7,
+        db=object(),
+    )
+
+    assert normalized.skill_launch is not None
+    assert normalized.skill_launch.paper_id == 111
+    assert normalized.skill_launch.project_id == 9
+    assert captured["paper_lookup"] == {"user_id": 7, "paper_id": 111}
+    assert captured["project_resolution"] == {"user_id": 7, "project_id": None, "goal": "run baseline"}
+    assert captured["builder_call"] == {
+        "paper_id": 111,
+        "project_id": 9,
+        "user_id": 7,
+        "refresh": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_message_normalizes_paper_skill_launch_before_rendering(monkeypatch):
+    conversation = Conversation(
+        id=61,
+        user_id=7,
+        title="测试对话",
+        llm_provider="aliyun",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    conversation.messages = []
+    runtime_service = _FakeRuntimeService()
+    planner = _FakePlanner(runtime_service)
+    skill_service = _FakeSkillService()
+
+    async def _normalize_request(request, *, user_id, db):
+        _ = user_id, db
+        return request.model_copy(
+            update={
+                "skill_launch": request.skill_launch.model_copy(
+                    update={"project_id": 9}
+                )
+            }
+        )
+
+    import app.services.react_agent as react_agent_module
+
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
+    monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(chat_api, "_normalize_skill_launch_request", _normalize_request)
+    monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: planner)
+    monkeypatch.setattr(chat_api, "LLMService", _FakeLLMService)
+
+    response = await chat_api.send_message(
+        ChatRequest(
+            message="继续论文规划阶段（paper_id=111）",
+            conversation_id=61,
+            stream=False,
+            use_tools=True,
+            skill_launch=ChatSkillLaunch(
+                skill_name="paper-reproduction",
+                stage="planning",
+                paper_id=111,
+            ),
+        ),
+        current_user=_User(),
+        db=_FakeDB(conversation),
+    )
+
+    assert response["message"].content == "direct answer"
+    assert skill_service.calls[-1]["payload"]["project_id"] == 9
+    assert planner.seen_messages[-1][-1]["content"] == "expanded::planning::111"
+
+
+@pytest.mark.asyncio
+async def test_create_chat_background_run_binds_conversation_after_stream_start(monkeypatch):
+    class _FakeBackgroundRuntimeService:
+        def __init__(self):
+            self.bind_calls = []
+            self.complete_calls = []
+            self.turn_entries = []
+            self.call_sequence = []
+
+        async def create_run(self, **kwargs):
+            self.create_kwargs = dict(kwargs)
+            return "bg-run-1"
+
+        async def bind_run_to_conversation(self, run_id, *, conversation_id):
+            self.bind_calls.append({"run_id": run_id, "conversation_id": conversation_id})
+            self.call_sequence.append(("bind", conversation_id))
+
+        async def complete_run(self, run_id, **kwargs):
+            self.complete_calls.append({"run_id": run_id, **dict(kwargs)})
+            self.call_sequence.append(("complete", kwargs.get("metadata", {}).get("conversation_id")))
+
+        async def append_chat_run_event(self, *args, **kwargs):
+            return None
+
+        async def upsert_conversation_turn_entry(self, conversation_id, payload):
+            self.turn_entries.append({"conversation_id": conversation_id, "payload": dict(payload)})
+
+    class _ImmediateBackgroundManager:
+        async def start(self, *, run_id, user_id, execute_fn, persist_event_fn=None):
+            _ = user_id, persist_event_fn
+
+            async def _publish(_event, _data):
+                return None
+
+            await execute_fn(_publish)
+            return {"run_id": run_id, "status": "completed"}
+
+    async def _fake_send_message(request, current_user, db):
+        _ = request, current_user, db
+
+        async def _iterator():
+            yield chat_api._sse_event("start", {"conversation_id": 88, "turn_id": "turn:88"}).encode("utf-8")
+            yield chat_api._sse_event("done", {"answer": "ok", "run_id": "inner-run-1"}).encode("utf-8")
+
+        return chat_api.StreamingResponse(_iterator(), media_type="text/event-stream")
+
+    runtime_service = _FakeBackgroundRuntimeService()
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_chat_background_run_manager", lambda: _ImmediateBackgroundManager())
+    monkeypatch.setattr(chat_api, "send_message", _fake_send_message)
+
+    response = await chat_api.create_chat_background_run(
+        ChatRequest(message="后台继续跑", stream=True),
+        current_user=_User(),
+    )
+
+    assert response["run_id"] == "bg-run-1"
+    assert {"run_id": "bg-run-1", "conversation_id": 88} in runtime_service.bind_calls
+    assert runtime_service.complete_calls[0]["run_id"] == "bg-run-1"
+    assert runtime_service.complete_calls[0]["metadata"]["conversation_id"] == 88
+    assert runtime_service.call_sequence[-1] == ("complete", 88)
+
+
+@pytest.mark.asyncio
+async def test_send_message_stream_persists_thought_items_into_item_stream(monkeypatch):
+    class _ToolPlanner:
+        def __init__(self, runtime_service):
+            self.runtime_service = runtime_service
+
+        async def prepare_direct_response(self, messages, *, force_no_tools=False):
+            _ = messages, force_no_tools
+            return None
+
+    class _ThoughtAgent:
+        def __init__(self, runtime_service):
+            self.runtime_service = runtime_service
+            self.runtime_context = SimpleNamespace(run_id="run-thought-1")
+
+        async def run(self, agent_messages, stream=True, prepared_plan=None):
+            _ = agent_messages, stream, prepared_plan
+            yield {"type": "start", "data": {"provider": "test", "model": "tool-model"}}
+            yield {"type": "thinking_start", "data": {"iteration": 1}}
+            yield {"type": "thought", "data": "让我先确认一下脚本入口。"}
+            yield {
+                "type": "done",
+                "data": {
+                    "answer": "已经确认入口脚本。",
+                    "run_id": "run-thought-1",
+                },
+            }
+
+    conversation = Conversation(
+        id=60,
+        user_id=7,
+        title="测试 thought 持久化",
+        llm_provider="aliyun",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    conversation.messages = []
+    runtime_service = _FakeRuntimeService()
+
+    import app.services.react_agent as react_agent_module
+
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: _ToolPlanner(runtime_service))
+    monkeypatch.setattr(react_agent_module, "create_react_agent", lambda *args, **kwargs: _ThoughtAgent(runtime_service))
+    monkeypatch.setattr(chat_api, "LLMService", _FakeStreamingLLMService)
+
+    response = await chat_api.send_message(
+        ChatRequest(
+            message="帮我看下现在做到哪一步了",
+            conversation_id=60,
+            stream=True,
+            use_tools=True,
+        ),
+        current_user=_User(),
+        db=_FakeDB(conversation),
+    )
+
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else str(chunk))
+
+    thought_entries = [entry for entry in runtime_service.item_entries if entry.get("kind") == "thought"]
+    assert thought_entries
+    assert thought_entries[0]["content"] == "让我先确认一下脚本入口。"
+    assert thought_entries[0]["iteration"] == 1
+
+    joined = "".join(chunks)
+    assert '"event": "done"' in joined
+    assert '"kind": "thought"' in joined

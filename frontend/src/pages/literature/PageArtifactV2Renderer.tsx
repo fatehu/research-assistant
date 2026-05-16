@@ -270,6 +270,8 @@ function shouldRenderInRail(block: PageArtifactV2ReadingBlock): boolean {
   const lane = getLaneHint(block)
   if (RAIL_HINTS.has(placement) || RAIL_HINTS.has(lane)) return true
   if (!SUPPORT_SEGMENT_KINDS.has(block.segment_kind)) return false
+  // 辅助 blocks 默认放在 rail，除非后端显式标记为 inline；
+  // 这样生成的旁注不会打断主正文。
   if (INLINE_HINTS.has(placement) || INLINE_HINTS.has(lane)) return false
   return true
 }
@@ -874,6 +876,8 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
     const groupIdCounts = new Map<string, number>()
 
     for (const block of flowBlocks) {
+      // 后端可能提供 heading 或显式 group ID；两者都不存在时，
+      // 将后续正文保留在当前 group，保证渲染稳定。
       const meta = block.meta || {}
       const explicitGroupId = String(meta.group_id || meta.section_id || '').trim()
       const explicitGroupLabel = String(meta.group_label || meta.section_label || '').trim()
@@ -905,6 +909,8 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
       const groupFirstExcerpt = group.blocks.find((item) => item.segment_kind === 'original_excerpt') || null
       let lastExcerpt: PageArtifactV2ReadingBlock | null = null
       for (const block of group.blocks) {
+        // 段落级 ask 操作应引用最近的 source excerpt；当顺序噪声较大时，
+        // 回退到 group 中的第一个 excerpt。
         if (block.segment_kind === 'original_excerpt') {
           lastExcerpt = block
           continue
@@ -947,6 +953,8 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
     const fullText = String(target.text || '').trim()
     if (!fullText) return
 
+    // 只动画刚改写的 block。nonce 用来防止上一次改写的延迟 timer
+    // 覆盖更新后的渲染文本。
     let frameIndex = 0
     const step = Math.max(1, Math.ceil(fullText.length / 36))
     setRewriteAnimation({

@@ -24,6 +24,8 @@ export function useExperienceActionBus(params: {
   const [lastUiEvent, setLastUiEvent] = useState<ExperienceUiEvent>(null)
 
   useEffect(() => {
+    // 页面切换时重置本地 focus 状态；否则上一页选中的 target 可能在跳转后
+    // 继续高亮无关 block。
     setActiveTargetId('')
     setLastUiEvent(null)
   }, [focusPage, paperId])
@@ -39,6 +41,8 @@ export function useExperienceActionBus(params: {
       setActiveTargetId(targetRef)
     }
     if (actionType === 'return_to_reader') {
+      // 返回时使用后端提供的 primary focus target，让手写 block 和生成组件
+      // 落到同一个阅读锚点。
       setActiveTargetId(primaryFocusTargetId || '')
     }
     setLastUiEvent({

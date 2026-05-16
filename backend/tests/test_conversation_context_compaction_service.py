@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -10,7 +11,32 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import app.services.conversation_context_compaction_service as compaction_module
 from app.config import settings
 from app.models.conversation import Conversation
-from app.services.conversation_context_compaction_service import ConversationContextCompactionService
+from app.services.agent_runtime_service import AgentRuntimeService
+from app.services.conversation_context_compaction_service import (
+    ConversationCompactionTask,
+    ConversationContextCompactionService,
+)
+
+
+def test_compact_debug_text_honors_limit_and_normalizes_whitespace():
+    text = compaction_module.ReActAgent._compact_debug_text("alpha\n beta\t" + "x" * 40, 18)
+
+    assert text == "alpha beta xxxx..."
+    assert len(text) <= 18
+
+
+def test_tool_arguments_preview_truncates_large_content_arguments():
+    preview = ConversationContextCompactionService._tool_arguments_preview(
+        {
+            "relative_path": "reports/tuning_report.md",
+            "content": "0123456789" * 80,
+        }
+    )
+
+    assert preview is not None
+    assert preview["relative_path"] == "reports/tuning_report.md"
+    assert len(preview["content"]) <= 120
+    assert preview["content"].endswith("...")
 
 
 class _FakeStateLLM:
@@ -38,6 +64,9 @@ class _FakeStateLLM:
                 "messages": list(messages),
                 "system_prompt": system_prompt,
                 "payload": payload,
+                "kwargs": dict(kwargs),
+                "provider": self.provider,
+                "model": self.config.get("model"),
             }
         )
         if "会话历史压缩器" in str(system_prompt or ""):
@@ -70,11 +99,21 @@ class _FakeStateLLM:
                             "tool_names": ["knowledge_search"],
                         }
                     ],
+                    "decision_state": {
+                        "status": "active",
+                        "evidence_status": "insufficient",
+                        "next_action": "collect_more_evidence",
+                        "allowed_actions": ["collect_more_evidence", "answer"],
+                        "repo_edit_allowed": False,
+                    },
                     "last_reasoning_summary": "先解释定义，再回答历史条件限制。",
                 },
                 ensure_ascii=False,
             )
         }
+
+    async def chat_with_tools(self, *args, **kwargs):
+        return await self.chat(*args, **kwargs)
 
 
 @pytest.mark.asyncio
@@ -136,6 +175,7 @@ async def test_build_artifacts_uses_llm_to_extract_context_state(monkeypatch):
                 },
             },
         ],
+        up_to_message_id=123,
     )
 
     assert artifacts.context_state["version"] == "conversation_context_state.v3"
@@ -150,10 +190,13 @@ async def test_build_artifacts_uses_llm_to_extract_context_state(monkeypatch):
     assert artifacts.context_state["evidence_ledger"][0]["result_count"] == 2
     assert artifacts.context_state["evidence_ledger"][0]["retrieval_scope"] == {"knowledge_base_ids": [12], "document_ids": [34]}
     assert artifacts.context_state["evidence_ledger"][0]["provenance_hints"] == ["Transformer / Attention Is All You Need.pdf"]
+    assert artifacts.context_state["decision_state"]["next_action"] == "collect_more_evidence"
     assert artifacts.compacted_history["version"] == "conversation_compacted_history.v2"
     assert "开场目标" in artifacts.compacted_history["history_anchors"]
     assert "注意力机制" in artifacts.compacted_history["history_summary"]
     assert len(artifacts.compacted_history["replacement_history"]) == 2
+    assert artifacts.compacted_history["compact_boundary_message_id"] == 123
+    assert artifacts.up_to_message_id == 123
     assert artifacts.compacted_message_count > 0
     assert "注意力机制" in artifacts.summary_text
     assert _FakeStateLLM.last_messages
@@ -168,6 +211,64 @@ async def test_build_artifacts_uses_llm_to_extract_context_state(monkeypatch):
     assert "检索到 attention mechanism 定义" in _FakeStateLLM.calls[0]["payload"]["evidence_candidates"][0]["summary"]
     assert _FakeStateLLM.calls[0]["payload"]["evidence_candidates"][0]["source_kind"] == "knowledge_base_search"
     assert _FakeStateLLM.calls[1]["payload"]["tool_ledger_preview"][0]["tool_name"] == "knowledge_search"
+    assert _FakeStateLLM.calls[0]["kwargs"]["source"] == "chat_compaction.context_state"
+    assert _FakeStateLLM.calls[1]["kwargs"]["source"] == "chat_compaction.compacted_history"
+
+
+@pytest.mark.asyncio
+async def test_build_artifacts_respects_context_state_disabled(monkeypatch):
+    monkeypatch.setattr(settings, "agent_context_window_turns", 2)
+    monkeypatch.setattr(settings, "agent_context_recently_slid_turns", 1)
+    monkeypatch.setattr(settings, "agent_context_state_enabled", False)
+    monkeypatch.setattr(compaction_module, "LLMService", _FakeStateLLM)
+    _FakeStateLLM.calls = []
+
+    artifacts = await ConversationContextCompactionService.build_artifacts(
+        [
+            {"role": "user", "content": "第1轮问题。"},
+            {"role": "assistant", "content": "第1轮回答。"},
+            {"role": "user", "content": "第2轮问题。"},
+            {"role": "assistant", "content": "第2轮回答。"},
+            {"role": "user", "content": "第3轮问题。"},
+        ],
+        up_to_message_id=12,
+    )
+
+    assert artifacts.context_state == {}
+    assert artifacts.compacted_history["compact_boundary_message_id"] == 12
+    assert [call["kwargs"]["source"] for call in _FakeStateLLM.calls] == [
+        "chat_compaction.compacted_history"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_build_artifacts_uses_budget_compression_settings_for_history(monkeypatch):
+    monkeypatch.setattr(settings, "agent_context_window_turns", 2)
+    monkeypatch.setattr(settings, "agent_context_recently_slid_turns", 1)
+    monkeypatch.setattr(settings, "agent_context_state_provider", "aliyun")
+    monkeypatch.setattr(settings, "agent_context_state_model", "state-model")
+    monkeypatch.setattr(settings, "agent_budget_compression_provider", "openai")
+    monkeypatch.setattr(settings, "agent_budget_compression_model", "history-model")
+    monkeypatch.setattr(settings, "agent_budget_compression_max_tokens", 321)
+    monkeypatch.setattr(compaction_module, "LLMService", _FakeStateLLM)
+    _FakeStateLLM.calls = []
+
+    await ConversationContextCompactionService.build_artifacts(
+        [
+            {"role": "user", "content": "第1轮问题。"},
+            {"role": "assistant", "content": "第1轮回答。"},
+            {"role": "user", "content": "第2轮问题。"},
+            {"role": "assistant", "content": "第2轮回答。"},
+            {"role": "user", "content": "第3轮问题。"},
+        ],
+        up_to_message_id=12,
+    )
+
+    assert _FakeStateLLM.calls[0]["provider"] == "aliyun"
+    assert _FakeStateLLM.calls[0]["model"] == "state-model"
+    assert _FakeStateLLM.calls[1]["provider"] == "openai"
+    assert _FakeStateLLM.calls[1]["model"] == "history-model"
+    assert _FakeStateLLM.calls[1]["kwargs"]["max_tokens"] == 321
 
 def test_require_item_stream_payload_raises_on_missing_entries():
     with pytest.raises(compaction_module.ConversationItemStreamUnavailableError) as exc_info:
@@ -313,11 +414,21 @@ class _FakeNoCompactLLM:
                     "open_questions": [],
                     "resolved_facts": [],
                     "evidence_ledger": [],
+                    "decision_state": {
+                        "status": "active",
+                        "evidence_status": "insufficient",
+                        "next_action": "answer",
+                        "allowed_actions": ["answer"],
+                        "repo_edit_allowed": False,
+                    },
                     "last_reasoning_summary": "概念解释",
                 },
                 ensure_ascii=False,
             )
         }
+
+    async def chat_with_tools(self, *args, **kwargs):
+        return await self.chat(*args, **kwargs)
 
 
 class _FakeSparseEvidenceLLM:
@@ -356,11 +467,21 @@ class _FakeSparseEvidenceLLM:
                             "tool_names": [],
                         }
                     ],
+                    "decision_state": {
+                        "status": "ready",
+                        "evidence_status": "sufficient",
+                        "next_action": "answer",
+                        "allowed_actions": ["answer"],
+                        "repo_edit_allowed": False,
+                    },
                     "last_reasoning_summary": "已有外部证据。",
                 },
                 ensure_ascii=False,
             )
         }
+
+    async def chat_with_tools(self, *args, **kwargs):
+        return await self.chat(*args, **kwargs)
 
 
 class _ScalarResult:
@@ -418,6 +539,247 @@ class _FakeRuntimeService:
     async def append_conversation_item_entries(self, conversation_id: int, entries):
         self.item_entries.extend(list(entries or []))
 
+    async def commit_conversation_compaction_if_current(
+        self,
+        conversation_id: int,
+        *,
+        source_fingerprint,
+        context_state=None,
+        compacted_history=None,
+        compact_boundary_entry=None,
+        history_event_title: str,
+        history_event_detail: str,
+        context_snapshot=None,
+        stale_history_event_title=None,
+        stale_history_event_detail=None,
+    ):
+        source_fingerprint = dict(source_fingerprint or {})
+        current_fingerprint = AgentRuntimeService.build_item_stream_fingerprint(
+            self.item_stream_payload,
+            fallback_boundary_message_id=source_fingerprint.get("boundary_message_id"),
+        )
+        if not AgentRuntimeService._item_stream_fingerprint_matches(current_fingerprint, source_fingerprint):
+            self.history_events.append(
+                {
+                    "title": stale_history_event_title or "compact_stale_skipped",
+                    "detail": stale_history_event_detail or "stale_source",
+                }
+            )
+            return {
+                "committed": False,
+                "reason": "stale_source",
+                "current_fingerprint": current_fingerprint,
+            }
+        if isinstance(context_state, dict) and context_state:
+            self.context_state = dict(context_state)
+        if isinstance(compacted_history, dict) and compacted_history:
+            self.compacted_history = dict(compacted_history)
+        self.history_events.append({"title": history_event_title, "detail": history_event_detail})
+        if isinstance(context_snapshot, dict) and context_snapshot:
+            self.snapshots.append(dict(context_snapshot))
+        if isinstance(compact_boundary_entry, dict) and compact_boundary_entry:
+            self.item_entries.append(dict(compact_boundary_entry))
+        return {
+            "committed": True,
+            "reason": "committed",
+            "current_fingerprint": current_fingerprint,
+        }
+
+
+class _StaleCommitRuntimeService(_FakeRuntimeService):
+    async def commit_conversation_compaction_if_current(self, *args, **kwargs):
+        self.item_stream_payload = {
+            **dict(self.item_stream_payload or {}),
+            "updated_at": datetime.utcnow().isoformat(),
+            "entries": [
+                *list((self.item_stream_payload or {}).get("entries") or []),
+                {
+                    "item_id": "assistant-new",
+                    "kind": "assistant_message",
+                    "turn_id": "turn:2",
+                    "role": "assistant",
+                    "content": "压缩生成期间新增的回答。",
+                    "message_id": 12,
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+            ],
+        }
+        return await super().commit_conversation_compaction_if_current(*args, **kwargs)
+
+
+def test_enqueue_conversation_wraps_legacy_id_as_full_compaction_task(monkeypatch):
+    monkeypatch.setattr(settings, "conversation_context_compaction_enabled", True)
+    service = ConversationContextCompactionService()
+
+    result = service.enqueue_conversation(
+        42,
+        mode="run_completed",
+        trigger="react_stream_completed",
+        source="chat.send.react_stream",
+    )
+
+    assert result["queued"] is True
+    task = service._queue.get_nowait()
+    try:
+        assert isinstance(task, ConversationCompactionTask)
+        assert task.conversation_id == 42
+        assert task.task_kind == "full_compaction"
+        assert task.mode == "run_completed"
+        assert task.trigger == "react_stream_completed"
+        assert task.source == "chat.send.react_stream"
+        assert task.requested_at
+        assert service._queued_keys == {(42, "full_compaction")}
+    finally:
+        service._queue.task_done()
+
+
+def test_enqueue_task_dedupes_queued_tasks_and_coalesces_running_tasks(monkeypatch):
+    monkeypatch.setattr(settings, "conversation_context_compaction_enabled", True)
+    service = ConversationContextCompactionService()
+
+    first = service.enqueue_task(42, trigger="first", source="test")
+    queued_duplicate = service.enqueue_task(42, trigger="second", source="test")
+
+    assert first["queued"] is True
+    assert queued_duplicate["queued"] is False
+    assert queued_duplicate["reason"] == "duplicate"
+    assert queued_duplicate["duplicate_state"] == "queued"
+
+    task = service._queue.get_nowait()
+    service._queue.task_done()
+    service._queued_keys.discard(service._task_key(task))
+    service._running_keys.add(service._task_key(task))
+
+    running_duplicate = service.enqueue_task(42, trigger="third", source="test")
+
+    assert running_duplicate["queued"] is True
+    assert running_duplicate["reason"] == "queued_after_running"
+    assert running_duplicate["duplicate_state"] == "running"
+    assert service._queued_keys == {(42, "full_compaction")}
+
+
+def test_enqueue_task_rejects_unsupported_task_kind(monkeypatch):
+    monkeypatch.setattr(settings, "conversation_context_compaction_enabled", True)
+    service = ConversationContextCompactionService()
+
+    with pytest.raises(ValueError, match="unsupported conversation compaction task kind"):
+        service.enqueue_task(42, task_kind="context_refresh")
+
+
+@pytest.mark.asyncio
+async def test_worker_runs_full_compaction_task_and_clears_running_key(monkeypatch):
+    monkeypatch.setattr(settings, "conversation_context_compaction_enabled", True)
+    monkeypatch.setattr(settings, "conversation_context_compaction_quiet_period_ms", 0)
+    service = ConversationContextCompactionService()
+    called = asyncio.Event()
+    calls = []
+
+    async def _fake_compact(conversation_id: int, *, mode: str = "auto"):
+        calls.append((conversation_id, mode))
+        called.set()
+
+    monkeypatch.setattr(service, "_compact_conversation", _fake_compact)
+
+    worker = asyncio.create_task(service._worker())
+    try:
+        result = service.enqueue_task(
+            42,
+            mode="pre_turn_deferred",
+            trigger="old_history",
+            source="react_agent.pre_turn",
+        )
+        assert result["queued"] is True
+        await asyncio.wait_for(called.wait(), timeout=1.0)
+        await asyncio.wait_for(service._queue.join(), timeout=1.0)
+        assert calls == [(42, "pre_turn_deferred")]
+        assert service._queued_keys == set()
+        assert service._running_keys == set()
+    finally:
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+
+@pytest.mark.asyncio
+async def test_worker_clears_running_key_after_failure(monkeypatch):
+    monkeypatch.setattr(settings, "conversation_context_compaction_enabled", True)
+    monkeypatch.setattr(settings, "conversation_context_compaction_quiet_period_ms", 0)
+    service = ConversationContextCompactionService()
+    called = asyncio.Event()
+
+    async def _fake_compact(conversation_id: int, *, mode: str = "auto"):
+        called.set()
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(service, "_compact_conversation", _fake_compact)
+
+    worker = asyncio.create_task(service._worker())
+    try:
+        result = service.enqueue_task(42, trigger="failure", source="test")
+        assert result["queued"] is True
+        await asyncio.wait_for(called.wait(), timeout=1.0)
+        await asyncio.wait_for(service._queue.join(), timeout=1.0)
+        assert service._queued_keys == set()
+        assert service._running_keys == set()
+    finally:
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+
+class _ChangingItemStreamRuntimeService:
+    def __init__(self):
+        self.calls = 0
+
+    async def get_conversation_item_stream(self, conversation_id: int):
+        self.calls += 1
+        entries = [
+            {
+                "item_id": "user-1",
+                "kind": "user_message",
+                "turn_id": "turn:1",
+                "role": "user",
+                "content": "旧问题",
+                "message_id": 10,
+            }
+        ]
+        if self.calls >= 2:
+            entries.append(
+                {
+                    "item_id": "assistant-1",
+                    "kind": "assistant_message",
+                    "turn_id": "turn:1",
+                    "role": "assistant",
+                    "content": "后台追加的回答",
+                    "message_id": 11,
+                }
+            )
+        return {
+            "version": "conversation_item_stream.v1",
+            "updated_at": f"2026-05-04T00:00:0{min(self.calls, 2)}",
+            "entries": entries,
+        }
+
+
+@pytest.mark.asyncio
+async def test_wait_for_item_stream_quiet_samples_until_fingerprint_is_stable(monkeypatch):
+    monkeypatch.setattr(settings, "conversation_context_compaction_quiet_period_ms", 1)
+    monkeypatch.setattr(settings, "conversation_context_compaction_quiet_timeout_ms", 200)
+    runtime_service = _ChangingItemStreamRuntimeService()
+    service = ConversationContextCompactionService()
+    service._runtime_service = runtime_service
+
+    result = await service._wait_for_item_stream_quiet(
+        42,
+        mode="run_completed",
+        trigger="react_stream_completed",
+        source="test",
+    )
+
+    assert result["reason"] == "stable"
+    assert result["entry_count"] == 2
+    assert runtime_service.calls >= 3
+
 
 @pytest.mark.asyncio
 async def test_compact_conversation_does_not_append_empty_boundary(monkeypatch):
@@ -464,9 +826,66 @@ async def test_compact_conversation_does_not_append_empty_boundary(monkeypatch):
 
     assert artifacts.context_state["active_topic"] == "注意力机制"
     assert artifacts.compacted_history == {}
+    assert artifacts.up_to_message_id is None
     assert runtime_service.context_state is not None
     assert runtime_service.compacted_history is None
     assert runtime_service.item_entries == []
+
+
+@pytest.mark.asyncio
+async def test_compact_conversation_skips_stale_source_without_boundary(monkeypatch):
+    monkeypatch.setattr(compaction_module, "LLMService", _FakeStateLLM)
+    _FakeStateLLM.calls = []
+    conversation = Conversation(
+        id=79,
+        user_id=5,
+        title="测试",
+        llm_provider="aliyun",
+        is_archived=0,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    runtime_service = _StaleCommitRuntimeService(
+        {
+            "version": "conversation_item_stream.v1",
+            "updated_at": "2026-04-02T00:00:00",
+            "entries": [
+                {
+                    "item_id": "user-1",
+                    "kind": "user_message",
+                    "turn_id": "turn:1",
+                    "role": "user",
+                    "content": "解释注意力机制。",
+                    "message_id": 10,
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+                {
+                    "item_id": "assistant-1",
+                    "kind": "assistant_message",
+                    "turn_id": "turn:1",
+                    "role": "assistant",
+                    "content": "注意力机制是一种动态聚焦机制。",
+                    "message_id": 11,
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+            ],
+        },
+        context_state={"version": "conversation_context_state.v3", "active_topic": "原状态"},
+    )
+    service = ConversationContextCompactionService()
+    service._runtime_service = runtime_service
+    monkeypatch.setattr(compaction_module, "async_session_factory", lambda: _FakeSession(conversation))
+
+    artifacts = await service.compact_now(79)
+
+    assert artifacts.compacted_message_count == 0
+    assert artifacts.context_state["active_topic"] == "原状态"
+    assert runtime_service.context_state["active_topic"] == "原状态"
+    assert runtime_service.compacted_history is None
+    assert runtime_service.item_entries == []
+    assert runtime_service.history_events[-1]["title"] == "manual_compact_stale_skipped"
+    assert "event=model_compaction_skipped" in runtime_service.history_events[-1]["detail"]
+    assert "reason=stale_source" in runtime_service.history_events[-1]["detail"]
 
 
 @pytest.mark.asyncio
@@ -557,3 +976,103 @@ async def test_compact_conversation_skips_when_boundary_already_covers_latest_me
     assert runtime_service.snapshots == []
     assert runtime_service.item_entries == []
     assert _FakeStateLLM.calls == []
+
+
+@pytest.mark.asyncio
+async def test_compact_conversation_preserves_existing_context_state_when_new_artifacts_are_empty(monkeypatch):
+    conversation = Conversation(
+        id=146,
+        user_id=5,
+        title="测试",
+        llm_provider="aliyun",
+        is_archived=0,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    runtime_service = _FakeRuntimeService(
+        {
+            "version": "conversation_item_stream.v1",
+            "entries": [
+                {
+                    "item_id": "user-1",
+                    "kind": "user_message",
+                    "turn_id": "turn:2",
+                    "role": "user",
+                    "content": "继续",
+                    "message_id": 729,
+                    "created_at": datetime.utcnow().isoformat(),
+                }
+            ],
+        },
+        context_state={
+            "version": "conversation_context_state.v3",
+            "active_topic": "复现 paperid 113",
+            "workflow_binding": {
+                "skill": "paper-reproduction",
+                "paper_id": 113,
+                "project_id": 6,
+                "workspace_id": 6,
+            },
+            "decision_state": {
+                "status": "blocked",
+                "next_action": "report_blocker",
+                "allowed_actions": ["report_blocker"],
+            },
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+    service = ConversationContextCompactionService()
+    service._runtime_service = runtime_service
+    monkeypatch.setattr(compaction_module, "async_session_factory", lambda: _FakeSession(conversation))
+
+    async def _fake_build_artifacts(*args, **kwargs):
+        return compaction_module.ConversationCompactionArtifacts(
+            context_state={},
+            compacted_history={},
+            summary_text="",
+            up_to_message_id=None,
+            message_count=1,
+            compacted_message_count=0,
+        )
+
+    monkeypatch.setattr(service, "build_artifacts", _fake_build_artifacts)
+
+    artifacts = await service.compact_now(146)
+
+    assert artifacts.context_state["workflow_binding"]["paper_id"] == 113
+    assert runtime_service.context_state["workflow_binding"]["project_id"] == 6
+    assert runtime_service.snapshots
+    assert runtime_service.snapshots[-1]["context_state"]["workflow_binding"]["workspace_id"] == 6
+
+
+def test_normalize_context_state_payload_strips_unverified_reasoning_claims():
+    payload = ConversationContextCompactionService._normalize_context_state_payload(
+        {
+            "version": "conversation_context_state.v3",
+            "active_topic": "AG News tuning",
+            "user_goal": "确认为什么脚本反复处理 8 个数据集",
+            "constraints": ["只处理 AG News"],
+            "open_questions": [],
+            "resolved_facts": [
+                "classification-results.sh 第 86 行有 for i in {0..7}",
+                "我们将使用 fix-classification.sh 替代",
+            ],
+            "evidence_ledger": [],
+            "decision_state": {
+                "status": "blocked",
+                "evidence_status": "sufficient",
+                "next_action": "report_blocker",
+                "blocked_reason": "repo_patch_required",
+                "allowed_actions": ["report_blocker"],
+                "repo_edit_allowed": False,
+            },
+            "last_reasoning_summary": "blocker 已移除，因为我们将使用 fix-classification.sh 替代",
+        },
+        turn_count=1,
+        evidence_candidates=[],
+    )
+
+    assert payload is not None
+    assert payload["resolved_facts"] == ["classification-results.sh 第 86 行有 for i in {0..7}"]
+    assert not payload.get("last_reasoning_summary")
+    assert payload["decision_state"]["next_action"] == "report_blocker"

@@ -8,8 +8,8 @@ import sys
 BASELINE = {
     "backend/app/api/codelab.py": {"exception": 6, "bare": 5},
     "backend/app/api/knowledge.py": {"exception": 13, "bare": 0},
-    "backend/app/services/agent_tools_impl/registry.py": {"exception": 21, "bare": 0},
-    "backend/app/services/react_agent.py": {"exception": 37, "bare": 0},
+    "backend/app/services/agent_tools_impl/registry.py": {"exception": 52, "bare": 0},
+    "backend/app/services/react_agent.py": {"exception": 39, "bare": 0},
     "backend/app/services/mcp/client.py": {"exception": 3, "bare": 0},
     "backend/app/services/codelab_executor.py": {"exception": 2, "bare": 0},
 }

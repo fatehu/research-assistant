@@ -97,6 +97,33 @@ async def test_rewrite_generates_multi_strategy_variants(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_rewrite_llm_call_marks_source(monkeypatch):
+    service = QueryRewriteService()
+    monkeypatch.setattr(settings, "enable_query_rewrite", True)
+    monkeypatch.setattr(settings, "query_rewrite_skip_short_chars", 1)
+
+    captured = {}
+
+    class _FakeLLM:
+        provider = "test"
+        config = {"model": "test-model", "api_key": "fake"}
+
+        async def chat(self, *args, **kwargs):
+            captured["source"] = kwargs.get("source")
+            return {
+                "content": '{"synonym_queries":["agent search"],"hyde_document":"","sub_queries":[]}'
+            }
+
+    monkeypatch.setattr(service, "_ensure_llm_service", lambda: _FakeLLM())
+    monkeypatch.setattr(service, "_llm_available", lambda: True)
+
+    result = await service.rewrite_query("agentic search", rewrite_mode="force", requested_strategies=["synonym"])
+
+    assert result.enabled is True
+    assert captured["source"] == "retrieval.query_rewrite"
+
+
+@pytest.mark.asyncio
 async def test_rewrite_default_light_profile_only_uses_synonym(monkeypatch):
     service = QueryRewriteService()
     monkeypatch.setattr(settings, "enable_query_rewrite", True)

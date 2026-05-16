@@ -14,7 +14,13 @@ from loguru import logger
 
 from app.config import settings
 from app.services.dashscope_multimodal_service import DashScopeMultimodalService
-from app.services.llm_service import get_llm_service
+from app.services.llm_service import (
+    build_llm_source_headers,
+    get_llm_service,
+    log_tagged_llm_request_done,
+    log_tagged_llm_request_error,
+    log_tagged_llm_request_start,
+)
 from app.services.reader_component_contract_service import ReaderComponentContractService
 from app.services.reader_compose_agent_core import ReaderComposeAgentCore
 from app.services.reader_compose_agent_tools import (
@@ -503,6 +509,13 @@ class ReaderComposeAgentRuntime:
         )
 
         async def _request(include_images: bool) -> Any:
+            source = "reader.compose.direct_review"
+            log_tagged_llm_request_start(
+                source=source,
+                provider=str(getattr(llm, "provider", "") or ""),
+                model=str(llm.config["model"]),
+                operation="chat_with_tools",
+            )
             return await llm.client.chat.completions.create(
                 model=llm.config["model"],
                 messages=[
@@ -521,6 +534,7 @@ class ReaderComposeAgentRuntime:
                 tool_choice={"type": "function", "function": {"name": "emit_review_patch"}},
                 temperature=0.2,
                 max_tokens=max(900, int(getattr(settings, "reader_agent_max_tokens", 7000) or 7000) // 3),
+                extra_headers=build_llm_source_headers(source) or None,
             )
 
         response = None
@@ -536,11 +550,25 @@ class ReaderComposeAgentRuntime:
         try:
             response = await _request(include_images=True)
         except Exception as exc:
+            log_tagged_llm_request_error(
+                source="reader.compose.direct_review",
+                provider=str(getattr(llm, "provider", "") or ""),
+                model=str(llm.config["model"]),
+                operation="chat_with_tools",
+                error=f"{type(exc).__name__}: {exc}",
+            )
             if had_images:
                 logger.warning(f"[ReaderComposeAgentRuntime] direct review with images failed, retrying text-only: {exc}")
                 try:
                     response = await _request(include_images=False)
                 except Exception as retry_exc:
+                    log_tagged_llm_request_error(
+                        source="reader.compose.direct_review",
+                        provider=str(getattr(llm, "provider", "") or ""),
+                        model=str(llm.config["model"]),
+                        operation="chat_with_tools",
+                        error=f"{type(retry_exc).__name__}: {retry_exc}",
+                    )
                     logger.warning(f"[ReaderComposeAgentRuntime] direct review text-only retry failed: {retry_exc}")
                     return {
                         "used": False,
@@ -577,6 +605,20 @@ class ReaderComposeAgentRuntime:
                 "agent_trace": [],
                 "agent_tool_calls": [],
             }
+
+        usage_obj = getattr(response, "usage", None)
+        log_tagged_llm_request_done(
+            source="reader.compose.direct_review",
+            provider=str(getattr(llm, "provider", "") or ""),
+            model=str(getattr(response, "model", "") or llm.config.get("model") or ""),
+            operation="chat_with_tools",
+            finish_reason=str(getattr((getattr(response, "choices", None) or [None])[0], "finish_reason", "") or ""),
+            usage={
+                "prompt_tokens": int(getattr(usage_obj, "prompt_tokens", 0) or 0),
+                "completion_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
+                "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
+            },
+        )
 
         ui_ops, ui_ops_errors = self._contract.validate_and_sanitize_ui_ops(
             list(parsed.get("ui_ops") or []),

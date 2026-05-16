@@ -34,7 +34,13 @@ from app.models.knowledge import Document, KnowledgeBase
 from app.models.literature import Paper, PaperReaderComponentOverlay, PaperReaderPageCache
 from app.services.dashscope_multimodal_service import DashScopeMultimodalService
 from app.services.literature_reader_service import get_literature_reader_service
-from app.services.llm_service import get_llm_service
+from app.services.llm_service import (
+    build_llm_source_headers,
+    get_llm_service,
+    log_tagged_llm_request_done,
+    log_tagged_llm_request_error,
+    log_tagged_llm_request_start,
+)
 from app.services.reader_component_contract_service import get_reader_component_contract_service
 from app.services.reader_compose_agent_state import ReaderComposeAgentState
 from app.services.reader_compose_agent_runtime import get_reader_compose_agent_runtime
@@ -522,6 +528,8 @@ class LiteratureReaderComposeService:
         publish_ready_event_enabled: bool = False,
         progress_callback: Optional[ReaderComposeProgressCallback] = None,
     ) -> Tuple[Dict[str, Any], ReaderComposeBuildMeta]:
+        # 来源签名（source signature）会纳入用户可见选项和来源材料，因此即使是同一页，
+        # 缓存命中也不会跨越风格、细节级别或知识库边界。
         page_num = max(1, int(page))
         parser_force_refresh = bool(force_refresh)
         compose_force_refresh = bool(force_refresh or regenerate)
@@ -575,6 +583,8 @@ class LiteratureReaderComposeService:
         )
 
         if not compose_force_refresh:
+            # 缓存 Redis 是快速路径；每次命中仍会按当前运行时契约修复后，
+            # 再应用用户 overlay。
             cached_payload = await self._read_payload_from_redis(redis_key)
             if isinstance(cached_payload, dict):
                 if self._should_rebuild_cached_payload(cached_payload):
@@ -653,6 +663,8 @@ class LiteratureReaderComposeService:
                 pipeline_version=pipeline_version,
             )
             if isinstance(compatible_cached_row, dict):
+                # 只有 canonical source 前缀匹配时才复用兼容 DB 行；随后把请求的
+                # 完整签名写回 payload，确保下游 overlay 仍然按用户隔离。
                 logger.info(
                     "[ReaderComposeService] reuse compatible compose cache "
                     f"paper={paper.id} page={page_num} requested_sig={sig_hash} "
@@ -719,6 +731,8 @@ class LiteratureReaderComposeService:
             f"paper={paper.id} page={page_num} acquired={bool(lock_token)} compose_force_refresh={compose_force_refresh}"
         )
         if lock_token is None:
+            # 重复构建通常比等待更昂贵；新请求会多等一会儿，给进行中的 worker
+            # 写入可复用缓存的机会，而 force-refresh 保持较短的交互预算。
             waited = 0.0
             wait_limit = LOCK_WAIT_SECONDS if compose_force_refresh else LOCK_RESULT_WAIT_SECONDS
             waiting_notice_emitted = False
@@ -7113,6 +7127,8 @@ class LiteratureReaderComposeService:
             paper_title=paper.title,
             paper_pdf_path=paper.pdf_path,
         )
+        # 页面渲染会被文本分组、图像重建和锚点预览复用，因此在进入
+        # 模型相关分支前只解析一次。
         page_image_asset = self._resolve_reader_page_image_asset(
             paper_id=int(paper.id),
             page=int(page),
@@ -7126,6 +7142,8 @@ class LiteratureReaderComposeService:
             if isinstance(row, Mapping)
         ]
         if not layout_atoms:
+            # 没有 layout atoms 时 UID 流水线无法确定性地定位组件；
+            # 单 agent 路径仍可生成页面。
             return await self._build_single_agent_v2_result(
                 db=db,
                 user_id=user_id,
@@ -9961,6 +9979,14 @@ class LiteratureReaderComposeService:
         ]
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        source = f"reader.compose.single_agent_v2.{step}.{phase}"
+        extra_headers = build_llm_source_headers(source)
+        log_tagged_llm_request_start(
+            source=source,
+            provider="aliyun",
+            model=model_name,
+            operation="chat",
+        )
         try:
             response = await asyncio.wait_for(
                 client.chat.completions.create(
@@ -9973,10 +9999,18 @@ class LiteratureReaderComposeService:
                     max_tokens=max_tokens,
                     response_format={"type": "json_object"},
                     timeout=request_timeout,
+                    extra_headers=extra_headers or None,
                 ),
                 timeout=request_timeout + 1.0,
             )
         except Exception as exc:  # pragma: no cover - network/provider failures expected at runtime
+            log_tagged_llm_request_error(
+                source=source,
+                provider="aliyun",
+                model=model_name,
+                operation="chat",
+                error=f"{type(exc).__name__}: {exc}",
+            )
             logger.warning(
                 f"[ReaderComposeService] single_agent_v2 model call failed "
                 f"step={step} phase={phase} model={model_name}: {type(exc).__name__}: {exc}"
@@ -9997,6 +10031,14 @@ class LiteratureReaderComposeService:
             "completion_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
             "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
         }
+        log_tagged_llm_request_done(
+            source=source,
+            provider="aliyun",
+            model=str(getattr(response, "model", "") or model_name),
+            operation="chat",
+            finish_reason=str(getattr((getattr(response, "choices", None) or [None])[0], "finish_reason", "") or ""),
+            usage=usage,
+        )
         return {
             "status": str(parsed.get("status") or ""),
             "step_result": dict(parsed.get("step_result") or {}),
@@ -12981,15 +13023,23 @@ class LiteratureReaderComposeService:
                     normalized["bbox_hint"] = None
             return [normalized]
 
+        paper_title = str(getattr(paper, "title", "") or "Untitled Paper")
+        paper_venue = str(getattr(paper, "venue", "") or "")
+        paper_year = getattr(paper, "year", None)
+        raw_authors = list(getattr(paper, "authors", None) or [])
+        author_names = [
+            str(item.get("name") or "") if isinstance(item, Mapping) else str(item or "")
+            for item in raw_authors[:10]
+        ]
         components.append(
             {
                 "id": next_id("header"),
                 "type": "PaperHeaderCard",
                 "props": {
-                    "title": str(paper.title or "Untitled Paper"),
-                    "venue": str(paper.venue or ""),
-                    "year": int(paper.year) if paper.year else None,
-                    "authors": [str(item.get("name") or "") for item in list(paper.authors or [])[:10]],
+                    "title": paper_title,
+                    "venue": paper_venue,
+                    "year": int(paper_year) if paper_year else None,
+                    "authors": author_names,
                 },
                 "children": [],
                 "source_anchor_refs": [],
@@ -13002,16 +13052,19 @@ class LiteratureReaderComposeService:
         )
 
         metadata_items: List[Dict[str, Any]] = []
-        if paper.doi:
-            metadata_items.append({"label": "DOI", "value": str(paper.doi)})
-        if paper.venue:
-            metadata_items.append({"label": "Venue", "value": str(paper.venue)})
-        if paper.year:
-            metadata_items.append({"label": "Year", "value": str(paper.year)})
-        if paper.pdf_url:
-            metadata_items.append({"label": "PDF", "value": str(paper.pdf_url)})
-        if paper.url:
-            metadata_items.append({"label": "Paper", "value": str(paper.url)})
+        paper_doi = str(getattr(paper, "doi", "") or "")
+        paper_pdf_url = str(getattr(paper, "pdf_url", "") or "")
+        paper_url = str(getattr(paper, "url", "") or "")
+        if paper_doi:
+            metadata_items.append({"label": "DOI", "value": paper_doi})
+        if paper_venue:
+            metadata_items.append({"label": "Venue", "value": paper_venue})
+        if paper_year:
+            metadata_items.append({"label": "Year", "value": str(paper_year)})
+        if paper_pdf_url:
+            metadata_items.append({"label": "PDF", "value": paper_pdf_url})
+        if paper_url:
+            metadata_items.append({"label": "Paper", "value": paper_url})
 
         components.append(
             {

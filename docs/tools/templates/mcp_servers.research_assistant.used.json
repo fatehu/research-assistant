@@ -1,0 +1,46 @@
+{
+  "mcpServers": {
+    "tavily": {
+      "enabled": true,
+      "type": "http",
+      "transport": "streamable_http",
+      "url": "https://mcp.tavily.com/mcp/?tavilyApiKey=${MCP_TAVILY_API_KEY}"
+    },
+    "firecrawl": {
+      "enabled": true,
+      "type": "http",
+      "transport": "streamable_http",
+      "url": "https://mcp.firecrawl.dev/${MCP_FIRECRAWL_API_KEY}/v2/mcp"
+    },
+    "web_internal": {
+      "enabled": true,
+      "type": "http",
+      "transport": "streamable_http",
+      "url": "http://mcp_web:8091/mcp"
+    },
+    "literature_internal": {
+      "enabled": true,
+      "type": "http",
+      "transport": "streamable_http",
+      "url": "http://mcp_literature:8092/mcp"
+    },
+    "filesystem": {
+      "enabled": false,
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/app"],
+      "transport": "stdio"
+    },
+    "fetch": {
+      "enabled": false,
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-fetch"],
+      "transport": "stdio"
+    },
+    "sequential-thinking": {
+      "enabled": false,
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "transport": "stdio"
+    }
+  }
+}

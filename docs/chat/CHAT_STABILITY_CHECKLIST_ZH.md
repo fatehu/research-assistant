@@ -12,6 +12,7 @@
 配套背景文档见：
 
 - [Chat 上下文管理对比与差距分析](./CHAT_CONTEXT_MANAGEMENT_COMPARISON_ZH.md)
+- [Chat Item Stream、Replay 与压缩边界说明](./CHAT_CONTEXT_ITEM_STREAM_REPLAY_ZH.md)
 
 ## 1. 当前结论
 

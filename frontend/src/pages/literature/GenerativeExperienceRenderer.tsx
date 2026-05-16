@@ -253,6 +253,8 @@ function buildManuscriptSlotEvidenceKey(
   slot: Pick<TeachingManuscriptSlotView, 'slotId' | 'slotKind' | 'targetIds' | 'fullEvidenceTargetIds' | 'anchorExcerpt'>,
   fallbackTargetIds: string[] = [],
 ): string {
+  // 优先使用 source target ID 而不是展示文本，避免模型给同一底层 block
+  // 使用不同标签时重复生成 evidence card。
   const targetToken = dedupeTrimmedText([
     ...slot.targetIds,
     ...slot.fullEvidenceTargetIds,
@@ -392,6 +394,8 @@ function tokenizeManuscriptCopyWithSlots(
     const key = normalizeKeyToken(slot.slotId)
     if (key) slotLookup.set(key, slot)
   })
+  // 后端同时接受显式 slot ID 和宽松的 slot-kind 提示；缺少 ID 时，
+  // 这个 fallback 让旧版 manuscript 文案仍可渲染。
   const pickSlot = (slotToken: string, slotIdToken: string) => {
     const normalizedId = normalizeKeyToken(slotIdToken)
     if (normalizedId && slotLookup.has(normalizedId)) return slotLookup.get(normalizedId) || null
@@ -814,6 +818,8 @@ export function GenerativeExperienceRenderer(props: GenerativeExperienceRenderer
       const key = normalizeKeyToken(slot.slotId)
       if (key) rootSlotLookup.set(key, slot)
     })
+    // 段内 slots 可以有意覆盖根级 slots；缺失字段继续继承根级 binding，
+    // 让手写 manuscript 保持紧凑。
     const mergeSlotWithRoot = (slot: TeachingManuscriptSlotView): TeachingManuscriptSlotView => {
       const root = rootSlotLookup.get(normalizeKeyToken(slot.slotId))
       if (!root) return slot
@@ -2452,6 +2458,8 @@ export function GenerativeExperienceRenderer(props: GenerativeExperienceRenderer
     const supportContextSeen = new Set<string>()
     const result: ReaderExperienceGuidedBeat[] = []
     for (const beat of guidedBeats) {
+      // 规划器重试可能返回 ID 不同但语义等价的 beats；按面向读者的
+      // 标题/摘要去重，避免 UI 重复展示同一指导。
       const beatType = normalizeKeyToken(beat.beat_type || '')
       const beatTitle = normalizeKeyToken(preferDisplayCopy(beat.display_title, beat.title))
       const beatSummary = normalizeKeyToken(preferDisplayCopy(beat.display_summary, beat.summary))
@@ -2477,6 +2485,8 @@ export function GenerativeExperienceRenderer(props: GenerativeExperienceRenderer
     for (const beat of dedupedGuidedBeats) {
       const beatType = normalizeKeyToken(beat.beat_type || '')
       if (PRIMARY_GUIDED_BEAT_TYPES.has(beatType)) {
+        // 主 beats 开启新的 guided segment；相邻 concept/context beats
+        // 挂到最近的 primary beat 上，以保留后端 story 顺序。
         const segment = { primary: beat, support: [] as ReaderExperienceGuidedBeat[] }
         segments.push(segment)
         orderedItems.push({ kind: 'segment', segment })

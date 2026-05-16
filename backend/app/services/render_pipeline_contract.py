@@ -776,6 +776,8 @@ def build_canonical_atom_bundle(
             elif role in _EXCLUDED_ROLE_HINTS:
                 excluded_reason = "excluded_role"
 
+            # 被排除的 atoms 保留在 bundle 中用于诊断，但只有可用 atoms
+            # 可以成为组件 ownership 目标。
             atom = {
                 "atom_id": atom_id,
                 "page": int(page),
@@ -1113,6 +1115,8 @@ def build_deterministic_baseline_slots(
         component = default_component if default_component in allowed_set else "ParagraphProse"
         if component not in allowed_set and allowed_set:
             component = sorted(list(allowed_set))[0]
+        # 基线 slots 是确定性 fallback 输出：一个组件拥有一个 atom，
+        # 这样后续 gates 不依赖模型也能验证完整覆盖。
         slots.append(
             {
                 "slot_id": f"slot_{idx:03d}",
@@ -1157,6 +1161,8 @@ def enforce_minimal_gates(
     usable_set = {str(item).strip() for item in list(usable_atom_ids or []) if str(item).strip()}
     full_coverage = usable_set.issubset(set(used_atoms))
     non_empty_plan = (len(components) > 0) if bool(non_empty_input) else True
+    # 最小 gates 在主观质量评分前保护 renderer contract：schema、白名单、
+    # 单一 ownership 和完整 source coverage。
     passed = bool(schema_valid and whitelist_valid and ownership_unchanged and full_coverage and non_empty_plan)
     return {
         "schema_valid": bool(schema_valid),

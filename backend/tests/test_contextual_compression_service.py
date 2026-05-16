@@ -26,6 +26,15 @@ def test_extract_json_from_fenced_payload():
     assert "Transformer" in payload["relevant_content"]
 
 
+def test_normalize_relevant_content_moves_source_label_to_front():
+    content = ContextualCompressionService._normalize_relevant_content(
+        "Agentic search enables dynamic search and tool use [来源3]",
+        "来源3",
+    )
+
+    assert content == "[来源3] Agentic search enables dynamic search and tool use"
+
+
 @pytest.mark.asyncio
 async def test_compress_chunk_disabled(monkeypatch):
     service = ContextualCompressionService()
@@ -61,9 +70,11 @@ async def test_compress_chunk_success(monkeypatch):
     monkeypatch.setattr(settings, "enable_contextual_compression", True)
     monkeypatch.setattr(settings, "contextual_compression_min_relevance", 4.0)
     monkeypatch.setattr(service, "_llm_available", lambda: True)
+    captured = {}
 
     class _FakeLLM:
         async def chat(self, *args, **kwargs):
+            captured["source"] = kwargs.get("source")
             return {
                 "content": (
                     '{"relevant_content":"[来源1] Transformer 的核心机制是自注意力。",'
@@ -80,6 +91,7 @@ async def test_compress_chunk_success(monkeypatch):
     assert result.relevance_score == 8.5
     assert "[来源1]" in result.relevant_content
     assert "自注意力" in result.relevant_content
+    assert captured["source"] == "retrieval.contextual_compression.single"
 
 
 @pytest.mark.asyncio

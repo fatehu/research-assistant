@@ -14,9 +14,12 @@ from app.core.rate_limit import build_rate_limit_dependency
 from app.services.literature_reader_compose_service import get_literature_reader_compose_service
 from app.services.conversation_context_compaction_service import get_conversation_context_compaction_service
 from app.services.retrieval_warmup_service import get_retrieval_warmup_service
+from app.services.agent_runtime_service import get_agent_runtime_service
+from app.services.agent_tools import ToolRegistry
 from app.api import (
     auth, users, chat, health, knowledge, literature, codelab,
-    admin, mentor, student, invitations, share, announcements, mcp
+    admin, mentor, student, invitations, share, announcements, mcp, projects, docx_templates,
+    literature_reviews
 )
 
 from app.api.chunking import router as chunking_router
@@ -99,12 +102,39 @@ async def lifespan(app: FastAPI):
         bool(retrieval_warmup_report.get("background_task_running")),
         retrieval_warmup_report.get("components") or [],
     )
+    mcp_warmup_report = await ToolRegistry.warmup_shared_mcp_tools(force_refresh=False)
+    logger.info(
+        "[MCPWarmupStartup] enabled={} status={} tool_count={} error={}",
+        bool(mcp_warmup_report.get("enabled")),
+        mcp_warmup_report.get("status"),
+        int(mcp_warmup_report.get("tool_count") or 0),
+        str(mcp_warmup_report.get("error") or ""),
+    )
     compaction_report = get_conversation_context_compaction_service().start_background_worker()
     logger.info(
         "[ConversationCompactionStartup] enabled={} running={} queued={}",
         bool(compaction_report.get("enabled")),
         bool(compaction_report.get("running")),
         int(compaction_report.get("queued") or 0),
+    )
+
+    stale_run_report = {"enabled": False, "cleaned_count": 0, "cleaned_runs": []}
+    if bool(getattr(settings, "agent_run_stale_cleanup_on_startup", True)):
+        stale_run_report = await get_agent_runtime_service().cleanup_stale_runs()
+    logger.info(
+        "[AgentRunCleanupStartup] enabled={} cleaned_count={} timeout_seconds={}",
+        bool(getattr(settings, "agent_run_stale_cleanup_on_startup", True)),
+        int(stale_run_report.get("cleaned_count") or 0),
+        int(stale_run_report.get("timeout_seconds") or 0),
+    )
+    stale_turn_report = {"enabled": False, "cleaned_count": 0, "cleaned_turns": []}
+    if bool(getattr(settings, "agent_run_stale_cleanup_on_startup", True)):
+        stale_turn_report = await get_agent_runtime_service().cleanup_stale_conversation_turns()
+    logger.info(
+        "[ConversationTurnCleanupStartup] enabled={} cleaned_count={} timeout_seconds={}",
+        bool(getattr(settings, "agent_run_stale_cleanup_on_startup", True)),
+        int(stale_turn_report.get("cleaned_count") or 0),
+        int(stale_turn_report.get("timeout_seconds") or 0),
     )
 
     recovery_report = await knowledge.resume_interrupted_document_tasks_on_startup()
@@ -186,6 +216,9 @@ app.include_router(users.router, prefix="/api/v1/users", tags=["用户"])
 app.include_router(chat.router, prefix="/api/v1/chat", tags=["对话"], dependencies=[Depends(chat_rate_limit)])
 app.include_router(knowledge.router, prefix="/api/v1/knowledge", tags=["知识库"], dependencies=[Depends(knowledge_rate_limit)])
 app.include_router(literature.router, prefix="/api/v1", tags=["文献管理"])
+app.include_router(literature_reviews.router, prefix="/api/v1", tags=["文献综述"])
+app.include_router(projects.router, prefix="/api/v1", tags=["研究项目"])
+app.include_router(docx_templates.router, prefix="/api/v1", tags=["DOCX 模板"])
 app.include_router(codelab.router, prefix="/api/v1/codelab", tags=["代码实验室"], dependencies=[Depends(codelab_rate_limit)])
 app.include_router(mcp.router, prefix="/api/v1/mcp", tags=["MCP 管理"])
 

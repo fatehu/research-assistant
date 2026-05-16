@@ -6,6 +6,7 @@ import {
   ExpandOutlined,
   LeftOutlined,
   LinkOutlined,
+  PlusOutlined,
   PushpinOutlined,
   QuestionCircleOutlined,
   ReloadOutlined,
@@ -41,6 +42,8 @@ import {
 import { Document as PdfDocument, Page as PdfPage, pdfjs } from 'react-pdf'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math'
+import rehypeKatex from 'rehype-katex'
 import {
   AnnotationType,
   CommentFilter,
@@ -90,6 +93,7 @@ import {
 import { renderNormalizedInlineText, renderReaderComponentTree } from './readerComponents'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
+import 'katex/dist/katex.min.css'
 import './composedReader.css'
 
 const { Title, Text, Paragraph } = Typography
@@ -2458,6 +2462,25 @@ export default function PaperReaderPage() {
   const [collectionReadiness, setCollectionReadiness] = useState<CollectionKnowledgeReadiness | null>(null)
   const [collectionReadinessLoading, setCollectionReadinessLoading] = useState<boolean>(false)
   const [asking, setAsking] = useState<boolean>(false)
+  const askSessionOptions = useMemo(
+    () =>
+      askSessions.map((item) => {
+        const title = String(item.title || '未命名问题').trim()
+        const updatedAt = String(item.updated_at || '').replace('T', ' ').slice(0, 16)
+        return {
+          label: (
+            <div style={{ maxWidth: 680, whiteSpace: 'normal' }}>
+              <div style={{ fontWeight: 500, lineHeight: 1.4 }}>{title}</div>
+              <div style={{ color: '#64748b', fontSize: 12, marginTop: 2 }}>{updatedAt}</div>
+            </div>
+          ),
+          title: `${title}${updatedAt ? ` · ${updatedAt}` : ''}`,
+          searchText: `${title} ${updatedAt}`,
+          value: item.id,
+        }
+      }),
+    [askSessions],
+  )
 
   const [readPage, setReadPage] = useState<number>(1)
   const [zoomPercent, setZoomPercent] = useState<number>(120)
@@ -3163,22 +3186,33 @@ export default function PaperReaderPage() {
       paper_id?: number
       collection_id?: number
       limit: number
+      offset: number
     } = {
       scope: scopeValue,
-      limit: 50,
+      limit: 100,
+      offset: 0,
     }
     if (scopeValue === 'paper') {
       params.paper_id = parsedPaperId
     } else if (collectionId) {
       params.collection_id = collectionId
     }
-    const data = await literatureApi.getAskSessions(params)
-    setAskSessions(data)
+
+    const sessions: LiteratureAskSession[] = []
+    while (true) {
+      const page = await literatureApi.getAskSessions(params)
+      sessions.push(...page)
+      if (page.length < params.limit) break
+      params.offset += params.limit
+    }
+    setAskSessions(sessions)
   }
 
   const reloadAskMessages = async (sessionId: number | undefined) => {
     if (!sessionId) {
       setAskMessages([])
+      setAskAnswer('')
+      setAskSources([])
       return
     }
     const data = await literatureApi.getAskMessages(sessionId, { limit: 200 })
@@ -3187,6 +3221,9 @@ export default function PaperReaderPage() {
     if (latestAssistant) {
       setAskAnswer(latestAssistant.content)
       setAskSources(Array.isArray(latestAssistant.sources) ? latestAssistant.sources : [])
+    } else {
+      setAskAnswer('')
+      setAskSources([])
     }
   }
 
@@ -3339,6 +3376,8 @@ export default function PaperReaderPage() {
       resolveAvailableKbId(requestedKbId)
       ?? resolveAvailableKbId(cachedReader?.selected_kb_id)
       ?? resolveAvailableKbId(nextSession.selected_kb_id)
+      ?? resolveAvailableKbId(nextLinks.find((item) => normalizeKnowledgeLinkStatus(item.status) === 'completed')?.knowledge_base_id)
+      ?? resolveAvailableKbId(nextLinks[0]?.knowledge_base_id)
     setSelectedKbId(fallbackKb)
     lastSavedReaderSignatureRef.current = JSON.stringify({
       page: restoredPage,
@@ -4023,7 +4062,7 @@ export default function PaperReaderPage() {
   }, [askSessionId])
 
   useEffect(() => {
-    if (askScope !== 'collection' || !askCollectionId || !selectedKbId) {
+    if (askScope !== 'collection' || !askCollectionId) {
       setCollectionReadiness(null)
       setCollectionReadinessLoading(false)
       return
@@ -4313,8 +4352,17 @@ export default function PaperReaderPage() {
     }
   }
 
+  const handleNewAskSession = () => {
+    setAskSessionId(undefined)
+    setAskMessages([])
+    setAskAnswer('')
+    setAskSources([])
+    setAskQuestion('')
+    message.success('已开始新对话')
+  }
+
   const handleAsk = async () => {
-    if (!validPaperId || !selectedKbId || !askQuestion.trim()) {
+    if (!validPaperId || !askQuestion.trim()) {
       message.warning('请补全提问参数')
       return
     }
@@ -4327,7 +4375,7 @@ export default function PaperReaderPage() {
       collectionReadiness &&
       !collectionReadiness.can_cross_paper_answer
     ) {
-      message.warning('当前收藏夹在所选知识库暂无 completed 论文，请先入库后再询问')
+      message.warning('当前收藏夹暂无 completed 入库论文，请先加入任意知识库并等待处理完成')
       return
     }
 
@@ -4340,12 +4388,18 @@ export default function PaperReaderPage() {
           scope: askScope,
           paper_id: askScope === 'paper' ? parsedPaperId : undefined,
           collection_id: askScope === 'collection' ? askCollectionId : undefined,
-          knowledge_base_id: selectedKbId,
+          knowledge_base_id: selectedKbId && selectedKbId > 0 ? selectedKbId : undefined,
           question: askQuestion.trim(),
           mode: askMode,
           session_id: askSessionId,
         },
         (event, data) => {
+          if (event === 'start') {
+            const resolvedKbId = Number(data?.knowledge_base_id || 0)
+            if (Number.isFinite(resolvedKbId) && resolvedKbId > 0) {
+              setSelectedKbId(resolvedKbId)
+            }
+          }
           if (event === 'token') {
             const token = String(data?.text || '')
             setAskAnswer((prev) => prev + token)
@@ -5122,7 +5176,8 @@ export default function PaperReaderPage() {
         }}
       >
         <ReactMarkdown
-          remarkPlugins={[remarkGfm]}
+          remarkPlugins={[remarkGfm, remarkMath]}
+          rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: 'ignore' }] as any]}
           components={{
             p: ({ children }) => (
               <p style={{ margin: '0 0 14px', color: activeWorkspaceStyle.bodyColor, lineHeight: 1.85 }}>
@@ -6825,12 +6880,13 @@ export default function PaperReaderPage() {
                             />
                           ) : null}
                           <Select
-                            placeholder="选择知识库"
+                            allowClear
+                            placeholder="优先知识库（可选，默认自动）"
                             options={kbOptions}
                             value={selectedKbId}
                             onChange={(v) => setSelectedKbId(v)}
                           />
-                          {askScope === 'collection' && askCollectionId && selectedKbId ? (
+                          {askScope === 'collection' && askCollectionId ? (
                             collectionReadinessLoading ? (
                               <Space>
                                 <Spin size="small" />
@@ -6848,7 +6904,7 @@ export default function PaperReaderPage() {
                                 description={(
                                   <Space direction="vertical" size={6} style={{ width: '100%' }}>
                                     <Text type="secondary">
-                                      联合回答仅覆盖 `completed` 状态论文；未入库/处理中/失败论文不会参与本轮答案。
+                                      联合回答仅覆盖 `completed` 状态论文；如选择了优先知识库会优先使用它，否则自动使用任意已入库知识库。
                                     </Text>
                                     <Space wrap size={6}>
                                       <Tag color="green">completed: {collectionReadiness.completed_papers}</Tag>
@@ -6869,19 +6925,32 @@ export default function PaperReaderPage() {
                               />
                             ) : null
                           ) : null}
-                          <Select
-                            placeholder="会话历史（仅自己可见）"
-                            value={askSessionId}
-                            allowClear
-                            onChange={(v) => {
-                              const next = Number(v || 0)
-                              setAskSessionId(next > 0 ? next : undefined)
-                            }}
-                            options={askSessions.map((item) => ({
-                              label: `${item.title || '未命名问题'} · ${String(item.updated_at || '').replace('T', ' ').slice(0, 16)}`,
-                              value: item.id,
-                            }))}
-                          />
+                          <Space.Compact style={{ width: '100%' }}>
+                            <Select
+                              style={{ flex: 1 }}
+                              placeholder="会话历史（仅自己可见）"
+                              value={askSessionId}
+                              allowClear
+                              showSearch
+                              optionLabelProp="title"
+                              popupMatchSelectWidth={false}
+                              listHeight={360}
+                              dropdownStyle={{ maxWidth: 720, minWidth: 520 }}
+                              filterOption={(input, option) =>
+                                String(option?.searchText || '')
+                                  .toLowerCase()
+                                  .includes(input.trim().toLowerCase())
+                              }
+                              onChange={(v) => {
+                                const next = Number(v || 0)
+                                setAskSessionId(next > 0 ? next : undefined)
+                              }}
+                              options={askSessionOptions}
+                            />
+                            <Button icon={<PlusOutlined />} disabled={asking} onClick={handleNewAskSession}>
+                              新对话
+                            </Button>
+                          </Space.Compact>
                           <TextArea
                             rows={3}
                             value={askQuestion}
@@ -6920,23 +6989,31 @@ export default function PaperReaderPage() {
                                 ? `${item.page}${item.page_source === 'estimated' ? '（估算）' : ''}`
                                 : '未知'
                               return (
-                                <List.Item
-                                  actions={[
-                                    <Button key="jump" size="small" onClick={() => void jumpToSource(item)}>
-                                      跳转
-                                    </Button>,
-                                  ]}
-                                >
-                                  <Space direction="vertical" size={2}>
-                                    <Text strong>{`[来源${Number(item.idx || itemIndex + 1)}] ${item.document_name}`}</Text>
+                                <List.Item>
+                                  <Space direction="vertical" size={2} style={{ width: '100%', minWidth: 0 }}>
+                                    <div
+                                      style={{
+                                        display: 'flex',
+                                        alignItems: 'flex-start',
+                                        justifyContent: 'space-between',
+                                        gap: 8,
+                                        width: '100%',
+                                        minWidth: 0,
+                                      }}
+                                    >
+                                      <Text strong style={{ minWidth: 0, flex: 1 }}>
+                                        {`[来源${Number(item.idx || itemIndex + 1)}] ${item.document_name}`}
+                                      </Text>
+                                      <Button size="small" onClick={() => void jumpToSource(item)}>
+                                        跳转
+                                      </Button>
+                                    </div>
                                     <Space wrap size={4}>
                                       <Tag>页码: {pageTextValue}</Tag>
                                       {item.section_title ? <Tag color="blue">章节: {item.section_title}</Tag> : null}
-                                      {item.score_source === 'fallback' || item.score == null ? (
-                                        <Tag color="default">分数: 无（回退检索）</Tag>
-                                      ) : (
-                                        <Tag>分数: {item.score}</Tag>
-                                      )}
+                                      {item.score_source !== 'fallback' && item.score != null ? (
+                                        <Tag>FTS分数: {item.score}</Tag>
+                                      ) : null}
                                     </Space>
                                     <Text>{item.snippet}</Text>
                                   </Space>

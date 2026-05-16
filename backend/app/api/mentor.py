@@ -53,13 +53,77 @@ async def get_my_students(
     db: AsyncSession = Depends(get_db)
 ):
     """获取我的学生列表"""
+    conversation_counts = (
+        select(
+            Conversation.user_id.label("user_id"),
+            func.count(Conversation.id).label("conversation_count"),
+        )
+        .group_by(Conversation.user_id)
+        .subquery()
+    )
+    knowledge_base_counts = (
+        select(
+            KnowledgeBase.user_id.label("user_id"),
+            func.count(KnowledgeBase.id).label("knowledge_base_count"),
+        )
+        .group_by(KnowledgeBase.user_id)
+        .subquery()
+    )
+    paper_counts = (
+        select(
+            Paper.user_id.label("user_id"),
+            func.count(Paper.id).label("paper_count"),
+        )
+        .group_by(Paper.user_id)
+        .subquery()
+    )
+    notebook_counts = (
+        select(
+            Notebook.user_id.label("user_id"),
+            func.count(Notebook.id).label("notebook_count"),
+        )
+        .group_by(Notebook.user_id)
+        .subquery()
+    )
+
     result = await db.execute(
-        select(User)
+        select(
+            User,
+            func.coalesce(conversation_counts.c.conversation_count, 0).label(
+                "conversation_count"
+            ),
+            func.coalesce(knowledge_base_counts.c.knowledge_base_count, 0).label(
+                "knowledge_base_count"
+            ),
+            func.coalesce(paper_counts.c.paper_count, 0).label("paper_count"),
+            func.coalesce(notebook_counts.c.notebook_count, 0).label("notebook_count"),
+        )
+        .outerjoin(conversation_counts, conversation_counts.c.user_id == User.id)
+        .outerjoin(knowledge_base_counts, knowledge_base_counts.c.user_id == User.id)
+        .outerjoin(paper_counts, paper_counts.c.user_id == User.id)
+        .outerjoin(notebook_counts, notebook_counts.c.user_id == User.id)
         .where(User.mentor_id == current_user.id)
         .order_by(User.joined_at.desc())
     )
-    students = result.scalars().all()
-    return [StudentResponse.model_validate(s) for s in students]
+    students = []
+    for (
+        student,
+        conversation_count,
+        knowledge_base_count,
+        paper_count,
+        notebook_count,
+    ) in result.all():
+        students.append(
+            StudentResponse.model_validate(student).model_copy(
+                update={
+                    "conversation_count": conversation_count or 0,
+                    "knowledge_base_count": knowledge_base_count or 0,
+                    "paper_count": paper_count or 0,
+                    "notebook_count": notebook_count or 0,
+                }
+            )
+        )
+    return students
 
 
 @router.get("/students/count")

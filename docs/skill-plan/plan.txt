@@ -1,0 +1,1132 @@
+这次我给你的不是泛泛建议，而是一版 **新的阶段计划 + runtime-worker 加固方案 + tool 审查结论**。每一项都按：
+
+* 目标
+* 条件
+* 改动
+* 验收标准
+
+来写。
+
+先给总判断：
+
+## 总判断
+
+你这套系统现在的优势已经很明显：
+
+* 有 truth files（`implementation_spec`、`run_drafts`）
+* 有 `runtime-worker`
+* 有 execution continuation
+* 有 repo 探索、runtime inspection、execution spec/write/read/start 这套工具骨架
+
+真正的问题不是“缺一个大 prompt”，而是：
+
+> **skill 控制面、tool 设计、runtime-worker、阶段编排，还没有被设计成同一个系统。**
+
+而 Codex、Claude Code、OpenCode 这类系统能稳，不是因为 prompt 更会写，而是因为它们都在强调几件事：
+
+* **任务在受控 sandbox/workspace 中执行**
+* **环境是一致的、可重复的**
+* **工具是显式的，不是无限 shell**
+* **会话可以恢复、并行、持续观察**
+* **项目配置和权限是分层的** ([OpenAI][1])
+
+所以你的新版设计，也应该照这个思路走：
+**skill 是控制面，runtime-worker 是执行面，tool 是受限能力面，artifact 是真相面。**
+
+---
+
+# 一、我建议的新版阶段计划
+
+我建议把当前 5 段改成 7 段：
+
+1. `intake_summary`
+2. `grounding`
+3. `implementation_plan`
+4. `run_qualification`
+5. `execution_preflight`
+6. `execution_run`
+7. `analysis_tuning_report`
+
+这不是为了“更复杂”，而是把现在混在一起的责任拆开。
+
+---
+
+## 阶段 1：`intake_summary`
+
+**目的**：先把论文讲明白，同时形成复现目标。
+
+### 目标
+
+第一阶段同时产出两类资产：
+
+* 复现导向
+* 讲解 / 研究导向
+
+### 产物
+
+保留：
+
+* `planning/paper_intake_result.json`
+* `planning/experiment_spec.json`
+
+新增：
+
+* `planning/paper_summary.json`
+* 可选：`planning/paper_summary.md`
+
+### `paper_summary.json` 必须包含
+
+* 问题定义
+* 核心方法
+* 方法流程 / 架构
+* 关键实验
+* 主结果
+* claimed contributions
+* 局限 / 假设
+* 术语表
+* reproduction risks
+* tuning hypotheses
+* verification questions
+* 面向读者的讲解提纲
+
+### 允许工具
+
+* `paper_research_status`
+* `paper_research_prepare`
+
+### 环境条件
+
+* 只依赖 saved paper / PDF intake / markdown fallback
+* **不依赖 runtime-worker**
+* **不依赖 repo clone**
+* **不做 execution**
+
+### 退出条件
+
+* 论文来源模式已明确（PDF markdown / fallback）
+* `paper_summary` 能回答“这篇论文在做什么、怎么做、为什么有效、最难复现什么”
+* 所有未知项被显式记录
+* 不允许在这一阶段脑补 repo path / command / entrypoint
+
+### 验收标准
+
+满足以下才算通过：
+
+* 归档成功写出 `paper_summary.json`
+* AI 能仅依赖第一阶段产物回答：
+
+  * 论文解决什么问题
+  * 核心方法是什么
+  * 关键实验是什么
+  * 最重要的 claim 是什么
+  * 复现最大风险是什么
+  * 后续适合验证什么
+* 回答中不出现 repo/path/脚本级幻觉
+
+---
+
+## 阶段 2：`grounding`
+
+**目的**：把 repo、dataset、runtime、external dependency 做成“证据闭环”。
+
+### 目标
+
+后续执行会依赖的关键事实，全部进入以下三态之一：
+
+* `grounded`
+* `absent`
+* `blocked`
+
+### 产物
+
+新增：
+
+* `specs/grounding_report.json`
+
+### `grounding_report.json` 必须包含
+
+* repo 状态
+* repo URL 存活 / cloneability
+* repo commit / branch
+* entrypoint 候选与确认状态
+* dataset 状态
+* external dependency 状态
+* runtime 状态
+* blockers
+* next actions
+* gate fields：
+
+  * `repo_grounded`
+  * `entrypoint_grounded`
+  * `dataset_grounded`
+  * `runtime_grounded`
+  * `external_dependencies_grounded`
+
+### 允许工具
+
+当前 skill 里应该正式纳入：
+
+* `paper_research_clone_repo`
+* `paper_research_get_artifact_manifest`
+* `paper_research_read_artifact`
+* `paper_research_read_repo_file`
+* `paper_research_search_repo`
+* `paper_research_inspect_runtime`
+* `paper_research_probe_repo`
+* `paper_research_probe_url`
+
+只在官方证据失效时，才允许：
+
+* `web_search`
+* `web_scrape`
+
+### 环境条件
+
+* 允许 repo clone
+* 允许 artifact / repo file / runtime inspection
+* **不允许 start_execution**
+* runtime-worker 只提供 `/tools` / inspection，不提供 run
+
+### 退出条件
+
+以下维度必须全部被分类：
+
+* repo
+* entrypoint
+* dataset
+* runtime
+* external URLs
+
+不能停留在“可能”“也许”“应该”。
+
+### 验收标准
+
+满足以下才算通过：
+
+* `grounding_report.json` 写出
+* 所有关键字段进入 `grounded|absent|blocked`
+* 记录 repo commit SHA 或明确无 repo
+* 对每个 blocker 都有具体原因，不是泛泛的“环境未知”
+
+---
+
+## 阶段 3：`implementation_plan`
+
+**目的**：把证据闭环转成真正的复现实施计划。
+
+### 目标
+
+生成一份不是“边猜边写”的 `implementation_spec`。
+
+### 产物
+
+* `specs/implementation_spec.json`
+
+### 允许工具
+
+* `paper_research_write_implementation_spec`
+* `paper_research_read_implementation_spec`
+
+### 环境条件
+
+* 不执行
+* 不写 execution 脚本
+* 只读 grounding + planning 产物
+
+### `implementation_spec` 必须明确表达
+
+* 当前状态：`planning_only | draftable | blocked`
+* baseline 路线
+* data plan
+* runtime plan
+* patch / override policy
+* blockers
+* `readiness.can_create_run_draft`
+* `readiness.can_execute`
+
+### 退出条件
+
+* `readiness.can_create_run_draft = true`
+  或
+* 明确 blocked，并说明原因
+
+### 验收标准
+
+满足以下才算通过：
+
+* `implementation_spec.json` 写出
+* 不存在路径类型混淆
+* 不存在“可执行”但没有 grounded entrypoint / runtime / data plan 的情况
+* 对 blocked 场景有具体 blocker codes
+
+---
+
+## 阶段 4：`run_qualification`
+
+**目的**：把实施计划拆成具体运行路线，并明确哪些能跑、哪些不能。
+
+### 目标
+
+`run_drafts` 不再只是“草案集合”，而是“草案 + 资格判定”。
+
+### 产物
+
+* `drafts/run_drafts.json`
+
+### 允许工具
+
+* `paper_research_write_run_drafts`
+* `paper_research_read_run_drafts`
+
+### 每个 draft 必须新增
+
+* `prerequisites`
+* `blocking_reasons`
+* `can_materialize_execution_spec`
+* `can_start_execution`
+* `readiness.status`：
+
+  * `planning_only`
+  * `preflight_ready`
+  * `execution_ready`
+  * `blocked`
+
+### 环境条件
+
+* 不执行
+* 不允许写 execution script 作为兜底
+* 只依赖 planning + grounding + implementation
+
+### 退出条件
+
+至少有一个 draft 达到：
+
+* `preflight_ready`
+
+### 验收标准
+
+满足以下才算通过：
+
+* `run_drafts.json` 中每个 draft 都带 readiness
+* draft 不是“存在就等于可执行”
+* prerequisite 和 blocker 被结构化表达
+
+---
+
+## 阶段 5：`execution_preflight`
+
+**目的**：单独回答一句话——现在到底能不能启动 execution。
+
+这是最关键的一段。
+
+### 目标
+
+把“能写 execution_spec”与“有资格 start_execution”彻底分开。
+
+### 产物
+
+* `executions/{execution_id}/execution_spec.json`
+* 其中必须带 `preflight_summary`
+
+### 允许工具
+
+* `paper_research_inspect_runtime`
+* `paper_research_write_execution_spec`
+* `paper_research_read_execution_spec`
+
+helper scripts：
+
+* `scripts/check_runtime_environment.py`
+* `scripts/render_execution_spec.py`
+
+建议新增：
+
+* `paper_research_write_execution_patch`（或同等能力）
+
+  * 只允许写到 execution worktree
+  * 不允许改 canonical repo/source
+
+### 环境条件
+
+* 允许 runtime inspection
+* 允许 external dependency probe
+* 允许生成 execution-scoped files
+* **仍然不自动 start_execution**
+
+### 必须检查
+
+至少包括：
+
+* `implementation_spec.readiness.can_execute`
+* draft readiness = `execution_ready`
+* unresolved blockers 为空
+* prerequisites 完成
+* runtime-worker availability
+* tool availability
+* entrypoint / cwd / path typing 正确
+* external dependencies 已 verified 或已 blocked
+* repo SHA 已记录
+
+### 退出条件
+
+只能得到两种结论：
+
+* `ready_to_start`
+* `blocked`
+
+不能再出现：
+
+* “spec 写成功了，所以往下跑”
+
+### 验收标准
+
+满足以下才算通过：
+
+* `execution_spec.json` 通过 deterministic render
+* spec 中不含 raw shell wrapper、模糊路径、未归类文件
+* `preflight_summary.decision` 必须是 `ready_to_start|blocked`
+* `blocked` 时给出阻塞原因与最小下一步
+
+---
+
+## 阶段 6：`execution_run`
+
+**目的**：真正运行，并把结果沉淀回系统。
+
+### 目标
+
+执行只发生在 preflight 通过后。
+
+### 产物
+
+* `executions/{execution_id}/execution_result.json`
+* `executions/{execution_id}/execution.log`
+
+必要时回写：
+
+* `specs/implementation_spec.json`
+* `drafts/run_drafts.json`
+
+### 允许工具
+
+* `paper_research_start_execution`
+* `paper_research_read_execution`
+* `paper_research_cancel_execution`
+
+### 环境条件
+
+这一阶段才真正依赖 runtime-worker 执行能力：
+
+* `plain-python`
+* `papermill`
+* `dockerfile`
+* `docker_compose`
+* `repo2docker`
+* `devcontainer`
+
+同时依赖：
+
+* background execution
+* continuation manager
+* runtime cache
+* execution-scoped writable workspace
+
+### 退出条件
+
+* `completed`
+* `failed`
+* `blocked`
+* `cancelled`
+
+### 验收标准
+
+满足以下才算通过：
+
+* 一定产生 `execution_result.json`
+* 一定产生 `execution.log`
+* result 中包含：
+
+  * runtime type
+  * repo SHA
+  * cwd
+  * argv
+  * generated files / patches
+  * elapsed_ms
+* 长任务能通过 continuation 回到会话
+* run 结束后 canonical repo/source 不被污染
+
+---
+
+## 阶段 7：`analysis_tuning_report`
+
+**目的**：把 baseline 结果、论文总结、compare、tuning 统一起来。
+
+### 目标
+
+先分析，再给选项，再决定要不要回到执行。
+
+### 产物
+
+保留：
+
+* `reports/compare_report.json`
+
+建议新增：
+
+* `reports/tuning_options.json`
+
+### 允许工具
+
+当前至少要读：
+
+* `paper_summary`
+* `implementation_spec`
+* `execution_result`
+* `compare_report`
+
+建议新增：
+
+* `paper_research_write_tuning_options`
+* `paper_research_read_tuning_options`
+
+### 环境条件
+
+* 默认不执行
+* 只有用户确认 tuning option，才回到阶段 5 / 6
+
+### 退出条件
+
+* 给出 grounded tuning options
+  或
+* 明确说明当前不适合调优
+
+### 验收标准
+
+满足以下才算通过：
+
+* `compare_report` 或 `tuning_options` 写出
+* 至少每个 tuning option 都有：
+
+  * target metric
+  * knob / module
+  * expected direction
+  * evidence basis
+  * risk
+  * prerequisites
+* 没有“先调了再说”的盲调
+
+---
+
+# 二、runtime-worker 加固方案
+
+这里是你最该参考 Codex / Claude Code / OpenCode 的地方。
+
+Codex 的关键是 **每个任务独立 sandbox，仓库预装进来，工具和 workspace 显式给出**；Claude Code 的关键是 **devcontainer 一致性 + 隔离 + 防火墙/权限边界**；OpenCode 更强调 **local-first、多会话、LSP 辅助导航**。这些原则不要求你照抄产品，但非常适合拿来加固你的 `runtime-worker`。 ([OpenAI][1])
+
+我建议你做 6 个硬改动。
+
+---
+
+## 1）把 worker 分成两档
+
+**目标**：降低 `docker.sock + root` 带来的风险和漂移。
+
+### 现状
+
+你现在的 `runtime-worker`：
+
+* root 运行
+* 挂载 `/var/run/docker.sock`
+* 同时承担 inspection 和 heavy execution
+
+这太重了。
+
+### 改动
+
+拆成两个 profile：
+
+### A. `runtime-inspect-worker`
+
+用于：
+
+* `inspect_runtime`
+* preflight
+* URL / repo probe
+* plain metadata checks
+
+特征：
+
+* **不挂 docker.sock**
+* 不做 container build
+* 默认无网络或极小白名单
+
+### B. `runtime-exec-worker`
+
+用于：
+
+* `dockerfile`
+* `docker_compose`
+* `repo2docker`
+* `devcontainer`
+* heavy runs
+
+特征：
+
+* 可以挂 docker.sock
+* 只在阶段 6 被调度
+* 只接收 preflight 通过的 spec
+
+### 验收标准
+
+* `plain-python` / `papermill` 预检任务不再走 privileged worker
+* 无 Docker 需求的项目，即使 worker 有问题，也不暴露 docker.sock
+* 日志里能看出 execution 被调度到了哪个 worker profile
+
+---
+
+## 2）把 canonical repo/source 变成只读真相源
+
+**目标**：解决“改了代码但没落实”与 repo 污染。
+
+### 改动
+
+不要直接在 canonical `repo/source` 上做 execution 改动。
+改成：
+
+* canonical repo/source：只读真相源
+* 每个 execution：单独 materialize 一个 execution worktree / overlay copy
+
+例如：
+
+* `executions/{execution_id}/worktree/`
+* `executions/{execution_id}/generated/`
+* `executions/{execution_id}/patches/`
+
+generated script、config override、patch 都写这里。
+
+### 验收标准
+
+* 任一 execution 后，canonical repo/source hash 不变
+* 任一 patch/script/config 都能追溯到 execution_id
+* “代码修改没有落实”问题，能在 worktree 中直接定位
+
+---
+
+## 3）禁止 raw shell，自始至终只走 structured execution spec
+
+**目标**：提高可验证性，减少路径/命令幻觉。
+
+### 改动
+
+`render_execution_spec.py` 只允许输出结构化字段，例如：
+
+* `runtime_type`
+* `repo_root_relative_path`
+* `cwd_type`
+* `cwd_path`
+* `entrypoint_type`
+* `entrypoint_path`
+* `argv`
+* `generated_files`
+* `patches`
+* `artifacts_expected`
+
+不要让 agent 传大段 shell wrapper。
+
+### 验收标准
+
+* 所有 execution spec 都能被 deterministic render
+* 不允许 `bash -lc "..."` 这类自由命令进入 worker
+* 审计日志能明确看到 argv、cwd、generated files、patches
+
+---
+
+## 4）加 network policy
+
+**目标**：把“探测外链”和“真正联网执行”分开。
+
+### 改动
+
+分三档网络：
+
+### A. stage 2 probe
+
+* 只允许 `probe_repo` / `probe_url`
+* 只做 HEAD / range bytes / `git ls-remote`
+
+### B. stage 5 preflight
+
+* 允许 runtime metadata check
+* 不允许大下载
+
+### C. stage 6 execution
+
+* 默认最小白名单
+* 对需要 pip / hf / kaggle / 官方下载的 repo，必须在 spec 里明确声明
+
+这点非常像 Claude devcontainer 的思路：
+不是“不联网”，而是 **联网要分权、分阶段、可审计**。 ([Claude API Docs][2])
+
+### 验收标准
+
+* 每次 execution 都记录访问了哪些域名
+* 非白名单外链会 blocked，不是静默失败
+* 官方 URL 测活与真实下载不再混成一个阶段
+
+---
+
+## 5）加资源配额和失败类型
+
+**目标**：让 worker 坚固，而不是“跑挂了只知道失败”。
+
+### 改动
+
+每个 execution 需要有：
+
+* CPU limit
+* memory limit
+* wall-clock timeout
+* optional idle timeout
+
+失败要结构化区分：
+
+* `timeout`
+* `oom`
+* `tool_missing`
+* `network_blocked`
+* `external_dependency_unavailable`
+* `invalid_spec`
+* `runtime_error`
+
+### 验收标准
+
+* 超时/OOM 不是模糊失败
+* `execution_result.json` 中有明确 error class
+* 不会因为一个 runaway task 拖垮整个 worker
+
+---
+
+## 6）执行结果里增加 reproducibility manifest
+
+**目标**：让结果可审计、可恢复、可比较。
+
+### 改动
+
+每次 run 都记录：
+
+* repo SHA
+* branch / default branch
+* runtime type
+* worker profile
+* tool availability snapshot
+* package snapshot（至少关键包）
+* argv / cwd
+* generated files / patches
+* execution start/end time
+* network destinations（摘要）
+
+### 验收标准
+
+* 任何 execution_result 都能回答“你到底在什么环境下跑的”
+* compare/tuning 阶段能基于 manifest 做差异比较
+* 失败案例可以复盘，不用再猜
+
+---
+
+# 三、tool 设计审查：哪些合理，哪些不够
+
+## 结论先说
+
+### 当前已经比较好的
+
+这些工具骨架是合理的：
+
+* `paper_research_status`
+* `paper_research_prepare`
+* `paper_research_clone_repo`
+* `paper_research_get_artifact_manifest`
+* `paper_research_read_artifact`
+* `paper_research_read_repo_file`
+* `paper_research_search_repo`
+* `paper_research_inspect_runtime`
+* `paper_research_write/read_implementation_spec`
+* `paper_research_write/read_run_drafts`
+* `paper_research_write/read_execution_spec`
+* `paper_research_start/read/cancel_execution`
+
+### 当前不够的
+
+主要缺 5 类能力：
+
+---
+
+## 1）probe 工具没进 skill 主流程
+
+**问题**：`paper_research_probe_repo`、`paper_research_probe_url` 已经实现了，但没有成为 skill 的正式阶段工具。
+
+### 改动
+
+把它们加入：
+
+* `skill.yaml` 的 `enforced_tool_names`
+* grounding / preflight 阶段说明
+* `chat.py` 的 stage hint 映射
+
+### 验收标准
+
+* grounding 阶段可以先探测 repo/url 再决定 clone/download
+* 不再靠 web 搜索替代官方链接测活
+
+---
+
+## 2）repo exploration 基本够，notebook exploration 还不够
+
+**判断**
+
+* 对文本型 repo：当前工具基本够探索
+* 对 notebook-heavy repo：还不够
+
+### 原因
+
+`.ipynb` 直接当 repo file 读，效果很差。agent 很难稳定看到：
+
+* cell 结构
+* imports
+* parameters
+* outputs
+* notebook 执行入口
+
+### 改动
+
+二选一：
+
+### 方案 A
+
+扩展 `paper_research_read_repo_file`：
+
+* `mode=text|notebook_structure|notebook_cells|notebook_parameters`
+
+### 方案 B
+
+新增：
+
+* `paper_research_read_notebook`
+
+我更推荐 A，避免工具爆炸。
+
+### 验收标准
+
+* agent 可以不读整份 notebook JSON，就知道 notebook 的 cell 结构和参数入口
+* papermill 路线能在阶段 2/4 就被识别出来
+
+---
+
+## 3）缺 grounding report / tuning options 的读写工具
+
+**问题**
+你准备新增的阶段产物：
+
+* `grounding_report.json`
+* `tuning_options.json`
+
+如果没有对应工具，skill 会断层。
+
+### 改动
+
+建议新增：
+
+* `paper_research_write_grounding_report`
+* `paper_research_read_grounding_report`
+* `paper_research_write_tuning_options`
+* `paper_research_read_tuning_options`
+
+或者做一个很窄的通用工具：
+
+* `paper_research_write_structured_artifact`
+* `paper_research_read_structured_artifact`
+
+但不要做成无限制任意写文件。
+
+### 验收标准
+
+* 新阶段的 truth files 都能被正式读写
+* `check_artifact_contract.py` 能校验这些新产物
+
+---
+
+## 4）execution script 需要“补丁化”，不能只会写整段脚本
+
+**问题**
+现在 `paper_research_write_execution_script` 有价值，但太容易变成万能兜底。
+
+### 改动
+
+新增一个更合理的能力：
+
+* `paper_research_write_execution_patch`
+  或
+* 在 execution spec 中支持 `patches`
+
+原则：
+
+* patch 只允许写到 execution worktree
+* 不允许改 canonical repo/source
+* patch 必须是 reviewable / diffable
+
+### 验收标准
+
+* 遇到小兼容性修复时，不必总是整段重写 variant script
+* patch 能被审计和复用
+* “修改没落实”时能定位到 patch 是否被应用
+
+---
+
+## 5）不要给 agent 直接的 raw shell tool
+
+**判断**
+不建议新增“任意 shell”给 chat agent。
+
+这点很重要。
+
+Codex / Agents SDK 的思路不是“无限 shell”，而是 **受控 workspace + 明确工具 + 受控 sandbox**。 ([OpenAI][3])
+
+### 建议
+
+继续维持：
+
+* exploration 走 read/search/probe tools
+* execution 走 structured spec + runtime-worker
+
+### 验收标准
+
+* agent 无法绕过 stage gates 直接跑任意命令
+* 所有执行都能追溯到 execution_spec
+
+---
+
+# 四、你这套 skill 最终该怎么落地
+
+## 需要改的文件
+
+至少包括：
+
+### skill 层
+
+* `.agents/skills/paper-reproduction/SKILL.md`
+* `.agents/skills/paper-reproduction/skill.yaml`
+* `.agents/skills/paper-reproduction/references/*.md`
+* `.agents/skills/paper-reproduction/scripts/*.py`
+
+### 后端编排层
+
+* `backend/app/api/chat.py`
+* `backend/app/services/project_service.py`
+* `backend/app/services/react_agent.py`
+* `backend/app/services/agent_skill_service.py`
+
+### tool / runtime 层
+
+* `backend/app/services/agent_tools_impl/registry.py`
+* `backend/app/services/project_runtime_service.py`
+* `backend/app/runtime_worker/main.py`
+
+### artifact registry
+
+* `_CANONICAL_FILE_SPECS` 所在逻辑
+
+---
+
+# 五、每个 helper script 的新职责
+
+既然这些脚本实际存在，我建议直接这么改：
+
+## `render_stage_prompt.py`
+
+**目标**：不再只渲染阶段标题，而是渲染：
+
+* 本阶段目标
+* 允许工具
+* 禁止动作
+* 进入下一阶段条件
+* 本阶段要写的 artifact
+
+**验收标准**
+
+* 每个阶段启动 prompt 都明确：
+
+  * 现在应该做什么
+  * 不能做什么
+  * 做完如何判定通过
+
+---
+
+## `check_artifact_contract.py`
+
+**目标**：校验新 artifact contract：
+
+* `paper_summary`
+* `grounding_report`
+* `implementation_spec`
+* `run_drafts`
+* `tuning_options`
+
+**验收标准**
+
+* 任何 truth file 缺字段或 gate 不一致时，会返回结构化错误
+* 阶段通过不再只看“文件存在”，而看“文件合格”
+
+---
+
+## `check_runtime_environment.py`
+
+**目标**：不只是查包，还要输出 preflight 所需结构：
+
+* worker profile
+* tool availability
+* runtime availability
+* key package availability
+* blocked reasons
+
+**验收标准**
+
+* stage 2/5 都能直接消费这个结果
+* 不再需要模型自己从自然语言里猜环境状态
+
+---
+
+## `render_execution_spec.py`
+
+**目标**：强制 execution spec 结构化，强制路径类型清晰。
+
+**必须支持**
+
+* `repo_relative_path`
+* `execution_relative_path`
+* `workspace_relative_path`
+* `generated_files`
+* `patches`
+* `expected_artifacts`
+* `preflight_summary`
+
+**验收标准**
+
+* spec 不再出现模糊 path
+* rendered spec 能直接进入 runtime-worker
+
+---
+
+# 六、最小落地顺序
+
+按这个顺序做，你每一步都能看到明显效果。
+
+## 第一步
+
+扩展第一阶段，加入 `paper_summary`
+
+**目标**
+
+* 让 skill 先会“讲论文”，再谈复现
+
+**验收标准**
+
+* `paper_summary.json` 可归档
+* AI 可稳定解释论文与复现风险
+
+---
+
+## 第二步
+
+加入 `grounding` 阶段 + probe tools
+
+**目标**
+
+* repo/data/runtime/external dependency 先闭环
+
+**验收标准**
+
+* `grounding_report.json` 可归档
+* 不再在事实模糊时写 execution spec
+
+---
+
+## 第三步
+
+把 `run_drafts` 升级成 `run_qualification`
+
+**目标**
+
+* draft 和 executable 分开
+
+**验收标准**
+
+* 每个 draft 带 readiness
+* 草案不再自动触发 execution
+
+---
+
+## 第四步
+
+把 execution 拆成 `execution_preflight` + `execution_run`
+
+**目标**
+
+* 把“能写 spec”和“能执行”彻底分开
+
+**验收标准**
+
+* 没有 `ready_to_start` 就绝不 start
+* 未满足条件不再误启动
+
+---
+
+## 第五步
+
+加固 runtime-worker：双 profile + worktree + preflight manifest
+
+**目标**
+
+* 让 worker 更坚固，执行更可审计
+
+**验收标准**
+
+* canonical repo/source 不被污染
+* 每次 execution 都可复盘
+* 非必要任务不再接触 docker.sock
+
+---
+
+## 第六步
+
+补 notebook-aware exploration 和 tuning artifacts
+
+**目标**
+
+* 让 agent 真能完整探索 repo/notebook，并持续优化
+
+**验收标准**
+
+* notebook-heavy repo 不再是盲区
+* tuning 变成可恢复工作流，而不是一次性口头输出
+
+---
+
+# 最后一条结论
+
+如果只用一句话概括这次新方案：
+
+> **你要把 `paper-reproduction` 从“一个会继续往前冲的 skill”，改造成“一个由 truth files、阶段 gates、受限 tools 和分层 sandbox 共同驱动的复现系统”。**
+
+而且从你当前代码基础看，这不是推倒重来。
+你已经有 60% 骨架了。真正要补的是：
+
+* 第一阶段的 `paper_summary`
+* 第二阶段的 `grounding`
+* 第五阶段的 `execution_preflight`
+* runtime-worker 的隔离与 worktree
+* notebook / patch / tuning 这三个缺口
+
+你把这 5 件事补齐，这套系统就会从“能跑”升级成“能稳定地研究、复现、解释和优化”。
+
+[1]: https://openai.com/index/introducing-codex/ "https://openai.com/index/introducing-codex/"
+[2]: https://docs.anthropic.com/en/docs/claude-code/devcontainer "https://docs.anthropic.com/en/docs/claude-code/devcontainer"
+[3]: https://openai.com/index/the-next-evolution-of-the-agents-sdk "https://openai.com/index/the-next-evolution-of-the-agents-sdk"

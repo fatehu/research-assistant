@@ -1,0 +1,4 @@
+display_name: "Paper2Code"
+short_description: "Run the upstream Paper2Code pipeline in an isolated demo workspace"
+default_prompt: "Use $paper2code to prepare or run an isolated Paper2Code demo."
+

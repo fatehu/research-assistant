@@ -58,7 +58,31 @@ def test_codelab_executor_allows_common_ml_modules():
 
 
 def test_codelab_executor_allows_common_python_builtins():
+    assert '"__build_class__"' in _WORKER_CODE
     assert '"format"' in _WORKER_CODE
     assert '"getattr"' in _WORKER_CODE
     assert '"hasattr"' in _WORKER_CODE
+    assert '"object"' in _WORKER_CODE
+    assert '"super"' in _WORKER_CODE
     assert '"type"' in _WORKER_CODE
+
+
+def test_codelab_executor_supports_class_definitions():
+    executor = CodeLabExecutor(notebook_id="test-class-definition", hard_timeout_seconds=20)
+    try:
+        result = executor.execute(
+            "class Demo(object):\n"
+            "    def __init__(self, value):\n"
+            "        self.value = value\n"
+            "\n"
+            "    def render(self):\n"
+            "        return f'value={self.value}'\n"
+            "\n"
+            "item = Demo(3)\n"
+            "print(item.render())\n",
+            timeout_seconds=15,
+        )
+        assert result["success"] is True
+        assert any("value=3" in (output.get("content") or "") for output in result["outputs"])
+    finally:
+        executor.close()

@@ -93,6 +93,32 @@ const formatEvidenceLedgerSummary = (
     .join('；')
 }
 
+const formatDecisionStateSummary = (
+  decisionState: ConversationContextState['decision_state'] | undefined,
+): string => {
+  if (!decisionState) return ''
+  const parts: string[] = []
+  if (decisionState.status) {
+    parts.push(`状态: ${decisionState.status}`)
+  }
+  if (decisionState.evidence_status) {
+    parts.push(`证据: ${decisionState.evidence_status}`)
+  }
+  if (decisionState.next_action) {
+    parts.push(`下一步: ${decisionState.next_action}`)
+  }
+  if (decisionState.blocked_reason) {
+    parts.push(`阻塞: ${decisionState.blocked_reason}`)
+  }
+  if (decisionState.allowed_actions?.length) {
+    parts.push(`允许动作: ${decisionState.allowed_actions.join(' / ')}`)
+  }
+  if (typeof decisionState.repo_edit_allowed === 'boolean') {
+    parts.push(`可改 repo/source: ${decisionState.repo_edit_allowed ? '是' : '否'}`)
+  }
+  return parts.join('；')
+}
+
 const Section = ({ title, icon, children, emptyText }: SectionProps) => {
   const hasContent = Boolean(children)
   return (
@@ -181,6 +207,131 @@ const MessagePreviewList = ({
   )
 }
 
+const SkillMatchList = ({
+  items,
+  emptyText,
+  tone = 'neutral',
+}: {
+  items?: ChatContextDebug['active_skills']
+  emptyText: string
+  tone?: 'neutral' | 'active'
+}) => {
+  if (!items || items.length === 0) {
+    return <div className="text-sm text-slate-500">{emptyText}</div>
+  }
+
+  const accentClass =
+    tone === 'active'
+      ? 'border-emerald-400/18 bg-emerald-500/10 text-emerald-200'
+      : 'border-white/[0.08] bg-slate-950/70 text-slate-300'
+
+  return (
+    <div className="space-y-2">
+      {items.map((item) => (
+        <div
+          key={`${item.name}-${item.path || item.activation_reason || 'skill'}`}
+          className="rounded-xl border border-white/[0.06] bg-slate-900/72 px-3 py-2.5"
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <span className={`rounded-full border px-2.5 py-1 text-[11px] ${accentClass}`}>
+              {item.display_name || item.name}
+            </span>
+            {typeof item.score === 'number' ? (
+              <span className="rounded-full border border-cyan-400/18 bg-cyan-500/10 px-2.5 py-1 text-[11px] text-cyan-200">
+                score {item.score}
+              </span>
+            ) : null}
+          </div>
+          {item.description ? (
+            <div className="mt-2 text-sm leading-6 text-slate-200">{item.description}</div>
+          ) : null}
+          {item.short_description ? (
+            <div className="mt-1 text-xs leading-5 text-slate-400">{item.short_description}</div>
+          ) : null}
+          {item.when_to_use ? (
+            <div className="mt-1 text-xs leading-5 text-slate-400">触发说明: {item.when_to_use}</div>
+          ) : null}
+          {item.stage_names && item.stage_names.length > 0 ? (
+            <div className="mt-2 text-xs leading-5 text-slate-400">
+              阶段: {item.stage_names.join(' -> ')}
+            </div>
+          ) : null}
+          {item.stage_policies && item.stage_policies.length > 0 ? (
+            <div className="mt-1 flex flex-wrap gap-2 text-[11px] text-slate-400">
+              {item.stage_policies.map((policy) => (
+                <span
+                  key={`${item.name}-stage-${policy}`}
+                  className="rounded-full border border-cyan-400/18 bg-cyan-500/10 px-2 py-0.5 text-cyan-200"
+                >
+                  {policy}
+                </span>
+              ))}
+            </div>
+          ) : null}
+          {item.default_continue_policy ? (
+            <div className="mt-1 text-xs leading-5 text-slate-400">
+              默认继续策略: {item.default_continue_policy}
+            </div>
+          ) : null}
+          {item.scripts && item.scripts.length > 0 ? (
+            <div className="mt-1 text-xs leading-5 text-slate-400">
+              辅助脚本: {item.scripts.join(', ')}
+            </div>
+          ) : null}
+          {item.default_prompt ? (
+            <div className="mt-1 text-xs leading-5 text-slate-400">默认入口: {item.default_prompt}</div>
+          ) : null}
+          <div className="mt-1 flex flex-wrap gap-2 text-[11px] text-slate-500">
+            {item.activation_reason ? (
+              <span className="rounded-full border border-fuchsia-400/18 bg-fuchsia-500/10 px-2 py-0.5 text-fuchsia-200">
+                {item.activation_reason}
+              </span>
+            ) : null}
+            {item.execution_context ? (
+              <span className="rounded-full border border-amber-400/18 bg-amber-500/10 px-2 py-0.5 text-amber-200">
+                context {item.execution_context}
+              </span>
+            ) : null}
+            {item.agent ? (
+              <span className="rounded-full border border-sky-400/18 bg-sky-500/10 px-2 py-0.5 text-sky-200">
+                agent {item.agent}
+              </span>
+            ) : null}
+            {item.effort ? (
+              <span className="rounded-full border border-lime-400/18 bg-lime-500/10 px-2 py-0.5 text-lime-200">
+                effort {item.effort}
+              </span>
+            ) : null}
+            {typeof item.user_invocable === 'boolean' ? (
+              <span className="rounded-full border border-white/[0.08] bg-slate-950/70 px-2 py-0.5">
+                {item.user_invocable ? '可显式调用' : '仅内部调用'}
+              </span>
+            ) : null}
+            {typeof item.allow_implicit_invocation === 'boolean' ? (
+              <span className="rounded-full border border-white/[0.08] bg-slate-950/70 px-2 py-0.5">
+                {item.allow_implicit_invocation ? '允许隐式触发' : '仅显式触发'}
+              </span>
+            ) : null}
+            {item.path ? (
+              <span className="rounded-full border border-white/[0.08] bg-slate-950/70 px-2 py-0.5">{item.path}</span>
+            ) : null}
+            {item.config_path ? (
+              <span className="rounded-full border border-white/[0.08] bg-slate-950/70 px-2 py-0.5">
+                {item.config_path}
+              </span>
+            ) : null}
+            {item.interface_path ? (
+              <span className="rounded-full border border-white/[0.08] bg-slate-950/70 px-2 py-0.5">
+                {item.interface_path}
+              </span>
+            ) : null}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 const ContextDebugWindow = ({
   contextDebug,
   conversationState = null,
@@ -194,7 +345,7 @@ const ContextDebugWindow = ({
   isCompacting = false,
   onManualCompact,
 }: ContextDebugWindowProps) => {
-  const [expanded, setExpanded] = useState(true)
+  const [expanded, setExpanded] = useState(false)
   const [detailsExpanded, setDetailsExpanded] = useState(false)
   const activeConversationState = conversationState || contextDebug?.conversation_state || null
   const activeCompactedHistory = conversationCompactedHistory || null
@@ -299,8 +450,34 @@ const ContextDebugWindow = ({
     return null
   }
 
+  if (!expanded) {
+    return (
+      <div className="pointer-events-none fixed right-4 bottom-[60px] z-40">
+        <motion.button
+          type="button"
+          layout
+          whileHover={{ scale: 1.04 }}
+          whileTap={{ scale: 0.96 }}
+          onClick={() => setExpanded(true)}
+          title="展开上下文窗口"
+          className="pointer-events-auto relative flex h-[52px] w-[52px] items-center justify-center rounded-full border border-emerald-300/25 bg-slate-950/90 text-emerald-100 shadow-[0_18px_42px_rgba(2,6,23,0.42)] backdrop-blur-2xl transition hover:border-emerald-200/45 hover:bg-emerald-400/10"
+        >
+          <BranchesOutlined className="text-lg" />
+          {isSending ? (
+            <span className="absolute -right-0.5 -top-0.5 h-3 w-3 rounded-full border border-slate-950 bg-emerald-400 shadow-[0_0_18px_rgba(52,211,153,0.7)]" />
+          ) : null}
+          {contextDebug?.context_truncated ? (
+            <span className="absolute -bottom-0.5 -right-0.5 h-4 w-4 rounded-full border border-slate-950 bg-amber-400 text-[9px] font-bold text-amber-950">
+              !
+            </span>
+          ) : null}
+        </motion.button>
+      </div>
+    )
+  }
+
   return (
-    <div className="pointer-events-none fixed right-4 bottom-[104px] z-40 w-[min(420px,calc(100vw-1.5rem))]">
+    <div className="pointer-events-none fixed right-4 bottom-[60px] z-40 w-[min(420px,calc(100vw-1.5rem))]">
       <motion.div
         layout
         className="pointer-events-auto overflow-hidden rounded-[24px] border border-white/[0.08] bg-slate-950/88 shadow-[0_20px_60px_rgba(2,6,23,0.42)] backdrop-blur-2xl"
@@ -560,6 +737,35 @@ const ContextDebugWindow = ({
                   ) : null}
                 </Section>
 
+                <Section title="Skills" icon={<DatabaseOutlined />}>
+                  {contextDebug ? (
+                    <div className="space-y-3">
+                      <div>
+                        <div className="mb-1.5 text-xs font-medium uppercase tracking-[0.14em] text-slate-500">
+                          已激活
+                        </div>
+                        <SkillMatchList
+                          items={contextDebug.active_skills}
+                          emptyText="当前没有命中的 skill。"
+                          tone="active"
+                        />
+                      </div>
+                      <div>
+                        <div className="mb-1.5 text-xs font-medium uppercase tracking-[0.14em] text-slate-500">
+                          候选清单
+                        </div>
+                        <SkillMatchList
+                          items={contextDebug.available_skills}
+                          emptyText="当前没有可用的 skill。"
+                        />
+                      </div>
+                      <div className="text-xs leading-5 text-slate-500">
+                        注入提示词预算约 {contextDebug.skill_prompt_tokens_estimate ?? 0} tokens
+                      </div>
+                    </div>
+                  ) : null}
+                </Section>
+
                 <Section title="上下文层" icon={<HistoryOutlined />}>
                   <div className="space-y-3">
                     <div>
@@ -588,6 +794,9 @@ const ContextDebugWindow = ({
                                   : '',
                                 activeConversationState.evidence_ledger?.length
                                   ? `证据账本: ${formatEvidenceLedgerSummary(activeConversationState.evidence_ledger)}`
+                                  : '',
+                                activeConversationState.decision_state
+                                  ? `决策态: ${formatDecisionStateSummary(activeConversationState.decision_state)}`
                                   : '',
                                 activeConversationState.last_reasoning_summary
                                   ? `最近推理摘要: ${activeConversationState.last_reasoning_summary}`

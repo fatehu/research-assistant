@@ -34,7 +34,7 @@ class Conversation(Base):
     title = Column(String(500), default="新对话")
     
     # LLM 配置
-    llm_provider = Column(String(50), default="deepseek")
+    llm_provider = Column(String(50), default="aliyun_qwen35_flash")
     llm_model = Column(String(100), nullable=True)
     
     # 元数据
@@ -42,6 +42,8 @@ class Conversation(Base):
     
     # 状态
     is_archived = Column(Integer, default=0)
+    is_starred = Column(Integer, default=0)
+    starred_at = Column(DateTime, nullable=True)
     
     # 时间戳
     created_at = Column(DateTime, default=datetime.utcnow)

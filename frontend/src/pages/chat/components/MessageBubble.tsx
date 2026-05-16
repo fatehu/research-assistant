@@ -26,8 +26,6 @@ import {
   type MessageSpanRewriteResponse,
 } from '@/services/api'
 import CodeBlock from './CodeBlock'
-import ThinkingPanel from './ThinkingPanel'
-import HistoryReActPanel from './HistoryReActPanel'
 
 interface MessageBubbleProps {
   msg: Message
@@ -218,6 +216,8 @@ const buildMarkdownVisibleTextIndex = (source: string): MarkdownVisibleTextIndex
   let index = 0
   let lineStart = true
 
+  // 浏览器选区是渲染后的文本，而改写 API 需要原始 Markdown offset；
+  // 为非精确匹配保留一份可见文本到源码位置的索引。
   while (index < source.length) {
     if (lineStart) {
       const nextIndex = findLineSyntaxEnd(source, index)
@@ -297,6 +297,8 @@ const resolveRewriteSelectionFromMarkdown = (
 ): ResolvedRewriteSelection | null => {
   const exactOccurrences = findAllOccurrences(source, renderedSelectedText)
   if (exactOccurrences.length > 0) {
+    // 能精确命中源码时优先使用源码文本，使引用标签和 Markdown 语法继续锚定在
+    // 模型实际改写的片段上。
     const renderedOccurrenceIndex = countOccurrences(renderedBeforeText, renderedSelectedText)
     const occurrenceIndex = Math.min(renderedOccurrenceIndex, exactOccurrences.length - 1)
     const sourceStart = exactOccurrences[occurrenceIndex]
@@ -508,6 +510,8 @@ const parseCitationExplanationItems = (
   const messageIndex = buildCitationIndexFromMessage(msg)
   const ledgerIndex = buildCitationIndexFromLedger(toolLedger, turnId)
   return labels.map((label) => {
+    // 旧消息把引用详情存在 metadata；实时工具轮次在持久化完成前可能只存在
+    // 轮次 ledger 中。
     const item = messageIndex.get(label) || ledgerIndex.get(label)
     if (item) {
       return item
@@ -574,61 +578,6 @@ const deriveMessageTurnId = (
   return undefined
 }
 
-const deriveHistorySteps = (
-  itemStream: ConversationItemStream | undefined,
-  turnId: string | undefined,
-): Array<{
-  type: string
-  iteration: number
-  content?: string
-  tool?: string
-  input?: Record<string, unknown>
-  output?: string
-  success?: boolean
-}> => {
-  if (!itemStream?.entries?.length || !turnId) return []
-  const steps: Array<{
-    type: string
-    iteration: number
-    content?: string
-    tool?: string
-    input?: Record<string, unknown>
-    output?: string
-    success?: boolean
-  }> = []
-  itemStream.entries
-    .filter((entry) => entry.turn_id === turnId)
-    .forEach((entry) => {
-      if (entry.kind === 'reasoning_summary' || entry.kind === 'tool_use_summary') {
-        steps.push({
-          type: 'thought',
-          iteration: entry.iteration || 0,
-          content: entry.summary || entry.content || '',
-        })
-        return
-      }
-      if (entry.kind === 'tool_call') {
-        steps.push({
-          type: 'action',
-          iteration: entry.iteration || 0,
-          tool: entry.tool_name,
-          input: entry.arguments,
-        })
-        return
-      }
-      if (entry.kind === 'tool_result') {
-        steps.push({
-          type: 'observation',
-          iteration: entry.iteration || 0,
-          tool: entry.tool_name,
-          output: entry.summary || entry.error || '',
-          success: entry.success,
-        })
-      }
-    })
-  return steps
-}
-
 const flattenMarkdownText = (value: ReactNode): string => {
   if (value == null || typeof value === 'boolean') {
     return ''
@@ -680,9 +629,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
     {
       msg,
       turnStore,
-      itemStream,
       toolLedger,
-      showHistoryPrelude = true,
       isStreaming = false,
       streamingContent = '',
       isThinking = false,
@@ -694,6 +641,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
     const isUser = msg.role === 'user'
     const baseContent = isStreaming ? streamingContent : msg.content
     const contentRef = useRef<HTMLDivElement | null>(null)
+    const pendingRewriteSelectionRef = useRef<RewriteSelectionState | null>(null)
     const [rewriteSelection, setRewriteSelection] = useState<RewriteSelectionState | null>(null)
     const [customRewriteInstruction, setCustomRewriteInstruction] = useState('')
     const [rewriteLoading, setRewriteLoading] = useState(false)
@@ -701,20 +649,11 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
     const [animatedContent, setAnimatedContent] = useState<string | null>(null)
     const content = animatedContent ?? baseContent
     const turnId = useMemo(() => deriveMessageTurnId(msg, turnStore), [msg, turnStore])
-    const historySteps = useMemo(
-      () => (isStreaming ? [] : deriveHistorySteps(itemStream, turnId)),
-      [isStreaming, itemStream, turnId],
-    )
-    const derivedThought = useMemo(
-      () => historySteps.find((step) => step.type === 'thought')?.content || '',
-      [historySteps],
-    )
-    const thought = isStreaming ? '' : derivedThought || msg.thought || ''
-    const hasReasoningSummary = Boolean(derivedThought || msg.thought)
-    const [thoughtExpanded, setThoughtExpanded] = useState(false)
     const [ragExpanded, setRagExpanded] = useState(false)
     const [evidenceExpanded, setEvidenceExpanded] = useState(false)
     const ragMetrics = !isStreaming && !isUser ? parseRagMetrics(msg.metadata?.rag_metrics) : null
+    // 助手回答仍在流式输出时，引用标签和来源 ledger 还未定稿，
+    // 避免展示不完整的引用说明。
     const citationItems = useMemo(
       () => (!isStreaming && !isUser ? parseCitationExplanationItems(msg, toolLedger, turnId) : []),
       [isStreaming, isUser, msg, toolLedger, turnId]
@@ -814,19 +753,31 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
       message.success('已复制到剪贴板')
     }
 
-    const handleCaptureRewriteSelection = () => {
-      if (isUser || isStreaming || rewriteLoading || rewriteAnimation || !onRewriteSpan) return
+    const handleCaptureRewriteSelection = (options?: { openPanel?: boolean; showWarnings?: boolean }): RewriteSelectionState | null => {
+      const openPanel = Boolean(options?.openPanel)
+      const showWarnings = Boolean(options?.showWarnings)
+      if (isUser || isStreaming || rewriteLoading || rewriteAnimation || !onRewriteSpan) return null
       const selection = window.getSelection()
-      if (!selection || selection.rangeCount <= 0 || selection.isCollapsed) return
+      if (!selection || selection.rangeCount <= 0 || selection.isCollapsed) {
+        if (!openPanel) pendingRewriteSelectionRef.current = null
+        return null
+      }
       const range = selection.getRangeAt(0)
       const container = contentRef.current
-      if (!container || !container.contains(range.commonAncestorContainer)) return
+      if (!container || !container.contains(range.commonAncestorContainer)) {
+        if (!openPanel) pendingRewriteSelectionRef.current = null
+        return null
+      }
 
       const selectedText = selection.toString()
-      if (selectedText.trim().length < 2) return
+      if (selectedText.trim().length < 2) {
+        if (!openPanel) pendingRewriteSelectionRef.current = null
+        return null
+      }
       if (selectedText.length > 4000) {
-        message.warning('选区太长，请缩小后再改写')
-        return
+        if (!openPanel) pendingRewriteSelectionRef.current = null
+        if (showWarnings) message.warning('选区太长，请缩小后再改写')
+        return null
       }
 
       const preRange = range.cloneRange()
@@ -839,18 +790,44 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
         selectedText,
         renderedBefore,
       )
+      // 后端改写的是源 Markdown，不是 DOM 文本；跨越歧义渲染结构的选区
+      // 会在调用 API 前被拒绝。
       if (!resolvedSelection) {
-        message.warning('这个选区暂时无法映射到原始 Markdown，请缩小选区后重试')
-        return
+        if (!openPanel) pendingRewriteSelectionRef.current = null
+        if (showWarnings) message.warning('这个选区暂时无法映射到原始 Markdown，请缩小选区后重试')
+        return null
       }
 
       const rect = range.getBoundingClientRect()
 
-      setRewriteSelection({
+      const nextSelection = {
         ...resolvedSelection,
         x: Math.min(Math.max(rect.left + rect.width / 2, 180), window.innerWidth - 180),
         y: Math.max(rect.top - 12, 72),
-      })
+      }
+      if (openPanel) {
+        setRewriteSelection(nextSelection)
+      } else {
+        pendingRewriteSelectionRef.current = nextSelection
+      }
+      return nextSelection
+    }
+
+    const handleOpenRewritePanel = () => {
+      if (pendingRewriteSelectionRef.current) {
+        setRewriteSelection(pendingRewriteSelectionRef.current)
+        return
+      }
+      const captured = handleCaptureRewriteSelection({ openPanel: true, showWarnings: true })
+      if (!captured && !window.getSelection()?.toString().trim()) {
+        message.info('请先在这条回复里选中需要改写的一段文字')
+      }
+    }
+
+    const handleCloseRewritePanel = () => {
+      setRewriteSelection(null)
+      pendingRewriteSelectionRef.current = null
+      setCustomRewriteInstruction('')
     }
 
     const runRewrite = async (instruction: string) => {
@@ -870,6 +847,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
           occurrence_index: rewriteSelection.occurrenceIndex,
         })
         setRewriteSelection(null)
+        pendingRewriteSelectionRef.current = null
         setCustomRewriteInstruction('')
         setAnimatedContent(response.old_content)
         setRewriteAnimation({
@@ -894,12 +872,8 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
       : 'flex min-w-0 flex-1 flex-col'
     const userBubbleShellClass = 'inline-flex max-w-[min(76%,720px)] flex-col items-end'
     const assistantBubbleWidthClass = 'w-full max-w-[min(100%,920px)]'
-    const hasAssistantPrelude =
-      showHistoryPrelude && !isUser && !isStreaming && (historySteps.length > 0 || String(thought || '').trim().length > 0)
     const normalizedContent = String(content || '').trim()
-    const normalizedThought = String(thought || '').trim()
-    const shouldHideEmptyAssistantBubble =
-      !isUser && !isStreaming && !normalizedContent && !normalizedThought && historySteps.length === 0
+    const shouldHideEmptyAssistantBubble = !isUser && !isStreaming && !normalizedContent
 
     if (shouldHideEmptyAssistantBubble) {
       return null
@@ -1025,29 +999,11 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
           ) : (
             <div className={assistantBubbleWidthClass}>
               <div className="overflow-hidden rounded-[24px] rounded-tl-md border border-white/[0.04] bg-[#13151A] px-8 pt-7 pb-8 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_14px_40px_rgba(2,6,23,0.22)]">
-                  {hasAssistantPrelude && (
-                    <div className="mb-3 space-y-3 border-b border-white/[0.04] pb-3">
-                      {historySteps.length > 0 && (
-                        <HistoryReActPanel steps={historySteps} embedded />
-                      )}
-                      {thought && (
-                        <ThinkingPanel
-                          thought={thought}
-                          isThinking={false}
-                          isExpanded={thoughtExpanded}
-                          onToggle={() => setThoughtExpanded(!thoughtExpanded)}
-                          embedded
-                          label={hasReasoningSummary ? '推理摘要' : '最终思考'}
-                        />
-                      )}
-                    </div>
-                  )}
-
                   {content ? (
                     <>
                       <div
                         ref={contentRef}
-                        onMouseUp={handleCaptureRewriteSelection}
+                        onMouseUp={() => handleCaptureRewriteSelection()}
                         className="prose prose-invert prose-slate max-w-none
                         [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_li>p]:my-1
                         prose-p:my-6 prose-p:text-[16px] prose-p:leading-[1.95] prose-p:tracking-[0.004em] prose-p:text-slate-200/90
@@ -1264,12 +1220,12 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                       {!isStreaming && content && (
                     <div className="mt-5 flex items-center gap-3 border-t border-white/[0.04] pt-4">
                       {!isUser && onRewriteSpan && (
-                        <Tooltip title="选中回复中的一段文字后改写">
+                        <Tooltip title="先选中回复中的一段文字，再点击这里改写">
                           <Button
                             type="text"
                             size="small"
                             icon={<EditOutlined />}
-                            onClick={() => message.info('请先在这条回复里选中需要改写的一段文字')}
+                            onClick={handleOpenRewritePanel}
                             className="rounded-lg text-slate-400 transition-all hover:bg-white/[0.04] hover:text-cyan-300"
                           >
                             局部改写
@@ -1319,7 +1275,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                 </div>
                 <button
                   type="button"
-                  onClick={() => setRewriteSelection(null)}
+                  onClick={handleCloseRewritePanel}
                   className="rounded-full px-2 py-1 text-xs text-slate-500 transition-colors hover:bg-white/[0.06] hover:text-slate-200"
                 >
                   取消

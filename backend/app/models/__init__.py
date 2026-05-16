@@ -7,6 +7,9 @@ from app.models.knowledge import KnowledgeBase, Document, DocumentChunk
 from app.models.literature import (
     Paper,
     PaperCollection,
+    PaperExperimentRun,
+    PaperExperimentWorkspace,
+    ResearchProject,
     PaperSearchHistory,
     PaperEntity,
     PaperReadSession,
@@ -22,6 +25,7 @@ from app.models.literature import (
 )
 from app.models.notebook import Notebook, NotebookCell
 from app.models.agent import AgentRun, AgentStepRecord, AgentMemoryItem
+from app.models.docx import DocxTemplate, DocxTemplateFile, DocxGenerationJob
 
 # 角色系统模型
 from app.models.role import (
@@ -51,6 +55,9 @@ __all__ = [
     # 文献
     "Paper",
     "PaperCollection",
+    "PaperExperimentWorkspace",
+    "PaperExperimentRun",
+    "ResearchProject",
     "PaperSearchHistory",
     "PaperEntity",
     "PaperReadSession",
@@ -70,6 +77,10 @@ __all__ = [
     "AgentRun",
     "AgentStepRecord",
     "AgentMemoryItem",
+    # DOCX templates and generation jobs
+    "DocxTemplate",
+    "DocxTemplateFile",
+    "DocxGenerationJob",
     # 角色系统
     "UserRole",
     "InvitationStatus",
