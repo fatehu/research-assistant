@@ -113,6 +113,8 @@ class ReaderMultimodalLayoutService:
         if cross_column_merge_ratio > 0.08:
             trigger_reasons.append("cross_column_merge_high")
 
+        # 即使调用方当前把 enabled 当作所有页面的 opt-in，也保留逐文档遥测；
+        # 返回的 trigger_reasons 仍说明页面是否真的有风险特征。
         state = self._doc_stats.setdefault(
             int(paper_id),
             {
@@ -498,6 +500,8 @@ class ReaderMultimodalLayoutService:
         payload["known_layout_ids"] = [real_to_alias.get(item, item) for item in known_ids]
         digest_rows = [row for row in list(payload.get("docmind_layout_digest") or []) if isinstance(row, dict)]
         if digest_rows and real_to_alias:
+            # 过长 layout ID 会让多模态 JSON 变脆弱；先在 prompt 中使用别名，
+            # 校验后再映射回规范 DocMind ID，保证下游契约稳定。
             aliased_digest_rows: List[Dict[str, Any]] = []
             for row in digest_rows:
                 cloned = dict(row)
@@ -576,6 +580,8 @@ class ReaderMultimodalLayoutService:
         last_error = err
         retry_hint = ""
         if isinstance(last_error, RenderPipelineContractError):
+            # 校验反馈刻意保持简短：足够修复 enum 和必填字段错误，
+            # 但不鼓励模型偏离 schema。
             retry_hint = f"Previous output failed validation: code={last_error.code}, stage={last_error.stage}. Return strict JSON only."
             if str(last_error.code) == "STAGE1_REQUIRED_FIELD_MISSING":
                 retry_hint += (
@@ -724,6 +730,8 @@ class ReaderMultimodalLayoutService:
         last_error = err
         retry_hint = ""
         if isinstance(last_error, RenderPipelineContractError):
+            # 第二阶段只负责设计；重试时要求模型修复 JSON，同时保留已知的
+            # 布局/组件允许列表。
             retry_hint = f"Previous output failed validation: code={last_error.code}, stage={last_error.stage}. Return strict JSON only."
         validated_retry, err_retry = await _attempt(primary_model, retry_hint)
         if isinstance(validated_retry, dict):

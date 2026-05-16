@@ -178,6 +178,8 @@ class RateLimitedHttpProvider:
             if attempt >= self.retry_attempts:
                 return response
 
+            # 服务方限流通常会带 Retry-After；优先使用它而不是本地指数退避，
+            # 避免立刻再次触发 429/503。
             retry_after = _parse_retry_after_seconds(response.headers.get("Retry-After"))
             wait_seconds = retry_after if retry_after is not None else max(
                 self.retry_backoff_seconds,
@@ -1519,6 +1521,8 @@ class LiteratureService:
             if result.get("error"):
                 errors[source_name] = str(result["error"])
 
+        # 自动搜索返回第一个有可用论文的来源，同时保留部分错误，
+        # 方便 API 响应侧观测。
         payload: Dict[str, Any] = {
             "total": 0,
             "offset": offset,
@@ -1608,6 +1612,8 @@ class LiteratureService:
         offset = max(0, int(offset))
         fetch_limit = min(max(limit_per_source + offset, limit_per_source), 100)
 
+        # 每个 provider 都从 offset 0 拉取，再在去重后分页；否则重复的 DOI/arXiv
+        # 记录会让后续页不稳定。
         tasks = {
             source_name: self.search(
                 query=query,
@@ -1653,6 +1659,7 @@ class LiteratureService:
                 paper.raw_data = raw_data
                 key = self._paper_dedupe_key(paper)
                 existing = merged.get(key)
+                # 对同一篇论文保留信息最丰富的记录，不受哪个 provider 先返回影响。
                 merged[key] = paper if existing is None else self._pick_better_paper(existing, paper)
 
         deduped = list(merged.values())

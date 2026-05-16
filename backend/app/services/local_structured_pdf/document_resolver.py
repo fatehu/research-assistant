@@ -66,6 +66,8 @@ class LocalPdfDocumentResolver:
 
     def resolve_document(self, *, pages: Sequence[PdfNormalizedPage]) -> PdfResolvedDocument:
         normalized_pages = [page for page in list(pages or []) if isinstance(page, PdfNormalizedPage)]
+        # 页眉/页脚签名会归一化数字，让 "Page 3" 和 "Page 4" 折叠为同一类
+        # 重复噪声，而不是混入正文。
         header_signatures = self._collect_repeated_signatures(pages=normalized_pages, band="top_band")
         footer_signatures = self._collect_repeated_signatures(pages=normalized_pages, band="bottom_band")
 
@@ -111,6 +113,8 @@ class LocalPdfDocumentResolver:
 
             layout = self._detect_column_layout(page=page, lines=kept_lines)
             if int(layout.get("column_count") or 1) == 2:
+                # 有些抽取器会把同一基线上的左右栏文本合并成一条宽行；仅在确认的
+                # 分栏带内拆分，避免误伤表格。
                 split_lines = self._split_cross_boundary_lines(
                     page=page,
                     lines=kept_lines,
@@ -538,6 +542,8 @@ class LocalPdfDocumentResolver:
     ) -> list[PdfResolvedLine]:
         if not lines:
             return []
+        # 对双栏 PDF，PyMuPDF text block 通常比原始坐标更接近作者/阅读顺序，
+        # 因此先尝试该路径，再退回几何 XY-cut。
         block_guided = self._order_page_lines_by_text_blocks(
             page=page,
             lines=lines,
@@ -609,6 +615,8 @@ class LocalPdfDocumentResolver:
             if float(block.bbox.width) >= page_width * self._full_width_ratio:
                 overlap_height = self._interval_overlap(float(block.bbox.top), float(block.bbox.bottom), band_top, band_bottom)
                 if overlap_height >= max(18.0, float(block.bbox.height) * 0.5):
+                    # 跨过分栏带的宽 block 通常表示页面不是干净的双栏流，
+                    # 此时 block-guided 排序不安全。
                     return None
                 continue
             overlap_height = self._interval_overlap(float(block.bbox.top), float(block.bbox.bottom), band_top, band_bottom)
@@ -901,6 +909,8 @@ class LocalPdfDocumentResolver:
 
         if has_horizontal_cut and has_vertical_cut:
             if abs(horizontal_cut[1] - vertical_cut[1]) <= self._xycut_gap_tie_threshold:
+                # 密集页面更可能是带小 x 间隙的单栏正文，稀疏页面更可能是分栏；
+                # 因此横/竖切分接近时按页面密度决策。
                 use_horizontal_cut = prefer_horizontal_first
             else:
                 use_horizontal_cut = horizontal_cut[1] > vertical_cut[1]

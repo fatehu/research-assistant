@@ -30,6 +30,8 @@ from app.services.react_agent import AgentRuntimeContext
 
 class GenerativeReaderAgentRuntime:
     READER_NATIVE_TOOLS = ("paper_read", "knowledge_search")
+    # 域名分桶只是阅读界面的排序策略，不是安全过滤器：高价值链接优先展示，
+    # 低价值链接后续仍会经过校验。
     HIGH_VALUE_RESOURCE_DOMAINS = (
         "usmle.org",
         "pubmed.ncbi.nlm.nih.gov",
@@ -12279,6 +12281,8 @@ class GenerativeReaderAgentRuntime:
         compose_payload: Mapping[str, Any],
         generative_plan: Mapping[str, Any],
     ) -> Dict[str, Any]:
+        # 在任何渲染决策前先归一化 ID；模型输出可能省略可选标识符，
+        # 但前端需要稳定的操作目标。
         materialized_generative_plan = self._materialize_missing_generative_plan_ids(
             parsed=generative_plan,
             page=int(focus_page),
@@ -12326,6 +12330,8 @@ class GenerativeReaderAgentRuntime:
             page_brief=page_brief,
             target_map=target_map,
         )
+        # 公开资源和组件直接面向阅读界面，因此在组合最终体验区块前，
+        # 先清理泛化或低信息量的模型文案。
         resource_modules = self._sanitize_supporting_resources_for_reader(resource_modules)
         interaction_modules = self._materialize_interaction_display_copy(
             [dict(row) for row in list((generative_plan or {}).get("interaction_modules") or []) if isinstance(row, Mapping)],
@@ -12360,6 +12366,8 @@ class GenerativeReaderAgentRuntime:
         )
         storyboard = [dict(row) for row in list(beat_guidance.get("storyboard") or []) if isinstance(row, Mapping)]
         if storyboard:
+            # 以 storyboard 顺序作为最强叙事契约；存在时优先于 planner 给出的
+            # 较宽松 reading_path。
             reading_path = self._storyboard_to_reading_path(storyboard)
         page_brief_meta = dict(page_brief.get("meta") or {})
         include_story_map = bool(page_brief_meta.get("include_story_map"))
@@ -15520,6 +15528,8 @@ class GenerativeReaderAgentRuntime:
         page_dossier: Optional[Sequence[Mapping[str, Any]] | Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         runtime_started_at = asyncio.get_running_loop().time()
+        # 让 planner 和页面生成共用同一个时间预算，避免第一阶段过慢导致 UI
+        # 无限等待。
         overall_runtime_budget = max(
             75.0,
             min(float(getattr(settings, "generative_reader_agent_timeout_seconds", 120) or 120), 180.0),
@@ -15585,6 +15595,8 @@ class GenerativeReaderAgentRuntime:
         if not allowed_tools:
             allowed_tools = resolve_generative_reader_agent_tool_whitelist()
         if not allowed_tools:
+            # 有效的静态阅读体验优于启动一个没有工具面的 agent，
+            # 否则容易生成缺乏依据的文案。
             runtime_stage_trace.append(
                 self._build_runtime_stage_row(
                     stage_id="planner",
@@ -15614,6 +15626,8 @@ class GenerativeReaderAgentRuntime:
             allowed_tool_names=sorted(list(allowed_tools)),
         )
         if not self._supports_staged_runtime(llm=llm, registry=registry):
+            # 较旧的 runtime adapter 只暴露 ReAct 风格循环；保留该路径，
+            # 避免模型或 provider 升级阻塞阅读页。
             runtime_stage_trace.append(
                 self._build_runtime_stage_row(
                     stage_id="planner",
@@ -15730,6 +15744,8 @@ class GenerativeReaderAgentRuntime:
             planner_output=planner_output,
             allowed_tools=sorted(list(allowed_tools)),
         )
+        # 工具观察会压缩成生成用 packet；完整 trace 保留在 meta 中，
+        # 便于评审工具诊断 grounding 缺失。
         tool_observation_rows = [
             row for row in list(tool_trace or [])
             if str(row.get("type") or "").strip() == "observation"
@@ -15783,6 +15799,8 @@ class GenerativeReaderAgentRuntime:
                 max_tokens=min(int(getattr(settings, "llm_max_tokens", 4096) or 4096), 2600),
             )
         except asyncio.TimeoutError:
+            # 超时恢复优先使用有依据的工具证据，其次使用确定性的 beat-aware plan，
+            # 最后才采用最小 fallback。
             recovered = await self._recover_plan_from_tool_trace(
                 llm=llm,
                 page=int(page),

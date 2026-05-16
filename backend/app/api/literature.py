@@ -142,6 +142,7 @@ from app.services.literature_service import PaperResult, get_literature_service
 from app.services.literature_reader_compose_service import GROUNDED_FIGURE_ASSET_VERSION, get_literature_reader_compose_service
 from app.services.literature_reader_service import get_literature_reader_service
 from app.services.llm_service import (
+    LLMService,
     build_llm_source_headers,
     get_llm_service,
     log_tagged_llm_request_done,
@@ -430,6 +431,7 @@ def paper_to_response(paper, collection_ids: List[int] = None) -> dict:
 ASK_CACHE_TTL_SECONDS = 600
 _ask_cache_memory: Dict[str, tuple[float, Dict[str, Any]]] = {}
 _ask_redis_client = None
+_literature_fts_keyword_cache: Dict[str, tuple[float, List[str]]] = {}
 GENERATIVE_PLAN_CACHE_TTL_SECONDS = 3600
 _generative_plan_cache_memory: Dict[str, tuple[float, Dict[str, Any]]] = {}
 EXPERIENCE_PLAN_CACHE_TTL_SECONDS = 3600
@@ -4039,10 +4041,18 @@ async def _build_experience_adjacent_page_structured_context_v2(
     return rows
 
 
-def _ask_cache_key(user_id: int, kb_id: int, scope: str, target_id: int, question: str, mode: str) -> str:
+def _ask_cache_key(
+    user_id: int,
+    kb_id: int,
+    scope: str,
+    target_id: int,
+    question: str,
+    mode: str,
+    session_id: int,
+) -> str:
     q_hash = hashlib.sha256(question.strip().encode("utf-8")).hexdigest()
     normalized_mode = (mode or "classic").strip().lower()
-    return f"lit:ask:v1:{user_id}:{kb_id}:{scope}:{target_id}:{normalized_mode}:{q_hash}"
+    return f"lit:ask:v2:{user_id}:{kb_id}:{scope}:{target_id}:{int(session_id)}:{normalized_mode}:{q_hash}"
 
 
 async def _get_redis_client():
@@ -8817,12 +8827,12 @@ async def _ask_cache_invalidate_prefix(prefix: str) -> None:
 
 
 async def _invalidate_ask_cache_for_scope(user_id: int, kb_id: int, scope: str, target_id: int) -> None:
-    prefix = f"lit:ask:v1:{user_id}:{kb_id}:{scope}:{target_id}:"
+    prefix = f"lit:ask:v2:{user_id}:{kb_id}:{scope}:{target_id}:"
     await _ask_cache_invalidate_prefix(prefix)
 
 
 async def _invalidate_ask_cache_for_collection(user_id: int, collection_id: int) -> None:
-    prefix = f"lit:ask:v1:{user_id}:"
+    prefix = f"lit:ask:v2:{user_id}:"
     redis_client = await _get_redis_client()
     if redis_client is not None:
         try:
@@ -8988,6 +8998,127 @@ def _select_link_for_query(
     return candidates[0] if candidates else None
 
 
+def _clean_literature_fts_keyword_query(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    clean = re.sub(r"[\r\n\t]+", " ", raw)
+    clean = re.sub(r"[^A-Za-z0-9_+./\-\s]", " ", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    if not clean:
+        return ""
+    tokens = [token for token in clean.split(" ") if token and len(token) <= 64]
+    return " ".join(tokens[:10]).strip()
+
+
+def _parse_literature_fts_keyword_queries(content: str) -> List[str]:
+    raw = str(content or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            return []
+        try:
+            data = json.loads(match.group(0))
+        except Exception:
+            return []
+
+    candidates: List[Any] = []
+    if isinstance(data, dict):
+        for key in ("queries", "fts_queries", "query"):
+            value = data.get(key)
+            if isinstance(value, list):
+                candidates.extend(value)
+            elif isinstance(value, str):
+                candidates.append(value)
+        keywords = data.get("keywords")
+        if isinstance(keywords, list):
+            candidates.append(" ".join(str(item) for item in keywords[:8]))
+        elif isinstance(keywords, str):
+            candidates.append(keywords)
+    elif isinstance(data, list):
+        candidates.extend(data)
+
+    queries: List[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        query = _clean_literature_fts_keyword_query(item)
+        if not query:
+            continue
+        key = query.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        queries.append(query)
+        if len(queries) >= 3:
+            break
+    return queries
+
+
+async def _generate_literature_fts_keyword_queries(question: str) -> List[str]:
+    if not bool(getattr(settings, "literature_fts_keyword_matcher_enabled", True)):
+        return []
+    clean_question = str(question or "").strip()
+    if not clean_question:
+        return []
+
+    cache_key = hashlib.sha256(clean_question.encode("utf-8")).hexdigest()
+    now = time.time()
+    cached = _literature_fts_keyword_cache.get(cache_key)
+    if cached and cached[0] > now:
+        return list(cached[1])
+    if cached:
+        _literature_fts_keyword_cache.pop(cache_key, None)
+
+    provider = str(getattr(settings, "literature_fts_keyword_matcher_provider", "aliyun") or "aliyun").strip()
+    model = str(getattr(settings, "literature_fts_keyword_matcher_model", "qwen-turbo") or "qwen-turbo").strip()
+    timeout_seconds = max(1.0, float(getattr(settings, "literature_fts_keyword_matcher_timeout_seconds", 3.0) or 3.0))
+    ttl_seconds = max(1, int(getattr(settings, "literature_fts_keyword_matcher_cache_ttl_seconds", 1800) or 1800))
+
+    system_prompt = (
+        "You are a query-to-English-FTS-keyword matcher for academic papers. "
+        "Extract only English terms likely to appear verbatim in the paper. "
+        "Remove question words, Chinese helper words, and explanation intent. "
+        "Return JSON only."
+    )
+    prompt = (
+        "Convert the user query into 1 to 3 short English FTS keyword queries.\n"
+        "Rules:\n"
+        "- Each query should contain 2 to 6 English words or technical tokens.\n"
+        "- Prefer exact paper terms, method names, datasets, metrics, abbreviations.\n"
+        "- Do not include words like what, why, how, explain, mean, compare, 什么, 是, 如何, 论文.\n"
+        "- If the query already contains English technical terms, keep them.\n"
+        "- Output JSON in this exact shape: {\"queries\":[\"...\"]}\n\n"
+        f"User query: {clean_question}"
+    )
+
+    try:
+        llm = LLMService(provider=provider)
+        if model:
+            llm.config["model"] = model
+        response = await asyncio.wait_for(
+            llm.chat(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt=system_prompt,
+                temperature=0.0,
+                max_tokens=120,
+                source="literature.fts_keyword_matcher",
+            ),
+            timeout=timeout_seconds,
+        )
+        queries = _parse_literature_fts_keyword_queries(str(response.get("content") or ""))
+    except Exception as exc:
+        logger.warning(f"[Literature Ask] Qwen Turbo FTS keyword matcher failed: {exc}")
+        return []
+
+    if queries:
+        _literature_fts_keyword_cache[cache_key] = (now + ttl_seconds, queries)
+    return list(queries)
+
+
 async def _retrieve_scope_links_for_query(
     db: AsyncSession,
     current_user: User,
@@ -9088,7 +9219,6 @@ async def _retrieve_rag_sources(
     if not document_ids:
         return []
 
-    fts_query = segment_text_for_fts(question or "")
     resolved_kb_ids = sorted({int(item) for item in list(knowledge_base_ids or []) if int(item) > 0})
     where_clauses = [
         "dc.document_id = ANY(:doc_ids)",
@@ -9099,7 +9229,7 @@ async def _retrieve_rag_sources(
     ]
     sql_params: Dict[str, Any] = {
         "doc_ids": list(document_ids),
-        "fts_query": fts_query,
+        "fts_query": "",
         "top_k": int(limit),
     }
     if resolved_kb_ids:
@@ -9134,14 +9264,38 @@ async def _retrieve_rag_sources(
         """
     )
 
-    rows = []
-    if fts_query.strip():
+    executed_fts_queries: set[str] = set()
+
+    async def execute_fts_query(raw_query: str, source_label: str) -> List[Any]:
+        candidate = segment_text_for_fts(raw_query or "").strip()
+        if not candidate:
+            return []
+        candidate_key = candidate.lower()
+        if candidate_key in executed_fts_queries:
+            return []
+        executed_fts_queries.add(candidate_key)
         try:
-            rows = (
-                await db.execute(sql, sql_params)
-            ).fetchall()
+            params = dict(sql_params)
+            params["fts_query"] = candidate
+            fetched = (await db.execute(sql, params)).fetchall()
+            if fetched and source_label != "raw":
+                logger.info(
+                    f"[Literature Ask] Qwen Turbo FTS keyword matcher hit: "
+                    f"query={candidate!r}, rows={len(fetched)}"
+                )
+            return list(fetched)
         except Exception as exc:
-            logger.warning(f"[Literature Ask] FTS 检索失败，回退 ILIKE: {exc}")
+            logger.warning(f"[Literature Ask] FTS 检索失败({source_label})，继续回退: {exc}")
+            return []
+
+    rows: List[Any] = await execute_fts_query(question or "", "raw")
+
+    if not rows:
+        keyword_queries = await _generate_literature_fts_keyword_queries(question or "")
+        for keyword_query in keyword_queries:
+            rows = await execute_fts_query(keyword_query, "qwen_turbo")
+            if rows:
+                break
 
     if not rows:
         fallback_filters = [
@@ -9768,6 +9922,7 @@ class LiteratureAskAgentCore(AgentCore):
 你的目标是基于可验证证据给出高质量回答。
 你需要自行决定是否调用工具、调用哪一个工具以及调用次数。
 不要机械套用固定流程，应根据问题类型动态选择 strategy（例如 knowledge_search、paper_read、web_search/MCP 网页工具）。
+用户已经在文献阅读页选定了当前论文或收藏夹；当用户说“文章 / 论文 / 本文 / this paper”时，默认指当前阅读上下文，禁止反问“是哪篇文章”。
 
 决策原则：
 1. 当前论文可直接回答时，可使用 paper_read。
@@ -9915,21 +10070,25 @@ class LiteratureAskAgentCore(AgentCore):
         compression_results = await self.contextual_compression_service.compress_chunks(query, compression_inputs)
         compression_map = {item.source_id: item for item in compression_results}
         parts: List[str] = []
+        compression_applied = False
 
         for local_source_id, stable_idx, row in input_rows:
             source_label = f"来源{stable_idx}"
             compressed = compression_map.get(local_source_id)
             if compressed and compressed.relevant_content:
                 content = compressed.relevant_content
-                score = compressed.relevance_score
                 if context is not None:
-                    context.compression_success_chunks += 1
+                    if compressed.used_compression and not compressed.fallback_reason:
+                        context.compression_success_chunks += 1
+                    else:
+                        context.compression_fallback_chunks += 1
+                if compressed.used_compression and not compressed.fallback_reason:
+                    compression_applied = True
             else:
                 raw = str(row.get("content") or "").strip()
                 if not raw:
                     continue
                 content = f"[{source_label}] {raw[:320]}" + ("..." if len(raw) > 320 else "")
-                score = 0.0
                 if context is not None:
                     context.compression_fallback_chunks += 1
 
@@ -9940,13 +10099,86 @@ class LiteratureAskAgentCore(AgentCore):
             parts.append(
                 f"\n[{source_label}] (retrieval score {retrieval_score:.1f}%)\n"
                 f"Source: {kb_name} / {doc_name} / chunk {chunk_idx}\n"
-                f"Compression score: {score:.1f}/10\n"
                 f"Content: {content}"
             )
 
         if not parts:
             return result.output
-        return f"Compressed contexts: {len(parts)}\n" + "".join(parts)
+        header = "Compressed contexts" if compression_applied else "Knowledge contexts"
+        return f"{header}: {len(parts)}\n" + "".join(parts)
+
+
+def _build_literature_agent_scope_context_message(
+    *,
+    scope: str,
+    paper: Optional[Paper],
+    paper_ids: Sequence[int],
+    collection_id: Optional[int],
+    knowledge_base_id: int,
+    knowledge_base_name: str,
+    document_ids: Sequence[int],
+    knowledge_base_ids: Sequence[int],
+    paper_pdf_path: Optional[str],
+) -> Dict[str, str]:
+    lines = [
+        "【当前阅读上下文 | 系统注入】",
+        "用户已经在文献阅读页选定了目标范围；不要询问用户要读哪篇文章。",
+        f"- scope: {scope}",
+        f"- active_knowledge_base: {knowledge_base_name or f'KB#{knowledge_base_id}'} (id={knowledge_base_id})",
+    ]
+    if scope == AskScope.PAPER.value and paper is not None:
+        title = str(getattr(paper, "title", "") or "").strip() or f"Paper#{getattr(paper, 'id', '')}"
+        authors = getattr(paper, "authors", None)
+        if isinstance(authors, list):
+            author_text = ", ".join(str(item) for item in authors[:4] if str(item).strip())
+        else:
+            author_text = str(authors or "").strip()
+        lines.extend(
+            [
+                f"- current_paper_id: {int(getattr(paper, 'id', 0) or 0)}",
+                f"- current_paper_title: {title}",
+            ]
+        )
+        if author_text:
+            lines.append(f"- current_paper_authors: {author_text}")
+        published = str(getattr(paper, "published_date", "") or "").strip()
+        if published:
+            lines.append(f"- published_date: {published}")
+    else:
+        lines.extend(
+            [
+                f"- current_collection_id: {int(collection_id or 0) or 'unknown'}",
+                f"- scoped_paper_ids: {', '.join(str(int(item)) for item in paper_ids if int(item) > 0) or 'none'}",
+            ]
+        )
+    lines.extend(
+        [
+            f"- scoped_document_ids: {', '.join(str(int(item)) for item in document_ids if int(item) > 0) or 'none'}",
+            f"- scoped_knowledge_base_ids: {', '.join(str(int(item)) for item in knowledge_base_ids if int(item) > 0) or str(knowledge_base_id)}",
+            f"- paper_pdf_available: {'yes' if paper_pdf_path else 'no'}",
+            "工具使用要求：",
+            "1. 对“文章讲了什么 / 论文主题 / 总结本文 / main idea / what is this paper about”等泛问句，先调用 paper_read 或 knowledge_search 获取证据。",
+            "2. 泛问句推荐 query: abstract introduction method conclusion；如果用户给了具体术语，则优先使用用户术语。",
+            "3. 回答必须基于工具来源；证据不足时说明缺少哪类证据，不要说用户没有指定文章。",
+        ]
+    )
+    return {"role": "user", "content": "\n".join(lines)}
+
+
+def _is_stale_literature_scope_refusal(content: str) -> bool:
+    text = str(content or "").strip().lower()
+    if not text:
+        return False
+    markers = (
+        "没有指定具体的文章",
+        "没有指定具体的论文",
+        "想让我阅读哪篇文章",
+        "想让我阅读哪篇论文",
+        "请问您想让我阅读哪篇",
+        "please tell me which paper",
+        "which article or paper",
+    )
+    return any(marker in text for marker in markers)
 
 
 async def _build_literature_agent_tool_registry(
@@ -16080,6 +16312,7 @@ async def literature_ask(
             target_id=target_id,
             question=payload.question,
             mode=ask_mode,
+            session_id=session_id,
         )
         cached_payload = await _ask_cache_get(cache_key)
         if cached_payload and isinstance(cached_payload, dict):
@@ -16111,8 +16344,23 @@ async def literature_ask(
             history_rows = list((await db.execute(history_stmt)).scalars().all())
             history_rows.reverse()
 
+            agent_messages.append(
+                _build_literature_agent_scope_context_message(
+                    scope=scope,
+                    paper=paper,
+                    paper_ids=paper_ids,
+                    collection_id=target_id if scope == AskScope.COLLECTION.value else None,
+                    knowledge_base_id=kb_id,
+                    knowledge_base_name=kb_name,
+                    document_ids=document_ids,
+                    knowledge_base_ids=source_kb_ids,
+                    paper_pdf_path=paper_pdf_path,
+                )
+            )
             for row in history_rows:
                 if row.role not in {"user", "assistant"}:
+                    continue
+                if row.role == "assistant" and _is_stale_literature_scope_refusal(row.content):
                     continue
                 agent_messages.append({"role": row.role, "content": row.content})
             agent_messages.append({"role": "user", "content": payload.question.strip()})
@@ -16209,6 +16457,8 @@ async def literature_ask(
 
             for row in history_rows:
                 if row.role not in {"user", "assistant"}:
+                    continue
+                if row.role == "assistant" and _is_stale_literature_scope_refusal(row.content):
                     continue
                 messages.append({"role": row.role, "content": row.content})
 

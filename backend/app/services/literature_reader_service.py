@@ -105,7 +105,7 @@ class LiteratureReaderService:
         publish_ready_event_enabled: bool = False,
     ) -> Tuple[Dict[str, Any], ReaderBuildMeta]:
         page_num = max(1, int(page))
-        # Force one rebuild when user explicitly prefers agent-first parsing.
+        # 用户显式选择 agent 优先解析时，强制重建一次，避免复用 parser-only 缓存。
         prefer_agent = bool(prefer_agent)
         force_refresh = bool(force_refresh or prefer_agent)
         source_signature = await self._build_source_signature(
@@ -328,6 +328,8 @@ class LiteratureReaderService:
         docmind_only_mode = parser_mode == "document_mind"
         if parser_mode in {"auto", "document_mind"}:
             if hasattr(self._document_mind_parser, "parse_page_structure"):
+                # 优先请求结构化布局；只有布局不可用时才退到纯文本，
+                # 这样能尽量保留 DocMind 的块级坐标和类型信息。
                 docmind_rows, docmind_meta = await self._document_mind_parser.parse_page_structure(
                     paper_id=int(paper_id) if isinstance(paper_id, int) else None,
                     page=int(page),
@@ -363,6 +365,7 @@ class LiteratureReaderService:
 
         if docmind_structure:
             style_cues = await asyncio.to_thread(self._extract_page_style_cues, pdf_path, page)
+            # 当 DocMind 结构可用时直接构建 v3 页面，后面的本地文本启发式只作为兜底。
             parsed_docmind = self._build_page_structure_v3_from_docmind(
                 page=int(page),
                 docmind_structure=docmind_structure,
@@ -396,6 +399,8 @@ class LiteratureReaderService:
                     parser_chain_meta["document_mind"].get("reason") or "fallback_to_local_parser"
                 )
 
+        # 本地 parser 只处理轻量文本结构；布局线索来自页面渲染结果，
+        # 用于识别标题、侧栏、噪声和段落断点。
         normalized_raw_text = self._normalize_pdf_text(raw_text)
         lines = [line.strip() for line in normalized_raw_text.splitlines()]
         lines = self._split_embedded_heading_lines(lines)
@@ -526,12 +531,12 @@ class LiteratureReaderService:
             if not line:
                 _flush_paragraph()
                 continue
-            # Exclude sidebar/callout rows before body structure decisions.
+            # 在正文结构判断前先排除侧栏/提示框行，避免它们被合并进主段落。
             if self._is_sidebar_line(line, sidebar_hints=sidebar_line_hints):
                 _flush_paragraph()
                 continue
 
-            # Filter image-overlapped noise rows while keeping potential headings.
+            # 过滤与图片区域重叠的噪声行，但保留可能的标题，避免误删章节入口。
             if self._is_noise_line(line, noise_hints=noise_line_hints) and not self._is_heading_line(line):
                 _flush_paragraph()
                 continue

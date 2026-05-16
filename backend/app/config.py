@@ -146,6 +146,11 @@ class Settings(BaseSettings):
     query_rewrite_cache_size: int = 2000
     query_rewrite_cache_ttl_seconds: int = 1800
     query_rewrite_skip_short_chars: int = 10
+    literature_fts_keyword_matcher_enabled: bool = True
+    literature_fts_keyword_matcher_provider: Literal["deepseek", "openai", "aliyun", "ollama"] = "aliyun"
+    literature_fts_keyword_matcher_model: str = "qwen-turbo"
+    literature_fts_keyword_matcher_timeout_seconds: float = 3.0
+    literature_fts_keyword_matcher_cache_ttl_seconds: int = 1800
 
     # Contextual compression
     enable_contextual_compression: bool = True

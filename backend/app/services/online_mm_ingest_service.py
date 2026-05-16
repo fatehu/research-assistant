@@ -281,6 +281,8 @@ class OnlineMmIngestService:
         page_usages: list[dict[str, Any]] = []
         blocks: list[dict[str, Any]] = []
         document_metadata = self._empty_document_metadata()
+        # 预先归一化 window cache，使实时抽取在恢复未完成摄取时也能复用
+        # 之前的页窗口。
         cached_window_entries = self._normalize_window_cache_entries(
             cached_windows=cached_windows,
             document_name=document_name,
@@ -303,6 +305,7 @@ class OnlineMmIngestService:
                     pages_per_call=pages_per_call,
                     overlap=window_overlap,
                 )
+                # 多模态抽取是昂贵阶段；并发上限独立于文档级摄取队列。
                 semaphore = asyncio.Semaphore(extract_max_concurrency)
 
                 async def _run_live_window(window_index: int, window_spec: dict[str, Any]) -> dict[str, Any]:
@@ -1570,6 +1573,8 @@ class OnlineMmIngestService:
                 return False
             if tuple(previous_chunk.get("section_levels") or ()) != current_section_levels:
                 return False
+            # 只合并显式 continuation 或结构上明显连续的片段，避免把只是类型相同的
+            # 相邻章节混在一起。
             previous_block = previous_chunk.get("_last_block") or {}
             previous_page = int(previous_block.get("page") or 0)
             current_page = int(current_block.get("page") or 0)
@@ -1673,6 +1678,8 @@ class OnlineMmIngestService:
         document_label = document_title or str(document_name or "").strip() or "Document"
         document_context_id = "doc_root"
         front_matter_context_id = "front_matter"
+        # 章节骨架（section spine）会成为每个实体化 chunk 的父级上下文；先构建它，
+        # 让检索能恢复周边标题。
         section_spine = self._build_section_spine(
             blocks=ordered_blocks,
             order_index=order_index,

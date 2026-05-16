@@ -68,6 +68,8 @@ class LocalPdfNativeExtractor:
         fitz_doc = None
         pypdf_reader = None
         try:
+            # 每个文档只打开一次可用引擎；后续每页可以独立降级，
+            # 不必为每个阶段重复解析 PDF。
             plumber_pdf = self._open_pdfplumber(path)
             fitz_doc = self._open_fitz(path)
             pypdf_reader = self._open_pypdf(path)
@@ -140,6 +142,7 @@ class LocalPdfNativeExtractor:
                     logger.debug(
                         f"[LocalStructuredPdf] page extraction failed page={page_number}: {exc}"
                     )
+                    # 即使某个引擎在坏页上失败，也保留页数一致性。
                     extracted_pages.append(self._fallback_page_atoms(page_number=page_number))
             return extracted_pages
         except Exception as exc:
@@ -220,6 +223,8 @@ class LocalPdfNativeExtractor:
                 line_like_count_override=coarse_line_count + coarse_rect_count,
                 curve_count_override=coarse_curve_count,
             )
+            # 图像/矢量密集的扫描页会让 pdfplumber 的词和表格阶段代价过高，
+            # 但通常只能增加很少文本信号。
             if not skip_expensive_textual_stages:
                 page_atoms.rects = self._safe_page_stage(
                     page_number=page_number,
@@ -281,6 +286,8 @@ class LocalPdfNativeExtractor:
                 not self._should_skip_words_and_tables_fast_path(page_atoms=page_atoms)
                 and self._should_probe_tables(page_atoms=page_atoms)
             ):
+                # 表格检测先经过廉价的矢量/文本信号门控，因为 PyMuPDF 的表格探测
+                # 在图形密集页面上成本较高。
                 page_atoms.tables = self._safe_page_stage(
                     page_number=page_number,
                     stage_name="tables",
@@ -327,6 +334,8 @@ class LocalPdfNativeExtractor:
         try:
             return extractor()
         except Exception as exc:
+            # 部分 PDF 库经常只在某一类解析对象上失败，而文本抽取仍然成功；
+            # 保持结构化页面的其他部分可用。
             logger.debug(
                 f"[LocalStructuredPdf] page stage failed page={page_number} stage={stage_name}: {exc}"
             )
@@ -898,6 +907,8 @@ class LocalPdfNativeExtractor:
         vector_line_count = line_like_count + curve_count
 
         very_low_text = text_char_count <= 24 and text_token_count <= 4
+        # 快速路径只用于看起来像扫描件、幻灯片或密集矢量图的页面；
+        # 普通原生数字文本仍会执行词和表格抽取。
         if very_low_text and largest_image_ratio >= 0.70 and total_image_ratio >= 0.78:
             return True
         if (

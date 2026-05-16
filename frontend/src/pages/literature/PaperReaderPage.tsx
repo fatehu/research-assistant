@@ -6,6 +6,7 @@ import {
   ExpandOutlined,
   LeftOutlined,
   LinkOutlined,
+  PlusOutlined,
   PushpinOutlined,
   QuestionCircleOutlined,
   ReloadOutlined,
@@ -41,6 +42,8 @@ import {
 import { Document as PdfDocument, Page as PdfPage, pdfjs } from 'react-pdf'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math'
+import rehypeKatex from 'rehype-katex'
 import {
   AnnotationType,
   CommentFilter,
@@ -90,6 +93,7 @@ import {
 import { renderNormalizedInlineText, renderReaderComponentTree } from './readerComponents'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
+import 'katex/dist/katex.min.css'
 import './composedReader.css'
 
 const { Title, Text, Paragraph } = Typography
@@ -3207,6 +3211,8 @@ export default function PaperReaderPage() {
   const reloadAskMessages = async (sessionId: number | undefined) => {
     if (!sessionId) {
       setAskMessages([])
+      setAskAnswer('')
+      setAskSources([])
       return
     }
     const data = await literatureApi.getAskMessages(sessionId, { limit: 200 })
@@ -3215,6 +3221,9 @@ export default function PaperReaderPage() {
     if (latestAssistant) {
       setAskAnswer(latestAssistant.content)
       setAskSources(Array.isArray(latestAssistant.sources) ? latestAssistant.sources : [])
+    } else {
+      setAskAnswer('')
+      setAskSources([])
     }
   }
 
@@ -4343,6 +4352,15 @@ export default function PaperReaderPage() {
     }
   }
 
+  const handleNewAskSession = () => {
+    setAskSessionId(undefined)
+    setAskMessages([])
+    setAskAnswer('')
+    setAskSources([])
+    setAskQuestion('')
+    message.success('已开始新对话')
+  }
+
   const handleAsk = async () => {
     if (!validPaperId || !askQuestion.trim()) {
       message.warning('请补全提问参数')
@@ -5158,7 +5176,8 @@ export default function PaperReaderPage() {
         }}
       >
         <ReactMarkdown
-          remarkPlugins={[remarkGfm]}
+          remarkPlugins={[remarkGfm, remarkMath]}
+          rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: 'ignore' }] as any]}
           components={{
             p: ({ children }) => (
               <p style={{ margin: '0 0 14px', color: activeWorkspaceStyle.bodyColor, lineHeight: 1.85 }}>
@@ -6906,26 +6925,32 @@ export default function PaperReaderPage() {
                               />
                             ) : null
                           ) : null}
-                          <Select
-                            placeholder="会话历史（仅自己可见）"
-                            value={askSessionId}
-                            allowClear
-                            showSearch
-                            optionLabelProp="title"
-                            popupMatchSelectWidth={false}
-                            listHeight={360}
-                            dropdownStyle={{ maxWidth: 720, minWidth: 520 }}
-                            filterOption={(input, option) =>
-                              String(option?.searchText || '')
-                                .toLowerCase()
-                                .includes(input.trim().toLowerCase())
-                            }
-                            onChange={(v) => {
-                              const next = Number(v || 0)
-                              setAskSessionId(next > 0 ? next : undefined)
-                            }}
-                            options={askSessionOptions}
-                          />
+                          <Space.Compact style={{ width: '100%' }}>
+                            <Select
+                              style={{ flex: 1 }}
+                              placeholder="会话历史（仅自己可见）"
+                              value={askSessionId}
+                              allowClear
+                              showSearch
+                              optionLabelProp="title"
+                              popupMatchSelectWidth={false}
+                              listHeight={360}
+                              dropdownStyle={{ maxWidth: 720, minWidth: 520 }}
+                              filterOption={(input, option) =>
+                                String(option?.searchText || '')
+                                  .toLowerCase()
+                                  .includes(input.trim().toLowerCase())
+                              }
+                              onChange={(v) => {
+                                const next = Number(v || 0)
+                                setAskSessionId(next > 0 ? next : undefined)
+                              }}
+                              options={askSessionOptions}
+                            />
+                            <Button icon={<PlusOutlined />} disabled={asking} onClick={handleNewAskSession}>
+                              新对话
+                            </Button>
+                          </Space.Compact>
                           <TextArea
                             rows={3}
                             value={askQuestion}
@@ -6964,23 +6989,31 @@ export default function PaperReaderPage() {
                                 ? `${item.page}${item.page_source === 'estimated' ? '（估算）' : ''}`
                                 : '未知'
                               return (
-                                <List.Item
-                                  actions={[
-                                    <Button key="jump" size="small" onClick={() => void jumpToSource(item)}>
-                                      跳转
-                                    </Button>,
-                                  ]}
-                                >
-                                  <Space direction="vertical" size={2}>
-                                    <Text strong>{`[来源${Number(item.idx || itemIndex + 1)}] ${item.document_name}`}</Text>
+                                <List.Item>
+                                  <Space direction="vertical" size={2} style={{ width: '100%', minWidth: 0 }}>
+                                    <div
+                                      style={{
+                                        display: 'flex',
+                                        alignItems: 'flex-start',
+                                        justifyContent: 'space-between',
+                                        gap: 8,
+                                        width: '100%',
+                                        minWidth: 0,
+                                      }}
+                                    >
+                                      <Text strong style={{ minWidth: 0, flex: 1 }}>
+                                        {`[来源${Number(item.idx || itemIndex + 1)}] ${item.document_name}`}
+                                      </Text>
+                                      <Button size="small" onClick={() => void jumpToSource(item)}>
+                                        跳转
+                                      </Button>
+                                    </div>
                                     <Space wrap size={4}>
                                       <Tag>页码: {pageTextValue}</Tag>
                                       {item.section_title ? <Tag color="blue">章节: {item.section_title}</Tag> : null}
-                                      {item.score_source === 'fallback' || item.score == null ? (
-                                        <Tag color="default">分数: 无（回退检索）</Tag>
-                                      ) : (
-                                        <Tag>分数: {item.score}</Tag>
-                                      )}
+                                      {item.score_source !== 'fallback' && item.score != null ? (
+                                        <Tag>FTS分数: {item.score}</Tag>
+                                      ) : null}
                                     </Space>
                                     <Text>{item.snippet}</Text>
                                   </Space>

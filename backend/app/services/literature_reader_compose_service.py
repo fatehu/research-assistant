@@ -528,6 +528,8 @@ class LiteratureReaderComposeService:
         publish_ready_event_enabled: bool = False,
         progress_callback: Optional[ReaderComposeProgressCallback] = None,
     ) -> Tuple[Dict[str, Any], ReaderComposeBuildMeta]:
+        # 来源签名（source signature）会纳入用户可见选项和来源材料，因此即使是同一页，
+        # 缓存命中也不会跨越风格、细节级别或知识库边界。
         page_num = max(1, int(page))
         parser_force_refresh = bool(force_refresh)
         compose_force_refresh = bool(force_refresh or regenerate)
@@ -581,6 +583,8 @@ class LiteratureReaderComposeService:
         )
 
         if not compose_force_refresh:
+            # 缓存 Redis 是快速路径；每次命中仍会按当前运行时契约修复后，
+            # 再应用用户 overlay。
             cached_payload = await self._read_payload_from_redis(redis_key)
             if isinstance(cached_payload, dict):
                 if self._should_rebuild_cached_payload(cached_payload):
@@ -659,6 +663,8 @@ class LiteratureReaderComposeService:
                 pipeline_version=pipeline_version,
             )
             if isinstance(compatible_cached_row, dict):
+                # 只有 canonical source 前缀匹配时才复用兼容 DB 行；随后把请求的
+                # 完整签名写回 payload，确保下游 overlay 仍然按用户隔离。
                 logger.info(
                     "[ReaderComposeService] reuse compatible compose cache "
                     f"paper={paper.id} page={page_num} requested_sig={sig_hash} "
@@ -725,6 +731,8 @@ class LiteratureReaderComposeService:
             f"paper={paper.id} page={page_num} acquired={bool(lock_token)} compose_force_refresh={compose_force_refresh}"
         )
         if lock_token is None:
+            # 重复构建通常比等待更昂贵；新请求会多等一会儿，给进行中的 worker
+            # 写入可复用缓存的机会，而 force-refresh 保持较短的交互预算。
             waited = 0.0
             wait_limit = LOCK_WAIT_SECONDS if compose_force_refresh else LOCK_RESULT_WAIT_SECONDS
             waiting_notice_emitted = False
@@ -7119,6 +7127,8 @@ class LiteratureReaderComposeService:
             paper_title=paper.title,
             paper_pdf_path=paper.pdf_path,
         )
+        # 页面渲染会被文本分组、图像重建和锚点预览复用，因此在进入
+        # 模型相关分支前只解析一次。
         page_image_asset = self._resolve_reader_page_image_asset(
             paper_id=int(paper.id),
             page=int(page),
@@ -7132,6 +7142,8 @@ class LiteratureReaderComposeService:
             if isinstance(row, Mapping)
         ]
         if not layout_atoms:
+            # 没有 layout atoms 时 UID 流水线无法确定性地定位组件；
+            # 单 agent 路径仍可生成页面。
             return await self._build_single_agent_v2_result(
                 db=db,
                 user_id=user_id,

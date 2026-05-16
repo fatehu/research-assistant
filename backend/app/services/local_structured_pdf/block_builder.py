@@ -149,6 +149,8 @@ class LocalPdfBlockBuilder:
         pages = list(document.pages or [])
         body_font_size = self._estimate_body_font_size(pages=pages)
         heading_stats = self._build_heading_statistics(pages=pages)
+        # 目录页会交错出现条目文本和纯页码行，因此在段落/标题分组前，
+        # 先按几何顺序重新排序。
         directory_like_pages = self._detect_directory_like_pages(pages=pages)
         line_map = {
             str(line.line_id): line
@@ -372,6 +374,8 @@ class LocalPdfBlockBuilder:
             next_line=next_line,
         )
 
+        # 标题恢复同时结合样式稀有度、排版特征和局部上下文，因为 PDF 很少暴露
+        # 可靠的语义标题标签。
         score = 0.0
         if font_large_enough:
             score += 0.42
@@ -496,6 +500,8 @@ class LocalPdfBlockBuilder:
         text = _SPACE_RE.sub(" ", str(line.text or "").strip())
         if not text or next_line is None or int(next_line.page) != int(line.page):
             return False
+        # 来源行（provider/source）常以数字编码和标题式大小写开头；如果下一行继续出现
+        # 元数据式文本，则按正文保留。
         words = text.split()
         if len(words) < 6:
             return False
@@ -715,6 +721,7 @@ class LocalPdfBlockBuilder:
             body_lines = lines[1:] if self._has_contents_title(lines[0]) else lines
             if len(body_lines) < 5:
                 continue
+            # 同时要求纯页码行和条目形态行，避免把普通编号正文或表格误判为目录页。
             page_number_lines = [line for line in body_lines if self._is_page_number_only_line(line)]
             if len(page_number_lines) < 4:
                 continue
@@ -862,6 +869,7 @@ class LocalPdfBlockBuilder:
             )
             for block in heading_blocks
         )
+        # 如果第一个 heading 实际上是文档标题，编号章节应从视觉标题的下一层开始。
         heading_offset = 1 if has_document_title else 0
 
         leveled: list[PdfSemanticBlock] = []

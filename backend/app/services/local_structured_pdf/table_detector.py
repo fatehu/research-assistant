@@ -78,6 +78,8 @@ class LocalPdfTableDetector:
         resolved_document: PdfResolvedDocument,
         structured_document: PdfStructuredDocument,
     ) -> PdfStructuredDocument:
+        # 表格恢复会反复跨越 normalized-word、resolved-line 和 structured-block
+        # 三层，因此先一次性构建查找表。
         word_map = {
             str(word.word_id): word
             for page in list(normalized_pages or [])
@@ -635,6 +637,8 @@ class LocalPdfTableDetector:
                 "\n".join(str(block.text or "").strip() for block in subset if str(block.text or "").strip()),
                 rows,
             )
+            # 只看几何范围容易吸收邻近正文；替换多个 block 前必须与 PyMuPDF
+            # 单元格存在文本重叠。
             if table_coverage < 0.82 or bbox_overlap < 0.82 or token_overlap < 0.56:
                 continue
 
@@ -674,6 +678,8 @@ class LocalPdfTableDetector:
         cursor = 0
         index = 0
         while index < len(lines):
+            # 有些抽取器会把整张表输出成一个段落；这里识别行状窗口，
+            # 保留前后正文，并且仅在能重建行时转换候选片段。
             row_indexes = self._collect_row_like_indexes(lines=lines[index:], word_map=word_map)
             if not row_indexes:
                 break
@@ -766,6 +772,8 @@ class LocalPdfTableDetector:
         best_result: tuple[PdfSemanticBlock, int] | None = None
         max_window_end = min(len(blocks), start_index + 4)
         for end_index in range(start_index + 2, max_window_end + 1):
+            # 表题和表头经常被拆成相邻 block；这里只尝试短窗口，
+            # 避免把普通章节文本过度合并。
             subset = list(blocks[start_index:end_index])
             if str(anchor.block_type or "") == "heading" and any(
                 self._block_has_strong_table_rows(block)
