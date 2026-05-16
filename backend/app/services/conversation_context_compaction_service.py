@@ -681,6 +681,14 @@ class ConversationContextCompactionService:
             "updated_at": datetime.utcnow().isoformat(),
         }
 
+    @staticmethod
+    def _compression_timeout_seconds() -> float:
+        try:
+            timeout = float(getattr(settings, "agent_budget_compression_timeout_seconds", 8.0) or 8.0)
+        except (TypeError, ValueError):
+            timeout = 8.0
+        return max(timeout, 1.0)
+
     @classmethod
     async def _extract_context_state(
         cls,
@@ -688,6 +696,8 @@ class ConversationContextCompactionService:
         *,
         tool_ledger_entries: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        if not bool(getattr(settings, "agent_context_state_enabled", True)):
+            return {}
         rows = [dict(item) for item in list(messages or []) if isinstance(item, dict)]
         user_turns = sum(1 for item in rows if str(item.get("role", "")).strip().lower() == "user")
         if not rows or user_turns <= 0:
@@ -783,14 +793,17 @@ class ConversationContextCompactionService:
         llm = LLMService(provider)
         llm.config = dict(llm.config)
         llm.config["model"] = model_name
-        response = await llm.chat_with_tools(
-            messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            system_prompt=system_prompt,
-            temperature=0.1,
-            max_tokens=max_tokens,
-            source="chat_compaction.context_state",
-            tools=tools,
-            tool_choice={"type": "function", "function": {"name": "set_context_state"}},
+        response = await asyncio.wait_for(
+            llm.chat_with_tools(
+                messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                system_prompt=system_prompt,
+                temperature=0.1,
+                max_tokens=max_tokens,
+                source="chat_compaction.context_state",
+                tools=tools,
+                tool_choice={"type": "function", "function": {"name": "set_context_state"}},
+            ),
+            timeout=cls._compression_timeout_seconds(),
         )
         parsed = cls._extract_tool_call_arguments(response)
         if not parsed:
@@ -836,9 +849,9 @@ class ConversationContextCompactionService:
         if not compact_source:
             return {}
 
-        provider = str(getattr(settings, "agent_context_state_provider", "aliyun") or "aliyun").strip()
-        model_name = str(getattr(settings, "agent_context_state_model", "qwen3.5-flash") or "qwen3.5-flash").strip()
-        max_tokens = max(int(getattr(settings, "agent_context_state_max_tokens", 420) or 420), 160)
+        provider = str(getattr(settings, "agent_budget_compression_provider", "aliyun") or "aliyun").strip()
+        model_name = str(getattr(settings, "agent_budget_compression_model", "qwen3.5-flash") or "qwen3.5-flash").strip()
+        max_tokens = max(int(getattr(settings, "agent_budget_compression_max_tokens", 420) or 420), 160)
 
         tool_previews = cls._tool_ledger_to_state_preview(tool_ledger_entries or [])
         payload = {
@@ -864,12 +877,15 @@ class ConversationContextCompactionService:
         llm = LLMService(provider)
         llm.config = dict(llm.config)
         llm.config["model"] = model_name
-        response = await llm.chat(
-            messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            system_prompt=system_prompt,
-            temperature=0.1,
-            max_tokens=max_tokens,
-            source="chat_compaction.compacted_history",
+        response = await asyncio.wait_for(
+            llm.chat(
+                messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                system_prompt=system_prompt,
+                temperature=0.1,
+                max_tokens=max_tokens,
+                source="chat_compaction.compacted_history",
+            ),
+            timeout=cls._compression_timeout_seconds(),
         )
         parsed = ReActAgent._extract_json_object(response.get("content") or "")
         if not parsed:
@@ -904,7 +920,10 @@ class ConversationContextCompactionService:
             context_state=state,
             compacted_history=compacted_history,
             summary_text=summary_text,
-            up_to_message_id=None,
+            up_to_message_id=cls._coerce_int(
+                compacted_history.get("up_to_message_id")
+                or compacted_history.get("compact_boundary_message_id")
+            ) if compacted_history else None,
             message_count=len(rows),
             compacted_message_count=compacted_message_count,
         )
@@ -957,7 +976,10 @@ class ConversationContextCompactionService:
         ):
             current_context_state = dict(await self._runtime_service.get_conversation_context_state(int(conversation_id)) or {})
             logger.info(
-                "[ConversationCompaction] skip conversation_id={} mode={} latest_message_id={} boundary_message_id={}",
+                (
+                    "[ConversationCompaction] event=model_compaction_skipped reason=boundary_current "
+                    "conversation_id={} mode={} latest_message_id={} boundary_message_id={}"
+                ),
                 conversation_id,
                 mode,
                 latest_message_id,
@@ -994,6 +1016,9 @@ class ConversationContextCompactionService:
             artifacts.compacted_history = compacted_history
 
         history_detail = (
+            f"event=model_compaction_committed, "
+            f"reason=committed, "
+            f"mode={mode}, "
             f"compacted_messages={artifacts.compacted_message_count}, "
             f"summary_chars={len(artifacts.summary_text or '')}, "
             f"up_to_message_id={latest_message_id or 0}, "
@@ -1034,7 +1059,9 @@ class ConversationContextCompactionService:
             ),
             stale_history_event_title=f"{mode}_compact_stale_skipped",
             stale_history_event_detail=(
+                f"event=model_compaction_skipped, "
                 f"reason=stale_source, "
+                f"mode={mode}, "
                 f"source_entry_count={source_fingerprint.get('entry_count')}"
             ),
         )
@@ -1047,7 +1074,10 @@ class ConversationContextCompactionService:
                 or latest_compacted_history.get("up_to_message_id")
             )
             logger.info(
-                "[ConversationCompaction] stale skip conversation_id={} mode={} source_entry_count={} current_entry_count={}",
+                (
+                    "[ConversationCompaction] event=model_compaction_skipped reason=stale_source "
+                    "conversation_id={} mode={} source_entry_count={} current_entry_count={}"
+                ),
                 conversation_id,
                 mode,
                 source_fingerprint.get("entry_count"),
@@ -1063,7 +1093,10 @@ class ConversationContextCompactionService:
             )
 
         logger.info(
-            "[ConversationCompaction] conversation_id={} messages={} compacted_messages={} summary_chars={} state_keys={} compacted_keys={}",
+            (
+                "[ConversationCompaction] event=model_compaction_committed reason=committed "
+                "conversation_id={} messages={} compacted_messages={} summary_chars={} state_keys={} compacted_keys={}"
+            ),
             conversation_id,
             artifacts.message_count,
             artifacts.compacted_message_count,
@@ -1135,9 +1168,15 @@ class ConversationContextCompactionService:
                 "task": task.to_payload(),
             }
         if key in self._running_keys:
+            self._queued_keys.add(key)
+            try:
+                self._queue.put_nowait(task)
+            except asyncio.QueueFull:
+                self._queued_keys.discard(key)
+                raise
             return {
-                "queued": False,
-                "reason": "duplicate",
+                "queued": True,
+                "reason": "queued_after_running",
                 "duplicate_state": "running",
                 "task": task.to_payload(),
             }
@@ -1149,6 +1188,122 @@ class ConversationContextCompactionService:
             raise
         return {"queued": True, "reason": "queued", "task": task.to_payload()}
 
+    async def _wait_for_item_stream_quiet(
+        self,
+        conversation_id: int,
+        *,
+        mode: str,
+        trigger: str,
+        source: str,
+    ) -> Dict[str, Any]:
+        """Wait until the persisted item stream stops changing before the LLM snapshot is built."""
+        quiet_ms = max(
+            int(getattr(settings, "conversation_context_compaction_quiet_period_ms", 800) or 0),
+            0,
+        )
+        if quiet_ms <= 0:
+            return {"waited": False, "reason": "disabled", "quiet_ms": 0}
+
+        timeout_ms = max(
+            int(getattr(settings, "conversation_context_compaction_quiet_timeout_ms", 4000) or quiet_ms),
+            quiet_ms,
+        )
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        deadline = started_at + (timeout_ms / 1000.0)
+        stable_since: Optional[float] = None
+        last_fingerprint: Optional[Dict[str, Any]] = None
+        last_entry_count: Optional[int] = None
+        samples = 0
+
+        while True:
+            payload = await self._runtime_service.get_conversation_item_stream(int(conversation_id))
+            if not isinstance(payload, dict) or not list(payload.get("entries") or []):
+                return {
+                    "waited": True,
+                    "reason": "item_stream_missing",
+                    "quiet_ms": quiet_ms,
+                    "timeout_ms": timeout_ms,
+                    "samples": samples,
+                }
+
+            fingerprint = AgentRuntimeService.build_item_stream_fingerprint(payload)
+            samples += 1
+            now = loop.time()
+            if last_fingerprint is not None and AgentRuntimeService._item_stream_fingerprint_matches(
+                fingerprint,
+                last_fingerprint,
+            ):
+                stable_since = stable_since if stable_since is not None else now
+                stable_ms = int(max(0.0, now - stable_since) * 1000)
+                if stable_ms >= quiet_ms:
+                    waited_ms = int(max(0.0, now - started_at) * 1000)
+                    if waited_ms > 0:
+                        logger.info(
+                            (
+                                "[ConversationCompaction] event=model_compaction_quiet_wait "
+                                "reason=stable conversation_id={} mode={} trigger={} source={} "
+                                "waited_ms={} quiet_ms={} entry_count={} samples={}"
+                            ),
+                            conversation_id,
+                            mode,
+                            trigger,
+                            source,
+                            waited_ms,
+                            quiet_ms,
+                            fingerprint.get("entry_count"),
+                            samples,
+                        )
+                    return {
+                        "waited": waited_ms > 0,
+                        "reason": "stable",
+                        "quiet_ms": quiet_ms,
+                        "timeout_ms": timeout_ms,
+                        "waited_ms": waited_ms,
+                        "entry_count": fingerprint.get("entry_count"),
+                        "samples": samples,
+                    }
+            else:
+                stable_since = now
+                last_fingerprint = dict(fingerprint)
+                last_entry_count = int(fingerprint.get("entry_count") or 0)
+
+            remaining_seconds = deadline - now
+            if remaining_seconds <= 0:
+                waited_ms = int(max(0.0, now - started_at) * 1000)
+                logger.info(
+                    (
+                        "[ConversationCompaction] event=model_compaction_quiet_wait "
+                        "reason=timeout conversation_id={} mode={} trigger={} source={} "
+                        "waited_ms={} quiet_ms={} timeout_ms={} entry_count={} samples={}"
+                    ),
+                    conversation_id,
+                    mode,
+                    trigger,
+                    source,
+                    waited_ms,
+                    quiet_ms,
+                    timeout_ms,
+                    last_entry_count,
+                    samples,
+                )
+                return {
+                    "waited": waited_ms > 0,
+                    "reason": "timeout",
+                    "quiet_ms": quiet_ms,
+                    "timeout_ms": timeout_ms,
+                    "waited_ms": waited_ms,
+                    "entry_count": last_entry_count,
+                    "samples": samples,
+                }
+
+            sleep_seconds = min(
+                max(quiet_ms / 2000.0, 0.05),
+                0.25,
+                max(remaining_seconds, 0.0),
+            )
+            await asyncio.sleep(sleep_seconds)
+
     async def _worker(self) -> None:
         while True:
             task = await self._queue.get()
@@ -1157,12 +1312,21 @@ class ConversationContextCompactionService:
             self._running_keys.add(key)
             try:
                 logger.info(
-                    "[ConversationCompaction] task start conversation_id={} task_kind={} mode={} trigger={} source={}",
+                    (
+                        "[ConversationCompaction] event=model_compaction_task_started "
+                        "conversation_id={} task_kind={} mode={} trigger={} source={}"
+                    ),
                     task.conversation_id,
                     task.task_kind,
                     task.mode,
                     task.trigger,
                     task.source,
+                )
+                await self._wait_for_item_stream_quiet(
+                    int(task.conversation_id),
+                    mode=task.mode,
+                    trigger=task.trigger,
+                    source=task.source,
                 )
                 await self._compact_conversation(task.conversation_id, mode=task.mode)
             except asyncio.CancelledError:
@@ -1170,8 +1334,9 @@ class ConversationContextCompactionService:
             except ConversationItemStreamUnavailableError as exc:
                 logger.warning(
                     (
-                        "[ConversationCompaction] skipped conversation_id={} task_kind={} mode={} "
-                        "trigger={} source={} code=conversation_item_stream_missing"
+                        "[ConversationCompaction] event=model_compaction_skipped reason=item_stream_missing "
+                        "conversation_id={} task_kind={} mode={} trigger={} source={} "
+                        "code=conversation_item_stream_missing"
                     ),
                     exc.conversation_id,
                     task.task_kind,
@@ -1181,7 +1346,10 @@ class ConversationContextCompactionService:
                 )
             except Exception as exc:
                 logger.exception(
-                    "[ConversationCompaction] failed conversation_id={} task_kind={} mode={} trigger={} source={}: {}",
+                    (
+                        "[ConversationCompaction] event=model_compaction_failed reason=exception "
+                        "conversation_id={} task_kind={} mode={} trigger={} source={}: {}"
+                    ),
                     task.conversation_id,
                     task.task_kind,
                     task.mode,

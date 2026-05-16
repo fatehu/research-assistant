@@ -1,3 +1,14 @@
+"""ReAct agent 核心编排模块。
+
+本文件负责把一次聊天请求组织成完整的 ReAct 运行：
+1. 准备运行时上下文、历史消息、长期记忆、skill 与 RAG 临时配置；
+2. 根据模型能力选择 function calling 或 XML action 协议；
+3. 在每轮中让模型 Think，再按需 Act 调工具，随后把 Observation 写回上下文；
+4. 控制上下文预算、会话压缩、工具防护、引用校验和运行持久化。
+
+注意：这里是“编排层”，具体工具实现、LLM 调用、上下文压缩和数据库读写分别下沉到
+agent_tools、llm_service、conversation_context_compaction_service、agent_runtime_service 等模块。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -52,6 +63,8 @@ from app.services.smart_chunking.token_utils import estimate_tokens
 
 
 class AgentState(Enum):
+    """单次 ReAct run 的状态机枚举，用于事件流和持久化记录。"""
+
     IDLE = "idle"
     THINKING = "thinking"
     ACTING = "acting"
@@ -63,6 +76,8 @@ class AgentState(Enum):
 
 @dataclass
 class AgentStep:
+    """面向 UI 和 agent_runs/agent_steps 的标准步骤记录。"""
+
     step_type: str
     content: str
     timestamp: datetime = field(default_factory=datetime.now)
@@ -74,6 +89,13 @@ class AgentStep:
 
 @dataclass
 class AgentRuntimeContext:
+    """外部 API 传入 AgentCore 的运行时边界信息。
+
+    这里保存的是“本轮运行在哪个用户、频道、会话、notebook、turn 里”的信息，
+    以及 live_event_callback 这类跨工具实时事件通道。它不直接参与模型 prompt，
+    但会决定工具权限、记忆 scope、conversation metadata 的读写位置。
+    """
+
     user_id: Optional[int] = None
     channel: str = "chat"
     conversation_id: Optional[int] = None
@@ -89,6 +111,16 @@ class AgentRuntimeContext:
 
 @dataclass
 class AgentContext:
+    """单次 ReAct 执行过程中的可变工作台。
+
+    AgentRuntimeContext 描述外部运行环境；AgentContext 则记录本轮内部状态：
+    - messages/history_messages 是真正送入模型前的候选上下文；
+    - steps/persist_events 是 UI 事件流与数据库运行记录；
+    - allowed_source_labels/source_items_by_label 负责回答阶段的引用白名单；
+    - context_debug/message_tokens_* 记录上下文预算和压缩观测数据；
+    - tool_failure_streaks/mid_run_compactions 等字段用于运行中防护。
+    """
+
     messages: List[Dict[str, Any]]
     turn_id: Optional[str] = None
     steps: List[AgentStep] = field(default_factory=list)
@@ -141,6 +173,12 @@ class AgentContext:
 
 @dataclass
 class ParsedToolCall:
+    """模型输出归一化后的工具调用。
+
+    function calling 和 XML action 两条协议最终都会转成这个结构，后续工具执行层
+    不再关心模型原始输出格式。
+    """
+
     call_id: str
     name: str
     arguments: Dict[str, Any]
@@ -150,6 +188,12 @@ class ParsedToolCall:
 
 @dataclass
 class ExecutedToolCall:
+    """单个工具调用的执行结果。
+
+    action_event/observation_event 用于前端事件流；tool_message 会写回 LLM 上下文；
+    metadata/result_data 则承载引用、RAG 调试信息、错误协议等结构化数据。
+    """
+
     action_event: Dict[str, Any]
     observation_event: Dict[str, Any]
     tool_message: Dict[str, Any]
@@ -169,6 +213,8 @@ class ExecutedToolCall:
 
 @dataclass
 class RoutingDecision:
+    """本轮是否需要进入工具链的轻量路由结果。"""
+
     intent: str = "general_chat"
     intent_user_text: str = ""
     carry_over_previous_goal: bool = False
@@ -197,6 +243,12 @@ class PreparedContextPreview:
 
 
 class AgentCore:
+    """ReAct 核心编排器。
+
+    这个类只负责“什么时候问模型、什么时候调工具、什么时候停下来、如何持久化”。
+    具体能力通过依赖注入的 LLMService、ToolRegistry 和 AgentRuntimeService 完成。
+    """
+
     SYSTEM_PROMPT = """你是一个智能AI助手，可以使用以下工具来帮助回答问题：
 
 {tools_description}
@@ -280,6 +332,7 @@ class AgentCore:
     _PROJECT_TOOL_NAMES: set[str] = {
         "project_tree",
         "project_read_file",
+        "project_write_report",
         "project_write_file",
         "project_bash",
         "project_claude",
@@ -373,6 +426,7 @@ class AgentCore:
         runtime_context: Optional[AgentRuntimeContext] = None,
         runtime_service: Optional[AgentRuntimeService] = None,
     ):
+        # 运行期依赖全部注入，便于测试时替换成 fake/mock，也避免核心循环直接绑定实现。
         self.llm = llm_service
         self.tools = tool_registry
         self.max_iterations = max_iterations if max_iterations is not None else settings.react_max_iterations
@@ -760,6 +814,10 @@ class AgentCore:
             )
 
         scope_reminders = {
+            "project_write_report": (
+                "`project_write_report` 只用于把调研报告、调优计划或 worker handoff 写入 "
+                "`reference/reports/*.md`；代码、脚本、数据和 repo/source 文件仍交给 Claude Code。"
+            ),
             "project_bash": (
                 "`project_bash` 只适用于明确允许主 agent 在 Project 根目录执行一次受控命令的场景；"
                 "它不是 Claude Code 失败后的 fallback worker。"
@@ -1198,6 +1256,12 @@ class AgentCore:
         self,
         messages: Optional[Sequence[Dict[str, Any]]],
     ) -> Optional[RoutingDecision]:
+        """判断本轮是否应短路成直接回答，或必须进入工具模式。
+
+        当前实现优先尊重 RAG 临时覆盖：只要本轮显式启用 RAG，就强制 needs_tools=True。
+        否则使用规则短路识别简单问答/追问，避免每次都走完整 ReAct 工具循环。
+        """
+
         latest_user_text = self._latest_user_text(messages)
         if not latest_user_text:
             self._routing_decision = None
@@ -1214,6 +1278,12 @@ class AgentCore:
                 source="rag_override",
                 latest_user_text=latest_user_text,
             )
+            self._routing_decision = decision
+            return decision
+        decision = self._maybe_short_circuit_direct_routing(messages)
+        if decision is None:
+            decision = self._maybe_short_circuit_followup_direct_routing(messages)
+        if decision is not None:
             self._routing_decision = decision
             return decision
         self._routing_decision = None
@@ -3713,6 +3783,7 @@ class AgentCore:
         compression_results = await self.contextual_compression_service.compress_chunks(query, compression_inputs)
         compression_map = {item.source_id: item for item in compression_results}
         parts: List[str] = []
+        compression_applied = False
 
         for offset, row in enumerate(valid_rows):
             source_id = base_source_id + offset
@@ -3720,15 +3791,18 @@ class AgentCore:
             compressed = compression_map.get(source_id)
             if compressed and compressed.relevant_content:
                 content = compressed.relevant_content
-                score = compressed.relevance_score
                 if context is not None:
-                    context.compression_success_chunks += 1
+                    if compressed.used_compression and not compressed.fallback_reason:
+                        context.compression_success_chunks += 1
+                    else:
+                        context.compression_fallback_chunks += 1
+                if compressed.used_compression and not compressed.fallback_reason:
+                    compression_applied = True
             else:
                 raw = str(row.get("content") or "").strip()
                 if not raw:
                     continue
                 content = f"[{source_label}] {raw[:320]}" + ("..." if len(raw) > 320 else "")
-                score = 0.0
                 if context is not None:
                     context.compression_fallback_chunks += 1
 
@@ -3739,14 +3813,14 @@ class AgentCore:
             parts.append(
                 f"\n[{source_label}] (retrieval score {retrieval_score:.1f}%)\n"
                 f"Source: {kb_name} / {doc_name} / chunk {chunk_idx}\n"
-                f"Compression score: {score:.1f}/10\n"
                 f"Content: {content}"
             )
         if not parts:
             return result.output
         if context is not None:
             context.next_knowledge_source_label = base_source_id + len(valid_rows)
-        return f"Compressed contexts: {len(parts)}\n" + "".join(parts)
+        header = "Compressed contexts" if compression_applied else "Knowledge contexts"
+        return f"{header}: {len(parts)}\n" + "".join(parts)
 
     def _format_knowledge_observation_without_compression(
         self,
@@ -4124,7 +4198,82 @@ class AgentCore:
 
     @staticmethod
     def _compact_debug_text(value: Any, limit: int = 180) -> str:
-        return re.sub(r"\s+", " ", str(value or "")).strip()
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        try:
+            max_chars = int(limit)
+        except (TypeError, ValueError):
+            max_chars = 180
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+        if max_chars <= 3:
+            return text[:max_chars]
+        return text[: max_chars - 3].rstrip() + "..."
+
+    @classmethod
+    def _normalize_context_observability_event(cls, event: Any) -> Dict[str, Any]:
+        if not isinstance(event, dict):
+            return {}
+
+        def _clean_text(value: Any, limit: int = 96) -> str:
+            return cls._compact_debug_text(value, limit)[:limit]
+
+        kind = _clean_text(event.get("kind") or event.get("event") or "", 72)
+        if not kind:
+            return {}
+
+        row: Dict[str, Any] = {"kind": kind}
+        for key, limit in {
+            "phase": 72,
+            "reason": 96,
+            "mode": 48,
+            "trigger": 96,
+            "source": 96,
+        }.items():
+            value = _clean_text(event.get(key), limit)
+            if value:
+                row[key] = value
+
+        for key in {
+            "input_tokens_before",
+            "input_tokens_after",
+            "effective_budget",
+            "compacted_messages",
+            "summary_chars",
+            "source_entry_count",
+            "current_entry_count",
+            "message_count",
+            "trigger_tokens",
+        }:
+            if event.get(key) is None:
+                continue
+            try:
+                row[key] = max(int(event.get(key) or 0), 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+        for key in {"deferred", "committed", "stale", "overflow"}:
+            if key in event:
+                row[key] = bool(event.get(key))
+        return row
+
+    @classmethod
+    def _append_context_observability_event(cls, context: AgentContext, event: Dict[str, Any]) -> None:
+        normalized = cls._normalize_context_observability_event(event)
+        if not normalized:
+            return
+        payload = dict(context.context_debug or {})
+        events = [
+            item
+            for item in (
+                cls._normalize_context_observability_event(raw)
+                for raw in list(payload.get("context_observability_events") or [])
+            )
+            if item
+        ]
+        events.append(normalized)
+        payload["context_observability_version"] = "context_observability.v1"
+        payload["context_observability_events"] = events[-16:]
+        context.context_debug = payload
 
     @classmethod
     def _debug_message_preview(cls, item: Dict[str, Any]) -> str:
@@ -4165,6 +4314,7 @@ class AgentCore:
         total_messages: int,
         older_messages_count: int,
         recent_messages_count: int,
+        context_observability_events: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         def _preview_messages(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, str]]:
             preview_rows: List[Dict[str, str]] = []
@@ -4219,9 +4369,53 @@ class AgentCore:
             for item in list(skill_resolution.get("active_skills") or [])
             if isinstance(item, dict)
         ]
+        existing_events = [
+            item
+            for item in (
+                self._normalize_context_observability_event(raw)
+                for raw in list((context.context_debug or {}).get("context_observability_events") or [])
+            )
+            if item
+        ]
+        new_events = [
+            item
+            for item in (
+                self._normalize_context_observability_event(raw)
+                for raw in list(context_observability_events or [])
+            )
+            if item
+        ]
+        budget_event = self._normalize_context_observability_event(
+            {
+                "kind": "budget_checked",
+                "phase": "prepare_llm_messages",
+                "reason": "within_budget" if int(max(0, estimated_tokens)) <= int(max(0, budget)) else "overflow_after_trim",
+                "input_tokens_before": int(max(0, context.message_tokens_before_trim)),
+                "input_tokens_after": int(max(0, estimated_tokens)),
+                "effective_budget": int(max(0, budget)),
+                "message_count": int(max(0, total_messages)),
+                "overflow": int(max(0, estimated_tokens)) > int(max(0, budget)),
+            }
+        )
+        observability_events = (existing_events + new_events + ([budget_event] if budget_event else []))[-16:]
+        deterministic_event_kinds = {
+            "deterministic_system_compression",
+            "deterministic_content_truncation",
+            "deterministic_summary_truncation",
+            "token_budget_overflow",
+        }
+        deterministic_reasons = sorted(
+            {
+                str(item.get("reason") or "").strip()
+                for item in observability_events
+                if str(item.get("kind") or "") in deterministic_event_kinds and str(item.get("reason") or "").strip()
+            }
+        )
 
         payload = {
             "version": "chat_context_debug.v1",
+            "context_observability_version": "context_observability.v1",
+            "context_observability_events": observability_events,
             "iteration": int(max(0, context.iteration)),
             "context_truncated": bool(context.context_truncated),
             "estimated_tokens": int(max(0, estimated_tokens)),
@@ -4236,6 +4430,13 @@ class AgentCore:
             "completion_reserve_tokens": int(max(0, effective_budget_state.get("completion_reserve_tokens") or 0)),
             "system_prompt_tokens": int(max(0, effective_budget_state.get("system_prompt_tokens") or 0)),
             "tool_schema_tokens_estimate": int(max(0, effective_budget_state.get("tool_schema_tokens_estimate") or 0)),
+            "message_tokens_before_trim": int(max(0, context.message_tokens_before_trim)),
+            "message_tokens_after_trim": int(max(0, estimated_tokens)),
+            "deterministic_truncation_applied": bool(
+                any(str(item.get("kind") or "") in deterministic_event_kinds for item in observability_events)
+            ),
+            "deterministic_truncation_reasons": deterministic_reasons[:8],
+            "token_budget_overflow_after_trim": bool(int(max(0, estimated_tokens)) > int(max(0, budget))),
             "window_turns": int(max(1, window_turns)),
             "message_count_before_trim": int(max(0, total_messages)),
             "message_count_sent": int(max(0, len(llm_messages))),
@@ -4467,6 +4668,16 @@ class AgentCore:
         return older, recently_slid, recent
 
     async def _prepare_llm_messages(self, context: AgentContext, system_prompt: str) -> List[Dict[str, Any]]:
+        """组装最终送给模型的 messages，并执行确定性上下文预算控制。
+
+        核心策略：
+        1. 把持久历史、当前回合临时消息拆开，避免把 UI 临时注入误当长期历史；
+        2. 按 older / recently_slid / recent 三段滑动窗口处理历史；
+        3. 优先插入 conversation_state、持久压缩摘要、记忆、RAG 预取证据等稳定前缀；
+        4. 超预算时先把较早历史压成 system message，再逐步压缩最近滑出的上下文；
+        5. 仍超预算时才做内容级截断，并把每一步写入 context_debug 方便排查。
+        """
+
         context.context_truncated = False
         context.message_tokens_before_trim = 0
         context.message_tokens_after_trim = 0
@@ -4475,19 +4686,39 @@ class AgentCore:
             user_text=self._current_user_text(context),
             system_prompt=system_prompt,
         )
+        context_observability_events: List[Dict[str, Any]] = []
         history_source = [
             self._sanitize_message_for_context(item)
             for item in list(context.history_messages or [])
             if isinstance(item, dict)
         ]
         if history_source and len(sanitized) >= len(history_source):
+            # history_source 是数据库/ItemStream 中的稳定历史；其后的部分通常是本轮临时注入。
             ephemeral_messages = sanitized[len(history_source):]
         else:
+            # 如果没有稳定历史，退化为把当前 messages 全部当作历史来源处理。
             history_source = list(sanitized)
             ephemeral_messages: List[Dict[str, Any]] = []
         anchor_summary = ""
         recently_slid: List[Dict[str, Any]] = []
         if not bool(getattr(settings, "agent_context_budget_enabled", True)):
+            disabled_tokens = self._estimate_messages_tokens(sanitized)
+            context.message_tokens_before_trim = disabled_tokens
+            context.message_tokens_after_trim = disabled_tokens
+            context_observability_events.append(
+                {
+                    "kind": "budget_disabled",
+                    "phase": "prepare_llm_messages",
+                    "reason": "agent_context_budget_enabled_false",
+                    "input_tokens_before": disabled_tokens,
+                    "input_tokens_after": disabled_tokens,
+                    "effective_budget": int(
+                        budget_state.get("effective_budget")
+                        or self._resolve_system_budget_cap(model_context_window=self._current_model_context_window())
+                    ),
+                    "message_count": len(sanitized),
+                }
+            )
             context.context_debug = self._build_context_debug_payload(
                 context=context,
                 anchor_summary=anchor_summary,
@@ -4506,6 +4737,7 @@ class AgentCore:
                 total_messages=len(sanitized),
                 older_messages_count=0,
                 recent_messages_count=len(sanitized),
+                context_observability_events=context_observability_events,
             )
             return sanitized
 
@@ -4546,6 +4778,8 @@ class AgentCore:
             replacement_history_entries=replacement_history_entries,
             memory_prompt=memory_prompt,
         )
+        # candidate 是“稳定前缀 + 压缩摘要 + RAG 预取 + 窗口消息 + 本轮临时消息”的最终候选。
+        # 后续所有预算判断都围绕 candidate 反复重建，确保压缩结果真正进入模型输入。
         summary_trigger_tokens = max(int(getattr(settings, "agent_context_summary_trigger_tokens", 7000) or 7000), 0)
         preserve_recent_turns = max(int(getattr(settings, "agent_context_preserve_recent_turns", 2) or 2), 1)
         overflow_compression_messages: List[Dict[str, Any]] = []
@@ -4557,6 +4791,7 @@ class AgentCore:
         ]
 
         if older:
+            # older 已经滑出可见窗口，优先转成系统压缩摘要，而不是直接丢弃。
             compressed_older = await self._build_system_compression_message(
                 older,
                 title="更早历史系统压缩",
@@ -4569,6 +4804,15 @@ class AgentCore:
                     older_summary_parts.append(older_summary)
                     context.context_summary = older_summary
                 context.context_truncated = True
+                context_observability_events.append(
+                    {
+                        "kind": "deterministic_system_compression",
+                        "phase": "prepare_llm_messages",
+                        "reason": "older_history_slid",
+                        "compacted_messages": len(older),
+                        "effective_budget": int(max(0, budget_state.get("effective_budget") or 0)),
+                    }
+                )
 
         def build_candidate(*, opportunistic_summary: str = "") -> List[Dict[str, Any]]:
             dynamic_prefixes = [dict(item) for item in prefixes]
@@ -4589,6 +4833,7 @@ class AgentCore:
         budget = max(int(budget_state.get("effective_budget") or 0), 256)
 
         if self._estimate_messages_tokens(candidate) > budget and raw_recently_slid:
+            # 第一道溢出处理：压缩 recently_slid，保留真正 recent 的完整上下文。
             compressed_slid = await self._build_system_compression_message(
                 raw_recently_slid,
                 title="滑出窗口历史系统压缩",
@@ -4599,11 +4844,23 @@ class AgentCore:
                 slid_summary = self._summarize_messages(raw_recently_slid, max_lines=8)
                 if slid_summary:
                     older_summary_parts.append(slid_summary)
+                slid_count = len(raw_recently_slid)
                 raw_recently_slid = []
                 context.context_truncated = True
+                context_observability_events.append(
+                    {
+                        "kind": "deterministic_system_compression",
+                        "phase": "prepare_llm_messages",
+                        "reason": "recently_slid_over_budget",
+                        "compacted_messages": slid_count,
+                        "input_tokens_before": self._estimate_messages_tokens(candidate),
+                        "effective_budget": budget,
+                    }
+                )
                 candidate = build_candidate()
 
         if self._estimate_messages_tokens(candidate) > budget and raw_recent:
+            # 第二道溢出处理：在保留最近若干轮的前提下压缩较早的 recent。
             compactable_recent, preserved_recent = self._split_messages_preserving_recent_turns(
                 raw_recent,
                 preserve_recent_turns=preserve_recent_turns,
@@ -4621,9 +4878,20 @@ class AgentCore:
                         older_summary_parts.append(recent_summary)
                     raw_recent = preserved_recent
                     context.context_truncated = True
+                    context_observability_events.append(
+                        {
+                            "kind": "deterministic_system_compression",
+                            "phase": "prepare_llm_messages",
+                            "reason": "recent_over_budget",
+                            "compacted_messages": len(compactable_recent),
+                            "input_tokens_before": self._estimate_messages_tokens(candidate),
+                            "effective_budget": budget,
+                        }
+                    )
                     candidate = build_candidate()
 
         if self._estimate_messages_tokens(candidate) > budget and raw_recent:
+            # 第三道溢出处理：进一步收窄 recent，仅强保留最近 1 轮，防止请求完全超窗。
             compactable_recent, preserved_recent = self._split_messages_preserving_recent_turns(
                 raw_recent,
                 preserve_recent_turns=1,
@@ -4641,6 +4909,16 @@ class AgentCore:
                         older_summary_parts.append(recent_summary)
                     raw_recent = preserved_recent
                     context.context_truncated = True
+                    context_observability_events.append(
+                        {
+                            "kind": "deterministic_system_compression",
+                            "phase": "prepare_llm_messages",
+                            "reason": "near_context_over_budget",
+                            "compacted_messages": len(compactable_recent),
+                            "input_tokens_before": self._estimate_messages_tokens(candidate),
+                            "effective_budget": budget,
+                        }
+                    )
                     candidate = build_candidate()
 
         opportunistic_summary = ""
@@ -4650,20 +4928,54 @@ class AgentCore:
             and not replacement_history_entries
             and self._estimate_messages_tokens(history_source + ephemeral_messages) >= summary_trigger_tokens
         ):
+            # 没有正式 compacted_history 时，长上下文也会生成一次机会性摘要作为稳定锚点。
             opportunistic_summary = self._summarize_messages(raw_recently_slid, max_lines=10)
             if opportunistic_summary:
                 older_summary_parts.append(opportunistic_summary)
+                context_observability_events.append(
+                    {
+                        "kind": "deterministic_system_compression",
+                        "phase": "prepare_llm_messages",
+                        "reason": "recently_slid_summary_trigger",
+                        "compacted_messages": len(raw_recently_slid),
+                        "input_tokens_before": self._estimate_messages_tokens(history_source + ephemeral_messages),
+                        "effective_budget": budget,
+                    }
+                )
 
         candidate = build_candidate(opportunistic_summary=opportunistic_summary)
+        content_truncation_input_tokens = self._estimate_messages_tokens(candidate)
+        # 内容级截断是最后兜底：它只在消息级压缩仍不够时触发。
         candidate, content_truncated = await self._apply_content_truncation_until_budget(candidate, budget=budget)
         if content_truncated:
             context.context_truncated = True
+            context_observability_events.append(
+                {
+                    "kind": "deterministic_content_truncation",
+                    "phase": "prepare_llm_messages",
+                    "reason": "token_budget_overflow",
+                    "input_tokens_before": content_truncation_input_tokens,
+                    "input_tokens_after": self._estimate_messages_tokens(candidate),
+                    "effective_budget": budget,
+                }
+            )
 
         older_summary = "\n".join(part for part in older_summary_parts if str(part or "").strip())
 
         estimated_tokens = self._estimate_messages_tokens(candidate)
         if estimated_tokens > budget:
             context.context_truncated = True
+            context_observability_events.append(
+                {
+                    "kind": "token_budget_overflow",
+                    "phase": "prepare_llm_messages",
+                    "reason": "overflow_after_trim",
+                    "input_tokens_before": context.message_tokens_before_trim,
+                    "input_tokens_after": estimated_tokens,
+                    "effective_budget": budget,
+                    "overflow": True,
+                }
+            )
         context.message_tokens_after_trim = estimated_tokens
         context.context_debug = self._build_context_debug_payload(
             context=context,
@@ -4680,6 +4992,7 @@ class AgentCore:
             total_messages=len(history_source) + len(ephemeral_messages),
             older_messages_count=len(older),
             recent_messages_count=len(recent) + len(ephemeral_messages),
+            context_observability_events=context_observability_events,
         )
         return candidate
 
@@ -4706,6 +5019,13 @@ class AgentCore:
             return None
 
     async def _gather_runtime_compaction_inputs(self, context: AgentContext) -> Dict[str, Any]:
+        """收集一次正式会话压缩所需的数据库侧输入。
+
+        这里不直接使用 context.messages 作为唯一来源，而是重新读取 conversation item_stream
+        和 tool_ledger。原因是长对话中可能已有后台压缩边界、工具摘要、权限中断等结构化条目，
+        只有 canonical_history 才能知道哪些条目仍属于当前有效历史。
+        """
+
         conversation_id = getattr(self.runtime_context, "conversation_id", None)
         if conversation_id is None:
             raise RuntimeError("conversation_id is required for runtime compaction")
@@ -4724,6 +5044,7 @@ class AgentCore:
         canonical = store.canonical_history(
             fallback_boundary_message_id=fallback_boundary_message_id,
         )
+        # fingerprint 用于乐观并发控制：生成摘要到提交之间 item_stream 若变化，就拒绝旧摘要落库。
         source_fingerprint = AgentRuntimeService.build_item_stream_fingerprint(
             item_stream_payload,
             fallback_boundary_message_id=fallback_boundary_message_id,
@@ -4743,6 +5064,7 @@ class AgentCore:
         tool_rows: List[Dict[str, Any]] = []
         tool_ledger_payload = await self.runtime_service.get_conversation_tool_ledger(int(conversation_id))
         if isinstance(tool_ledger_payload, dict):
+            # tool_ledger 可能包含已经被 compact_boundary 覆盖的旧 turn，这里只保留当前 active turn。
             active_turn_ids = {
                 str(entry.turn_id or "").strip()
                 for entry in canonical.active_entries
@@ -4756,6 +5078,7 @@ class AgentCore:
                     continue
                 tool_rows.append(dict(row))
         if not tool_rows:
+            # 老会话可能没有独立 tool_ledger，退化为从 item_stream 中恢复工具摘要。
             tool_rows = ConversationContextCompactionService._item_stream_to_tool_rows(active_entries)
 
         latest_message_id = self._latest_item_stream_message_id(active_entries)
@@ -4781,6 +5104,12 @@ class AgentCore:
         tool_rows: Sequence[Dict[str, Any]],
         latest_message_id: Optional[int],
     ) -> tuple[Dict[str, Any], Any]:
+        """调用压缩服务生成 context_state 与 compacted_history。
+
+        正常路径由 ConversationContextCompactionService.build_artifacts 生成模型摘要；
+        如果服务没有产出 compacted_history，则用确定性窗口摘要兜底，保证 run 仍能继续。
+        """
+
         from app.services.conversation_context_compaction_service import ConversationContextCompactionService
 
         artifacts = await ConversationContextCompactionService.build_artifacts(
@@ -4842,6 +5171,13 @@ class AgentCore:
         mode: str,
         history_event_title: str,
     ) -> bool:
+        """把一次正式压缩结果提交回 conversation metadata/item_stream。
+
+        提交必须经过 commit_conversation_compaction_if_current：只有 source_fingerprint
+        与当前 item_stream 一致时才会落库，避免后台任务或并发回合覆盖较新的历史。
+        成功后会刷新 context.messages，使后续 iteration 立即基于压缩后的替代历史继续。
+        """
+
         from app.services.conversation_context_compaction_service import ConversationItemStreamUnavailableError
 
         compacted_history = dict(compacted_history or {})
@@ -4862,6 +5198,8 @@ class AgentCore:
             f"source_entry_count={(source_fingerprint or {}).get('entry_count')}"
         )
         boundary_entry = {
+            # compact_boundary 是 item_stream 的分界线：它告诉 canonical_history
+            # “边界以前的 message 可由 replacement_history/summary 替代”。
             "kind": "compact_boundary",
             "turn_id": context.turn_id,
             "role": "system",
@@ -4911,6 +5249,18 @@ class AgentCore:
                 f"{mode}_compaction_source_fingerprint": dict(source_fingerprint or {}),
                 f"{mode}_compaction_current_fingerprint": current_fingerprint,
             }
+            self._append_context_observability_event(
+                context,
+                {
+                    "kind": "model_compaction_skipped",
+                    "phase": "runtime_compaction",
+                    "reason": "stale_source",
+                    "mode": mode,
+                    "source_entry_count": (source_fingerprint or {}).get("entry_count"),
+                    "current_entry_count": current_fingerprint.get("entry_count"),
+                    "stale": True,
+                },
+            )
             return False
 
         refreshed_item_stream = await self.runtime_service.get_conversation_item_stream(int(conversation_id))
@@ -4937,9 +5287,28 @@ class AgentCore:
             "formal_compaction_mode": mode,
             "formal_compaction_applied": True,
         }
+        self._append_context_observability_event(
+            context,
+            {
+                "kind": "model_compaction_committed",
+                "phase": "runtime_compaction",
+                "reason": "committed",
+                "mode": mode,
+                "compacted_messages": artifacts.compacted_message_count,
+                "summary_chars": len(artifacts.summary_text or ""),
+                "source_entry_count": (source_fingerprint or {}).get("entry_count"),
+                "committed": True,
+            },
+        )
         return True
 
     async def _maybe_pre_turn_compact(self, context: AgentContext) -> bool:
+        """回合开始前的压缩调度。
+
+        pre-turn 压缩不在请求路径里同步等待模型摘要，而是把任务投递给后台维护队列。
+        当前回合继续使用已有上下文，下一轮再从 compacted_history/item_stream 中受益。
+        """
+
         if not bool(getattr(settings, "agent_context_budget_enabled", True)):
             return False
         if not bool(getattr(settings, "agent_pre_turn_compaction_enabled", True)):
@@ -4953,6 +5322,15 @@ class AgentCore:
                 **dict(context.context_debug or {}),
                 "pre_turn_compaction_skipped": "runtime_item_stream_unavailable",
             }
+            self._append_context_observability_event(
+                context,
+                {
+                    "kind": "model_compaction_skipped",
+                    "phase": "pre_turn_compaction",
+                    "reason": "runtime_item_stream_unavailable",
+                    "mode": "pre_turn_deferred",
+                },
+            )
             return False
 
         inputs = await self._gather_runtime_compaction_inputs(context)
@@ -4966,6 +5344,15 @@ class AgentCore:
                 **dict(context.context_debug or {}),
                 "pre_turn_compaction_skipped": "no_history_rows",
             }
+            self._append_context_observability_event(
+                context,
+                {
+                    "kind": "model_compaction_skipped",
+                    "phase": "pre_turn_compaction",
+                    "reason": "no_history_rows",
+                    "mode": "pre_turn_deferred",
+                },
+            )
             return False
 
         window_turns = max(int(getattr(settings, "agent_context_window_turns", 8) or 8), 1)
@@ -4986,6 +5373,16 @@ class AgentCore:
                 "pre_turn_compaction_skipped": "no_compactable_history",
                 "pre_turn_compaction_candidate_messages": len(candidate_rows),
             }
+            self._append_context_observability_event(
+                context,
+                {
+                    "kind": "model_compaction_skipped",
+                    "phase": "pre_turn_compaction",
+                    "reason": "no_compactable_history",
+                    "mode": "pre_turn_deferred",
+                    "message_count": len(candidate_rows),
+                },
+            )
             return False
 
         effective_budget = max(
@@ -5003,6 +5400,7 @@ class AgentCore:
         candidate_tokens = self._estimate_messages_tokens(candidate_rows)
         old_history_exists = bool(older_rows)
         pressure_triggered = candidate_tokens >= trigger_tokens
+        # 没有真正滑出的旧历史、也没达到 token 压力时，不启动后台压缩，避免频繁空转。
         if not old_history_exists and not pressure_triggered:
             context.context_debug = {
                 **dict(context.context_debug or {}),
@@ -5011,6 +5409,18 @@ class AgentCore:
                 "pre_turn_compaction_trigger_tokens": trigger_tokens,
                 "pre_turn_compaction_compactable_messages": len(compactable_rows),
             }
+            self._append_context_observability_event(
+                context,
+                {
+                    "kind": "model_compaction_skipped",
+                    "phase": "pre_turn_compaction",
+                    "reason": "below_pressure",
+                    "mode": "pre_turn_deferred",
+                    "input_tokens_before": candidate_tokens,
+                    "trigger_tokens": trigger_tokens,
+                    "compacted_messages": len(compactable_rows),
+                },
+            )
             return False
 
         from app.services.conversation_context_compaction_service import get_conversation_context_compaction_service
@@ -5041,9 +5451,31 @@ class AgentCore:
         }
         if isinstance(enqueue_result.get("duplicate_state"), str):
             context.context_debug["pre_turn_compaction_duplicate_state"] = enqueue_result.get("duplicate_state")
+        self._append_context_observability_event(
+            context,
+            {
+                "kind": "model_compaction_deferred",
+                "phase": "pre_turn_compaction",
+                "reason": enqueue_reason,
+                "mode": "pre_turn_deferred",
+                "trigger": trigger,
+                "source": "react_agent.pre_turn",
+                "input_tokens_before": candidate_tokens,
+                "trigger_tokens": trigger_tokens,
+                "compacted_messages": len(compactable_rows),
+                "deferred": deferred,
+            },
+        )
         return False
 
     async def _maybe_mid_run_compact(self, context: AgentContext, system_prompt: str) -> bool:
+        """运行中压缩。
+
+        当某个 ReAct run 已经执行多轮工具调用，messages 可能快速膨胀。
+        mid-run 压缩会同步生成并提交 compact_boundary，然后重建 context.messages，
+        让同一个 run 的后续 iteration 直接用压缩后的历史继续。
+        """
+
         if not bool(getattr(settings, "agent_mid_run_compaction_enabled", True)):
             return False
         active_skill_names = [
@@ -5078,6 +5510,7 @@ class AgentCore:
         default_trigger = max(int(effective_budget * 0.6), 2048)
         trigger_tokens = max(configured_trigger or default_trigger, 256)
         message_pressure_triggered = int(context.message_tokens_before_trim or 0) >= trigger_tokens
+        # 只有上下文已经被裁剪，或输入 token 接近触发线时，才值得付出同步压缩成本。
         if not bool(context.context_truncated) and not message_pressure_triggered:
             return False
 
@@ -5161,6 +5594,12 @@ class AgentCore:
         return out
 
     def _append_step_from_event(self, context: AgentContext, event: Dict[str, Any]) -> None:
+        """把流式事件同步到 context.steps。
+
+        前端看到的是 event stream；后端持久化和最终 done payload 需要标准 AgentStep。
+        这个函数就是两者之间的轻量投影层。
+        """
+
         et = event.get("type")
         data = event.get("data")
         if et == "thought":
@@ -5598,6 +6037,16 @@ class AgentCore:
         *,
         parallel_group: str,
     ) -> ExecutedToolCall:
+        """执行单个工具调用，并把结果标准化为 observation。
+
+        这里集中处理工具执行前后的所有核心约束：
+        - workflow_binding 注入，保证 paper/codelab 等长流程能自动带上 project_id；
+        - selected_tools 与 decision_state 双重门禁，限制模型调用非本轮允许工具；
+        - project_claude/docx Claude 工具的 live event 转发；
+        - RAG/web_search observation 压缩与引用白名单登记；
+        - ToolResult 到 ExecutedToolCall 的事件、错误协议、ledger metadata 投影。
+        """
+
         effective_arguments = self._apply_tool_call_overrides(
             call.name,
             call.arguments,
@@ -5631,6 +6080,8 @@ class AgentCore:
             live_event_token = set_tool_live_event_emitter(self.runtime_context.live_event_callback)
         try:
             if call.arguments_error:
+                # 模型给出的 arguments 不是合法 JSON 时，不直接抛异常，而是把错误作为 observation
+                # 交回模型，允许下一轮自行修正参数。
                 raw_arguments = self._compact_debug_text(call.arguments_raw, limit=600)
                 contract = build_tool_error_contract(
                     code="invalid_tool_arguments",
@@ -5650,6 +6101,7 @@ class AgentCore:
             elif self._paper_skill_is_active_for_context(context) and call.name in self._PAPER_SKILL_SELF_WORK_TOOL_NAMES:
                 result = self._build_paper_skill_self_work_block_result(call.name)
             elif selected_tools and call.name not in selected_tools:
+                # 工具选择器只把少量工具暴露给当前回合，模型越权调用会被这里拦截。
                 contract = build_tool_error_contract(
                     code="tool_not_allowed",
                     message="当前回合不允许调用该工具",
@@ -5693,6 +6145,8 @@ class AgentCore:
                     and requested_action not in allowed_actions
                     )
                 ):
+                    # decision_state 来自长流程工具摘要，表示当前工作流阶段允许的下一步动作。
+                    # 它比 selected_tools 更细，能阻止模型跳过必要阶段直接写文件/训练/提交。
                     contract = build_tool_error_contract(
                         code="tool_not_allowed_by_decision_state",
                         message="当前决策状态不允许调用该工具",
@@ -5753,6 +6207,7 @@ class AgentCore:
         )
         if result.success and citation_tool_name == "knowledge_search":
             context.knowledge_search_calls += 1
+            # 知识库结果先压缩成短 observation，再从压缩文本中登记 [来源X] 白名单。
             observation_output = await self._compress_knowledge_observation(
                 str(effective_arguments.get("query", "")),
                 result,
@@ -5761,6 +6216,7 @@ class AgentCore:
             context.allowed_source_labels.update(self._extract_source_labels(observation_output))
         elif result.success and citation_tool_name == "web_search":
             context.web_search_calls += 1
+            # web_search 同样只允许回答引用 observation 中真实出现过的网页编号。
             observation_output = await self._compress_web_search_observation(
                 str(call.arguments.get("query", "")),
                 result,
@@ -6590,6 +7046,8 @@ class AgentCore:
         *,
         parallel_group: str,
     ) -> None:
+        """把一组工具调用压成 item_stream 摘要，供后续上下文压缩使用。"""
+
         conversation_id = getattr(self.runtime_context, "conversation_id", None)
         if conversation_id is None:
             return
@@ -6698,6 +7156,11 @@ class AgentCore:
         context: AgentContext,
         entries: Sequence[Dict[str, Any]],
     ) -> None:
+        """把工具 call/result 写入 conversation tool_ledger。
+
+        tool_ledger 是比 UI steps 更稳定的机器可读执行账本，压缩服务会用它生成长期摘要。
+        """
+
         conversation_id = getattr(self.runtime_context, "conversation_id", None)
         if conversation_id is None:
             return
@@ -6719,6 +7182,8 @@ class AgentCore:
         *,
         parallel_group: str,
     ) -> List[Dict[str, Any]]:
+        """生成工具开始执行时的 ledger 条目。"""
+
         created_at = datetime.utcnow().isoformat()
         return [
             {
@@ -6746,6 +7211,8 @@ class AgentCore:
         context: AgentContext,
         executed_calls: Sequence[ExecutedToolCall],
     ) -> List[Dict[str, Any]]:
+        """生成工具完成后的 ledger 条目，包含成功状态、错误、耗时和压缩摘要。"""
+
         entries: List[Dict[str, Any]] = []
         for item in executed_calls:
             status = "authorization_required" if item.permission_required else ("succeeded" if item.success else "failed")
@@ -6776,6 +7243,12 @@ class AgentCore:
         return entries
 
     async def _execute_tool_calls(self, context: AgentContext, calls: Sequence[ParsedToolCall]) -> List[ExecutedToolCall]:
+        """执行模型本轮提出的一批工具调用。
+
+        可并行工具会在同一个 parallel_group 中并发执行；非 parallel_safe 的工具保持顺序执行，
+        这样既能提升读类工具吞吐，又不会让写文件/运行命令这类有副作用的工具互相踩踏。
+        """
+
         if not calls:
             return []
         parallel_enabled = bool(getattr(settings, "agent_parallel_tool_calls_enabled", True))
@@ -6804,8 +7277,10 @@ class AgentCore:
                 tool_obj = self.tools.get(call.name) if hasattr(self.tools, "get") else None
                 is_safe = bool(getattr(tool_obj, "parallel_safe", False)) if tool_obj is not None else False
                 if is_safe:
+                    # parallel_safe 工具可以排队并发；并发上限由 semaphore 控制。
                     pending.append(asyncio.create_task(_run_one(i, sem)))
                 else:
+                    # 碰到非并发安全工具前，先等已启动的安全工具结束，保持副作用顺序。
                     if pending:
                         await asyncio.gather(*pending)
                         pending = []
@@ -6841,6 +7316,14 @@ class AgentCore:
         reasoning: str,
         parsed_calls: Sequence[ParsedToolCall],
     ) -> tuple[List[Dict[str, Any]], bool]:
+        """收束一次 function calling 模型响应。
+
+        模型响应只有两种有效出口：
+        1. parsed_calls 非空：把 assistant tool_calls 写回上下文，执行工具，再返回 done=False；
+        2. answer 非空：经过工作流守卫和引用校验后设置 final_answer，返回 done=True。
+        如果既没有工具也没有答案，则由外层主循环进入下一轮或最终触发轮次兜底。
+        """
+
         events: List[Dict[str, Any]] = []
         answer_hint = self._extract_answer_text(content)
         raw_thought_text = ""
@@ -6860,6 +7343,8 @@ class AgentCore:
         if parsed_calls:
             redundant_queries = self._find_redundant_knowledge_search_queries(context, parsed_calls)
             if redundant_queries:
+                # 对重复 knowledge_search 做软中断：不报错，而是向模型追加 observation，
+                # 让下一轮直接基于已有来源回答，避免同义 query 无限检索。
                 notice = self._redundant_knowledge_search_observation(redundant_queries)
                 events.append(
                     {
@@ -6891,6 +7376,7 @@ class AgentCore:
                     ],
                 }
             )
+            # function calling 协议要求 assistant tool_calls 与随后 tool messages 成对出现。
             executed = await self._execute_tool_calls(context, parsed_calls)
             for item in executed:
                 events.append(item.action_event)
@@ -6900,6 +7386,8 @@ class AgentCore:
 
         answer = answer_hint
         if answer:
+            # 最终答案出口前要经过三类业务守卫：
+            # 文档 artifact 更新失败、DOCX runtime 虚假完成、paper reproduction 未按 skill 调工具。
             guarded = self._maybe_guard_document_artifact_update_failure_answer(context, events=events)
             if guarded is not None:
                 return guarded
@@ -6924,6 +7412,8 @@ class AgentCore:
         llm_messages: List[Dict[str, Any]],
         system_prompt: str,
     ) -> tuple[List[Dict[str, Any]], bool]:
+        """非流式 function calling 单轮执行，用作不支持 stream 时的 fallback。"""
+
         user_text = self._current_user_text(context)
         llm_messages = self._normalize_messages_for_function_calling(llm_messages)
         response = await self.llm.chat_with_tools(
@@ -6948,6 +7438,13 @@ class AgentCore:
         llm_messages: List[Dict[str, Any]],
         system_prompt: str,
     ) -> AsyncGenerator[Dict[str, Any], None]:
+        """function calling 单轮执行。
+
+        如果 provider 支持 chat_with_tools_stream，就消费流式事件并在 done 后统一解析工具调用；
+        如果不支持流式，则退回 _run_iteration_function_calling_once。外层主循环通过
+        _iteration_done 这个内部事件判断是否结束 run。
+        """
+
         user_text = self._current_user_text(context)
         llm_messages = self._normalize_messages_for_function_calling(llm_messages)
         stream_method = getattr(self.llm, "chat_with_tools_stream", None)
@@ -6984,6 +7481,8 @@ class AgentCore:
                 reasoning_parts.append(str(event_data or ""))
                 continue
             if event_type in {"tool_call", "tool_call_delta"}:
+                # 工具调用 delta 只作为 provider 内部增量，不直接透传给 UI；
+                # 最终工具调用以 done payload 中的完整 tool_calls 为准。
                 continue
             if event_type == "done" and isinstance(event_data, dict):
                 final_payload = dict(event_data)
@@ -7008,6 +7507,7 @@ class AgentCore:
                 and not parsed_calls
                 and str(event.get("data") or "") == streamed_answer
             ):
+                # 答案内容已经由上游流式透传过时，用内部标记避免外层重复发送 answer。
                 yield {
                     "type": "_answer_streamed",
                     "data": {"answer": str(event.get("data") or "")},
@@ -7022,6 +7522,13 @@ class AgentCore:
         llm_messages: List[Dict[str, Any]],
         system_prompt: str,
     ) -> tuple[List[Dict[str, Any]], bool]:
+        """XML action 协议单轮执行。
+
+        这是模型不支持 function calling 时的兼容路径。模型需要输出
+        <think>、<action>{...}</action> 或 <answer>；本函数解析这些标签后复用同一套
+        ParsedToolCall/ExecutedToolCall 工具执行层。
+        """
+
         llm_messages = self._normalize_messages_for_plain_chat(llm_messages)
         response = await self.llm.chat(
             messages=llm_messages,
@@ -7068,6 +7575,7 @@ class AgentCore:
                 )
             redundant_queries = self._find_redundant_knowledge_search_queries(context, parsed_calls)
             if redundant_queries:
+                # XML 路径同样阻断重复知识库检索，防止 fallback 协议绕过 function calling 的保护。
                 notice = self._redundant_knowledge_search_observation(redundant_queries)
                 events.append(
                     {
@@ -7109,6 +7617,8 @@ class AgentCore:
         return events, False
 
     async def _persist_run_completion(self, context: AgentContext, status: str) -> None:
+        """把本次 run 的事件、token 和状态写入 agent_runs/agent_steps。"""
+
         if not context.run_id:
             return
         try:
@@ -7132,6 +7642,8 @@ class AgentCore:
             logger.warning(f"[AgentCore] persist failed: {exc}")
 
     async def _persist_memory(self, context: AgentContext) -> None:
+        """按 agent profile 的记忆 scope 保存本轮问答摘要。"""
+
         if not context.memory_enabled:
             return
         if not self.runtime_context.user_id or not context.final_answer:
@@ -7158,6 +7670,16 @@ class AgentCore:
         stream: bool = True,
         prepared_plan: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
+        """ReAct 主入口。
+
+        外部 API 调用这个 async generator 后，会依次收到 start/thought/action/observation/answer/done
+        等事件。主循环最多执行 context.max_iterations 轮，每轮流程固定为：
+        准备 prompt -> 模型思考/产出工具或答案 -> 执行工具 -> observation 写回上下文 -> 判断是否停止。
+
+        prepared_plan 是预览/预规划阶段留下的可复用结果：如果首轮没有强制 RAG 注入，
+        可以直接复用提前构建好的 system_prompt 与 llm_messages，减少重复组装成本。
+        """
+
         prepared_prefetched_rag_messages: List[Dict[str, Any]] = []
         prepared_prefetched_rag_metadata: Dict[str, Any] = {}
         if isinstance(prepared_plan, dict):
@@ -7180,6 +7702,7 @@ class AgentCore:
         )
         self._routing_decision = None
         await self._prepare_runtime_context(context)
+        # prepared_plan 只作为首轮优化；一旦上下文被压缩或强制执行 RAG，就丢弃并重新构建 prompt。
         prepared_system_prompt = ""
         prepared_llm_messages: List[Dict[str, Any]] = []
         if isinstance(prepared_plan, dict):
@@ -7218,6 +7741,7 @@ class AgentCore:
 
         pre_turn_compacted = False
         try:
+            # 回合开始前先尝试把历史压缩任务投递给后台，避免每轮都携带无限增长的 item_stream。
             pre_turn_compacted = await self._maybe_pre_turn_compact(context)
         except (RuntimeError, TypeError, ValueError) as exc:
             logger.warning(f"[AgentCore] pre-turn compact skipped: {exc}")
@@ -7260,6 +7784,8 @@ class AgentCore:
                 yield {"type": "thinking", "data": "正在分析问题并规划下一步..."}
                 forced_initial_rag_retrieval = False
                 if i == 1 and self._should_force_initial_rag_retrieval(context):
+                    # 用户或页面显式启用 RAG 注入时，先强制跑一次 knowledge_search，
+                    # 把知识库 evidence 放进第一轮模型调用之前的上下文。
                     forced_initial_rag_retrieval = True
                     await self._ensure_run_created(context)
                     self._mark_forced_rag_search_debug(context, planned=True, executed=True)
@@ -7299,6 +7825,7 @@ class AgentCore:
                 use_fc = self._supports_function_calling()
 
                 if i == 1 and prepared_system_prompt and prepared_llm_messages and not forced_initial_rag_retrieval:
+                    # 预览阶段已准备好的 prompt 只在首轮且无强制 RAG 时复用。
                     system_prompt = prepared_system_prompt
                     llm_messages = [dict(item) for item in prepared_llm_messages]
                 else:
@@ -7306,6 +7833,8 @@ class AgentCore:
                     llm_messages = await self._prepare_llm_messages(context, system_prompt)
                 await self._ensure_run_created(context)
                 if await self._maybe_mid_run_compact(context, system_prompt):
+                    # 工具执行把上下文推高后，mid-run compaction 会同步改写 context.messages，
+                    # 因此必须重新生成 system_prompt/llm_messages。
                     thought_event = {
                         "type": "thought",
                         "data": "运行中已压缩较早上下文，并基于替代历史继续当前任务。",
@@ -7333,10 +7862,12 @@ class AgentCore:
                         async for event in self._run_iteration_function_calling(context, llm_messages, system_prompt):
                             event_type = str(event.get("type") or "")
                             if event_type == "_iteration_done":
+                                # 内部控制事件只用于主循环，不进入 UI steps 或数据库。
                                 event_data = event.get("data") if isinstance(event.get("data"), dict) else {}
                                 done = bool(event_data.get("done"))
                                 continue
                             if event_type == "_answer_streamed":
+                                # provider 已经流出完整答案时，只记录状态，避免重复发送 answer。
                                 event_data = event.get("data") if isinstance(event.get("data"), dict) else {}
                                 answer = str(event_data.get("answer") or context.final_answer or "").strip()
                                 if answer:
@@ -7356,6 +7887,7 @@ class AgentCore:
                             f"xml_fallback_enabled={xml_fallback_enabled}: {exc}"
                         )
                         if xml_fallback_enabled:
+                            # function calling provider 异常时，可选退回 XML 协议继续本轮。
                             events, done = await self._run_iteration_xml(context, llm_messages, system_prompt)
                             emit_events_after_call = True
                         else:
@@ -7364,6 +7896,7 @@ class AgentCore:
                     events, done = await self._run_iteration_xml(context, llm_messages, system_prompt)
 
                 if emit_events_after_call:
+                    # XML 路径没有内部流式事件，模型返回后统一补写 steps/persist_events 并发给前端。
                     for event in events:
                         self._append_step_from_event(context, event)
                         if event.get("type") in {"thought", "action", "observation", "answer", "content", "error"}:
@@ -7373,6 +7906,7 @@ class AgentCore:
                         yield event
                 authorization_stop_thought = self._maybe_stop_after_authorization_required(context, events)
                 if authorization_stop_thought:
+                    # 权限类失败需要停在当前轮，等待用户授权或调整配置。
                     thought_event = {"type": "thought", "data": authorization_stop_thought}
                     self._append_step_from_event(context, thought_event)
                     context.persist_events.append(thought_event)
@@ -7380,6 +7914,7 @@ class AgentCore:
                     break
                 background_stop_thought = self._maybe_stop_after_background_execution_started(context, events)
                 if background_stop_thought:
+                    # 后台长任务已经启动时不继续追问模型，避免把异步执行误判为失败。
                     thought_event = {"type": "thought", "data": background_stop_thought}
                     self._append_step_from_event(context, thought_event)
                     context.persist_events.append(thought_event)
@@ -7387,6 +7922,7 @@ class AgentCore:
                     break
                 repeated_read_thought = self._maybe_interrupt_redundant_successful_reads(context, events)
                 if repeated_read_thought:
+                    # 连续读取同一目标通常说明模型陷入循环，提前中断并要求基于现有 observation 收束。
                     thought_event = {"type": "thought", "data": repeated_read_thought}
                     self._append_step_from_event(context, thought_event)
                     context.persist_events.append(thought_event)
@@ -7396,6 +7932,7 @@ class AgentCore:
                     continue
                 failure_stop_thought = self._maybe_stop_after_repeated_tool_failures(context, events)
                 if failure_stop_thought:
+                    # 同一工具连续失败超过阈值时停止自动重试，防止无意义消耗。
                     thought_event = {"type": "thought", "data": failure_stop_thought}
                     self._append_step_from_event(context, thought_event)
                     context.persist_events.append(thought_event)
@@ -7405,6 +7942,7 @@ class AgentCore:
                     break
 
             if not context.final_answer:
+                # 正常轮次耗尽但没有 final_answer 时给出稳定兜底，避免前端等待空结果。
                 context.final_answer = "未能在限制轮次内完成回答，请重试或缩小问题范围。"
             if not answer_emitted:
                 context.final_answer = await self._ensure_citation_compliance(context.final_answer, context)
@@ -7415,6 +7953,7 @@ class AgentCore:
 
             context.state = AgentState.DONE
             reasoning_trace = (
+                # reasoning_summary 可能交给异步后台生成；done 事件只带 pending 标记和内部 trace。
                 self._build_reasoning_trace_for_summary(context)
                 if self._should_generate_reasoning_summary(context)
                 else ""

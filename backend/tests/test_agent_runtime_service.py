@@ -153,6 +153,8 @@ async def test_commit_conversation_compaction_if_current_skips_stale_source(monk
     assert "context_state" not in row.metadata_
     assert "compacted_history" not in row.metadata_
     assert row.metadata_["history_log"]["events"][-1]["title"] == "manual_compact_stale_skipped"
+    assert "event=model_compaction_skipped" in row.metadata_["history_log"]["events"][-1]["detail"]
+    assert "current_entry_count=2" in row.metadata_["history_log"]["events"][-1]["detail"]
     kinds = [entry["kind"] for entry in row.metadata_["item_stream"]["entries"]]
     assert kinds[-1] == "history_event"
     assert "compact_boundary" not in kinds

@@ -956,6 +956,12 @@ async def test_pre_turn_compaction_defers_full_compaction_without_model_call(mon
     assert task_kwargs["trigger"] == "old_history"
     assert context.context_debug["pre_turn_compaction_deferred"] is True
     assert context.context_debug["pre_turn_compaction_enqueue_reason"] == "queued"
+    assert any(
+        event.get("kind") == "model_compaction_deferred"
+        and event.get("phase") == "pre_turn_compaction"
+        and event.get("reason") == "queued"
+        for event in context.context_debug["context_observability_events"]
+    )
 
 
 @pytest.mark.asyncio
@@ -986,6 +992,12 @@ async def test_pre_turn_compaction_skips_new_conversation_first_turn(monkeypatch
     assert not runtime.context_states
     assert not runtime.compacted_histories
     assert context.context_debug["pre_turn_compaction_skipped"] == "no_compactable_history"
+    assert any(
+        event.get("kind") == "model_compaction_skipped"
+        and event.get("phase") == "pre_turn_compaction"
+        and event.get("reason") == "no_compactable_history"
+        for event in context.context_debug["context_observability_events"]
+    )
 
 
 @pytest.mark.asyncio

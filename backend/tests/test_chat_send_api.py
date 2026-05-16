@@ -356,6 +356,78 @@ def test_build_tool_event_workflow_control_payload_promotes_probe_stage(monkeypa
     assert workflow_control.get("action") is None
 
 
+@pytest.mark.parametrize("stage", ["planning", "execution", "tuning"])
+def test_project_write_report_workflow_stage_follows_active_skill_stage(monkeypatch, stage):
+    skill_service = _FakeSkillService()
+    monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
+
+    workflow_control = chat_api._build_tool_event_workflow_control_payload(
+        ChatRequest(
+            message=f"继续论文{stage}阶段（paper_id=111）",
+            conversation_id=58,
+            stream=True,
+            use_tools=True,
+            skill_launch=ChatSkillLaunch(
+                skill_name="paper-reproduction",
+                stage=stage,
+                paper_id=111,
+                project_id=2,
+            ),
+        ),
+        tool_name="project_write_report",
+        tool_payload={
+            "project_id": 2,
+            "relative_path": "reference/reports/tuning_research.md",
+            "artifact_kind": "project_report",
+        },
+        success=True,
+        phase="action",
+    )
+
+    assert workflow_control is not None
+    assert workflow_control["stage"] == stage
+    assert workflow_control["stage_status"] == "running"
+
+
+def test_reference_report_paths_do_not_force_planning_stage():
+    assert chat_api._infer_paper_stage_from_artifact_path("reference/reports/tuning_research.md") is None
+
+
+def test_final_workflow_control_converts_running_stage_to_completed(monkeypatch):
+    skill_service = _FakeSkillService()
+    monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
+
+    request = ChatRequest(
+        message="继续论文规划阶段（paper_id=111）",
+        conversation_id=58,
+        stream=True,
+        use_tools=True,
+        skill_launch=ChatSkillLaunch(
+            skill_name="paper-reproduction",
+            stage="planning",
+            paper_id=111,
+            project_id=2,
+        ),
+    )
+    workflow_control = chat_api._build_final_workflow_control_payload(
+        request,
+        active_workflow_control={
+            "skill_name": "paper-reproduction",
+            "display_name": "Paper Reproduction",
+            "stage": "planning",
+            "stage_label": "规划阶段",
+            "stage_status": "running",
+            "continue_policy": "manual",
+        },
+    )
+
+    assert workflow_control is not None
+    assert workflow_control["stage"] == "planning"
+    assert workflow_control["stage_status"] == "completed"
+    assert workflow_control["next_stage"] == "execution"
+    assert workflow_control["action"]["label"] == "继续 执行阶段"
+
+
 @pytest.mark.asyncio
 async def test_send_message_marks_turn_stopped_on_stream_cancellation(monkeypatch):
     conversation = Conversation(

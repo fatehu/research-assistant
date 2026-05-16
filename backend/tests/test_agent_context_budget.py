@@ -112,6 +112,15 @@ async def test_context_budget_trims_observation_after_first_user_turn(monkeypatc
     assert context.context_truncated is True
     assert context.context_debug["context_truncated"] is True
     assert context.context_debug["message_count_sent"] == len(trimmed)
+    assert context.context_debug["context_observability_version"] == "context_observability.v1"
+    assert context.context_debug["message_tokens_before_trim"] > context.context_debug["message_tokens_after_trim"]
+    assert context.context_debug["deterministic_truncation_applied"] is True
+    assert "token_budget_overflow" in context.context_debug["deterministic_truncation_reasons"]
+    assert any(
+        event.get("kind") == "deterministic_content_truncation"
+        and event.get("phase") == "prepare_llm_messages"
+        for event in context.context_debug["context_observability_events"]
+    )
 
 
 @pytest.mark.asyncio

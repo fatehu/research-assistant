@@ -123,6 +123,10 @@ const ChatPage = () => {
       ),
     [contextPreview?.chat_preference_candidates, ignoredCandidateIds],
   )
+  const hasPendingFirstTurnMessage = useMemo(
+    () => messages.some((message) => Number(message.conversation_id || 0) === 0),
+    [messages],
+  )
 
   useEffect(() => {
     previewRequestIdRef.current += 1
@@ -191,9 +195,7 @@ const ChatPage = () => {
           }
         }
       } else {
-        const hasPendingFirstTurn =
-          isSending ||
-          messages.some((message) => Number(message.conversation_id || 0) === 0)
+        const hasPendingFirstTurn = isSending || hasPendingFirstTurnMessage
 
         setConversationLoaded(false)
         if (!cancelled) {
@@ -213,7 +215,15 @@ const ChatPage = () => {
     return () => {
       cancelled = true
     }
-  }, [clearCurrentConversation, conversationId, currentConversation?.id, isSending, messages.length, selectConversation])
+  }, [
+    clearCurrentConversation,
+    conversationId,
+    currentConversation?.id,
+    hasPendingFirstTurnMessage,
+    isSending,
+    messages.length,
+    selectConversation,
+  ])
 
   // ─── 处理首页传来的初始消息 / 消息高亮 ──────────
   useEffect(() => {

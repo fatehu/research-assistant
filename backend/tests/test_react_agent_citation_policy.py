@@ -186,6 +186,7 @@ class _PaperSelfWorkTools:
             "paper_research_status",
             "paper_research_prepare",
             "project_claude",
+            "project_write_report",
             "project_bash",
             "project_write_file",
             "paper_research_start_execution",
@@ -199,6 +200,7 @@ class _PaperSelfWorkTools:
             "paper_research_status",
             "paper_research_prepare",
             "project_claude",
+            "project_write_report",
             "project_bash",
             "project_write_file",
             "paper_research_start_execution",
@@ -504,11 +506,12 @@ async def test_prepare_direct_response_can_force_direct_without_tools(monkeypatc
 @pytest.mark.parametrize(
     "message_text",
     [
+        "解释深度学习中的注意力机制",
         "一句话解释注意力机制",
         "请直接用一句话解释注意力机制",
     ],
 )
-async def test_prepare_direct_response_no_longer_short_circuits_single_turn_direct_chat(
+async def test_prepare_direct_response_short_circuits_single_turn_direct_chat(
     monkeypatch,
     message_text,
 ):
@@ -522,7 +525,10 @@ async def test_prepare_direct_response_no_longer_short_circuits_single_turn_dire
 
     prepared = await agent.prepare_direct_response([{"role": "user", "content": message_text}])
 
-    assert prepared is None
+    assert prepared is not None
+    assert prepared.routing_decision is not None
+    assert prepared.routing_decision.needs_tools is False
+    assert prepared.routing_decision.source == "heuristic_direct"
 
 
 @pytest.mark.asyncio
@@ -561,7 +567,7 @@ async def test_prepare_direct_response_returns_none_when_current_turn_rag_is_ena
         "如果不使用它，会出现什么限制？",
     ],
 )
-async def test_prepare_direct_response_no_longer_short_circuits_followup_direct_chat(
+async def test_prepare_direct_response_short_circuits_followup_direct_chat(
     monkeypatch,
     message_text,
 ):
@@ -581,7 +587,10 @@ async def test_prepare_direct_response_no_longer_short_circuits_followup_direct_
         ]
     )
 
-    assert prepared is None
+    assert prepared is not None
+    assert prepared.routing_decision is not None
+    assert prepared.routing_decision.needs_tools is False
+    assert prepared.routing_decision.source == "heuristic_direct_followup"
 
 
 @pytest.mark.asyncio
@@ -845,6 +854,7 @@ def test_paper_reproduction_active_skill_hides_self_work_tools():
     selected_tools = set(agent._last_tool_selection["selected_tools"])
     assert "project_claude" in selected_tools
     assert "paper_research_status" in selected_tools
+    assert "project_write_report" in selected_tools
     assert "project_bash" not in selected_tools
     assert "project_write_file" not in selected_tools
     assert "paper_research_start_execution" not in selected_tools

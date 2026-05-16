@@ -216,6 +216,8 @@ const buildMarkdownVisibleTextIndex = (source: string): MarkdownVisibleTextIndex
   let index = 0
   let lineStart = true
 
+  // 浏览器选区是渲染后的文本，而改写 API 需要原始 Markdown offset；
+  // 为非精确匹配保留一份可见文本到源码位置的索引。
   while (index < source.length) {
     if (lineStart) {
       const nextIndex = findLineSyntaxEnd(source, index)
@@ -295,6 +297,8 @@ const resolveRewriteSelectionFromMarkdown = (
 ): ResolvedRewriteSelection | null => {
   const exactOccurrences = findAllOccurrences(source, renderedSelectedText)
   if (exactOccurrences.length > 0) {
+    // 能精确命中源码时优先使用源码文本，使引用标签和 Markdown 语法继续锚定在
+    // 模型实际改写的片段上。
     const renderedOccurrenceIndex = countOccurrences(renderedBeforeText, renderedSelectedText)
     const occurrenceIndex = Math.min(renderedOccurrenceIndex, exactOccurrences.length - 1)
     const sourceStart = exactOccurrences[occurrenceIndex]
@@ -506,6 +510,8 @@ const parseCitationExplanationItems = (
   const messageIndex = buildCitationIndexFromMessage(msg)
   const ledgerIndex = buildCitationIndexFromLedger(toolLedger, turnId)
   return labels.map((label) => {
+    // 旧消息把引用详情存在 metadata；实时工具轮次在持久化完成前可能只存在
+    // 轮次 ledger 中。
     const item = messageIndex.get(label) || ledgerIndex.get(label)
     if (item) {
       return item
@@ -646,6 +652,8 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
     const [ragExpanded, setRagExpanded] = useState(false)
     const [evidenceExpanded, setEvidenceExpanded] = useState(false)
     const ragMetrics = !isStreaming && !isUser ? parseRagMetrics(msg.metadata?.rag_metrics) : null
+    // 助手回答仍在流式输出时，引用标签和来源 ledger 还未定稿，
+    // 避免展示不完整的引用说明。
     const citationItems = useMemo(
       () => (!isStreaming && !isUser ? parseCitationExplanationItems(msg, toolLedger, turnId) : []),
       [isStreaming, isUser, msg, toolLedger, turnId]
@@ -782,6 +790,8 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
         selectedText,
         renderedBefore,
       )
+      // 后端改写的是源 Markdown，不是 DOM 文本；跨越歧义渲染结构的选区
+      // 会在调用 API 前被拒绝。
       if (!resolvedSelection) {
         if (!openPanel) pendingRewriteSelectionRef.current = null
         if (showWarnings) message.warning('这个选区暂时无法映射到原始 Markdown，请缩小选区后重试')

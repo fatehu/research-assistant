@@ -335,6 +335,8 @@ class Settings(BaseSettings):
     agent_budget_compression_max_tokens: int = 1200
     agent_budget_compression_timeout_seconds: float = 8.0
     conversation_context_compaction_enabled: bool = True
+    conversation_context_compaction_quiet_period_ms: int = 800
+    conversation_context_compaction_quiet_timeout_ms: int = 4000
     agent_context_transcript_keep_entries: int = 160
     agent_context_tool_ledger_keep_entries: int = 240
     agent_context_history_log_keep_events: int = 48

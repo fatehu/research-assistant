@@ -517,6 +517,12 @@ class AgentRuntimeService:
                 stale_detail = str(stale_history_event_detail or "").strip() or (
                     "source item_stream changed before compaction commit"
                 )
+                if "event=" not in stale_detail:
+                    stale_detail = f"event=model_compaction_skipped, reason=stale_source, {stale_detail}"
+                if "current_entry_count=" not in stale_detail:
+                    stale_detail = (
+                        f"{stale_detail}, current_entry_count={current_fingerprint.get('entry_count')}"
+                    )
                 self._append_history_event_to_metadata(
                     metadata,
                     title=stale_title,

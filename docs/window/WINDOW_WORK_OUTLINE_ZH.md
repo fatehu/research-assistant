@@ -70,7 +70,7 @@
 - `MOD_05_CONTEXT_BUDGET_OBSERVABILITY_ZH.md`
   - 修改项：预算、压缩触发、stale 跳过和确定性裁剪观测统一。
   - 阶段：P3。
-  - 状态：待讨论。
+  - 状态：已实施，Docker focused 回归通过。
 
 - `MOD_06_PAPER_REPRODUCTION_PROJECT_ONLY_AUDIT_ZH.md`
   - 修改项：paper-reproduction project-only 路线与旧 workspace/notebook 残留清点。
@@ -89,8 +89,8 @@
 
 ## 当前推荐顺序
 
-1. 整理并提交本轮已完成的 `MOD_08` 变更。
-2. `MOD_05` 暂不实施，只记录观测方向。
+1. 整理并提交本轮已完成的 `MOD_05` 变更。
+2. 后续稳定性维护继续保持低风险、小范围、先文档后代码，不扩展到 notebook/codelab 产品面。
 
 ## 决策记录
 
@@ -121,9 +121,12 @@
 - 2026-05-04：`MOD_08` 已实施：`project_tree(project_id=10)` observation 降到 448 tokens，候选路径包含真实 `repo/source/FASTTEXT_REPRODUCTION_REPORT.md`；根路径读取失败时 `project_read_file` 会返回 suggested paths。
 - 2026-05-05：真实 chat 页面验证 `project_tree(project_id=10)` 成功且只调用该工具；模型最终回答曾把 `Directory summary` examples 混入 Candidate Files 表达，因此补充字段边界标签，明确 examples 不是 candidate files。
 - 2026-05-05：字段边界强化后，新建 `conversation_id=201` 真实 chat 回归通过：重新调用 `project_tree(project_id=10)`，工具结果 `output_tokens_estimate=518`、`truncated=false`，最终回答未再把 `data/` examples 混入 Candidate files。
+- 2026-05-05：用户确认系统大方向已开发完成，后续只做稳定性维护加固，不动 notebook/codelab/notebook-agent 产品面，不把其作为 paper-reproduction fallback。
+- 2026-05-05：执行 `MOD_05`：统一 context debug / history event / logs 的上下文观测字段，新增 `context_observability_events`、before/after token、deterministic truncation reason、model compaction committed/skipped/failed 事件；不改变压缩策略、不增加模型调用。
+- 2026-05-05：`MOD_05` Docker focused 回归通过：context budget / runtime resilience / compaction / runtime service 共 54 项，chat send / manual compact / FC fallback 共 54 项，broad-except 与 contract alignment 守卫通过。
 
 ## 下一步
 
-- 下一步整理本轮变更，按 MOD/功能边界拆分提交。
+- 下一步整理本轮 `MOD_05` 变更，按功能边界提交。
 - paper-reproduction 后续只围绕 Project + Claude Code + sandbox 做回归和维护，不把 codelab/notebook 当作 fallback。
 - 旧 `paper_research_*execution*` 类仍作为未注册 legacy 代码保留；如需彻底删除模型/服务代码，另开清理项并先确认迁移边界。

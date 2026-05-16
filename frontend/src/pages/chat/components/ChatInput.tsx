@@ -280,10 +280,12 @@ const ChatInput = ({
   }, [ragOverrides])
 
   useEffect(() => {
+    // 文档选项异步分页加载，提交覆盖项时要读最新选中文档，避免闭包拿到旧值。
     ragDocumentIdsRef.current = ragDocumentIds
   }, [ragDocumentIds])
 
   useEffect(() => {
+    // 外部重置标记表示本轮临时 RAG 注入已结算，面板状态回到后端传入的基线。
     const nextOverrides = ragOverridesRef.current || null
     setRagEnabled(Boolean(nextOverrides?.enabled))
     setRagScopeMode(nextOverrides?.scope_mode || 'all')
@@ -314,6 +316,7 @@ const ChatInput = ({
   }, [documentSearchInput])
 
   useEffect(() => {
+    // 切换知识库或检索范围时清空文档列表，防止旧知识库的文档 ID 混入新范围。
     setDocumentOptions([])
     setDocumentSearchInput('')
     setDebouncedDocumentSearch('')
@@ -386,6 +389,7 @@ const ChatInput = ({
         setDocumentLoadedCount((current) => (documentPage === 0 ? items.length : current + items.length))
         setDocumentOptions((current) => {
           if (documentPage === 0) {
+            // 新搜索第一页仍保留已选文档，否则已选项可能因为不在当前页而从选择框消失。
             const preserved = current.filter((item) => ragDocumentIdsRef.current.includes(item.id))
             return mergeDocumentOptions(preserved, items)
           }
@@ -444,6 +448,7 @@ const ChatInput = ({
       next.query_rewrite_profile = ragRewriteMode
       next.use_query_rewrite = ragRewriteMode !== 'off'
     }
+    // 只在序列化结果变化时上抛，避免父级状态更新引起面板内部循环刷新。
     if (serializeRagOverrides(ragOverridesRef.current) !== serializeRagOverrides(next)) {
       onRagOverridesChange(next)
     }
@@ -493,6 +498,8 @@ const ChatInput = ({
     if (!raw.length) return []
     const draft = inputValue.trim()
     if (!draft) return raw.slice(0, 3)
+    // 预览接口可能已经把当前草稿放进 recent_messages；展示继承历史时去掉它，
+    // 避免用户误以为同一条输入会被重复发送。
     let lastIndex = -1
     for (let index = raw.length - 1; index >= 0; index -= 1) {
       const item = raw[index]
